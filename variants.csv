@@ -1,0 +1,6 @@
+Variant,Chromosome,Position,RS_ID,Ref_seq,Var_seq,Type,HGVS,Zygosity,Gene,OMIM_phenotype,OMIM_inheritance,Inheritance,ClinVar_class,Allelic_balance,Frequency,CADD_score
+chr19:40730680_1 insG,chr19,40730681,NA,NA,G,Insertion,NM_024877.4:c.305dup p.(Val103CysfsTer25),Heterozygous,CCNP,NA,NA,NA,NA,0.5417,0,NA
+chr16:56904031 C>T,chr16,56904031,rs28936388,C,T,SNV,NM_001126108.2:c.625C>T p.(Arg209Trp),Heterozygous,SLC12A3,Gitelman syndrome,Autosomal recessive,AR,Pathogenic,0.5393,1.19E-05,26
+chr12:117962872 G>A,chr12,117962872,rs56178407,G,A,SNV,NM_173598.6:c.2004C>T p.(Ile668=),Heterozygous,KSR2,NA,NA,NA,Benign,0.3947,0.00689813,5.871
+chr3:49690627 G>A,chr3,49690627,rs35762866,G,A,SNV,NM_003458.4:c.3638G>A p.(Gly1213Asp),Heterozygous,BSN,NA,NA,NA,Benign,0.5556,0.0813352,12.92
+chr6:100896130 T>C,chr6,100896130,NA,T,C,SNV,NM_005068.3:c.744-2A>G p.?,Heterozygous,SIM1,NA,NA,AD,NA,0.383,0,34
