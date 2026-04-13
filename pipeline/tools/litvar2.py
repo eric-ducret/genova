@@ -97,8 +97,7 @@ class LitVar2SummaryTool(SLMTool):
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.error("LitVar2 request failed for %s: %s", rsid, e)
-            return []
+            raise ToolFetchError(f"LitVar2 API request failed for {rsid}: {e}") from e
 
         # API returns {"pmids": [...], "pmcids": [...], "pmids_count": N}
         raw_pmids = data.get("pmids", [])
@@ -120,15 +119,17 @@ class LitVar2SummaryTool(SLMTool):
                 self.timeout,
             ).json()
         except Exception as e:
-            logger.error("PubMed esummary failed: %s", e)
-            return {}
+            raise ToolFetchError(f"PubMed esummary request failed: {e}") from e
 
         result = data.get("result", {})
-        return {
-            pmid: result[pmid].get("title", "No title")
-            for pmid in pmids
-            if pmid in result
-        }
+        try:
+            return {
+                pmid: result[pmid].get("title", "No title")
+                for pmid in pmids
+                if pmid in result
+            }
+        except Exception as e:
+            raise ToolParseError(f"Failed to parse PubMed titles: {e}") from e
 
     # ── step 3: SLM title filter ──────────────────────────────────────────────
 
@@ -191,32 +192,34 @@ class LitVar2SummaryTool(SLMTool):
             ).text
             root = ET.fromstring(xml_text)
         except Exception as e:
-            logger.error("PubMed efetch failed: %s", e)
-            return {}
+            raise ToolFetchError(f"PubMed efetch request failed: {e}") from e
 
-        results = {}
-        for article in root.iter("PubmedArticle"):
-            pmid_el = article.find(".//PMID")
-            if pmid_el is None:
-                continue
-            pmid = pmid_el.text.strip()
+        try:
+            results = {}
+            for article in root.iter("PubmedArticle"):
+                pmid_el = article.find(".//PMID")
+                if pmid_el is None:
+                    continue
+                pmid = pmid_el.text.strip()
 
-            title_el = article.find(".//ArticleTitle")
-            title    = _clean_xml_text(ET.tostring(title_el, encoding="unicode")) if title_el is not None else "No title"
+                title_el = article.find(".//ArticleTitle")
+                title    = _clean_xml_text(ET.tostring(title_el, encoding="unicode")) if title_el is not None else "No title"
 
-            abstract_parts = [
-                _clean_xml_text(ET.tostring(a, encoding="unicode"))
-                for a in article.iter("AbstractText")
-            ]
-            abstract = " ".join(abstract_parts) if abstract_parts else "No abstract available."
+                abstract_parts = [
+                    _clean_xml_text(ET.tostring(a, encoding="unicode"))
+                    for a in article.iter("AbstractText")
+                ]
+                abstract = " ".join(abstract_parts) if abstract_parts else "No abstract available."
 
-            results[pmid] = {
-                "title":    title,
-                "abstract": abstract[: self.max_chars],
-                "url":      f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
-            }
+                results[pmid] = {
+                    "title":    title,
+                    "abstract": abstract[: self.max_chars],
+                    "url":      f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                }
 
-        return results
+            return results
+        except Exception as e:
+            raise ToolParseError(f"Failed to parse PubMed abstracts: {e}") from e
 
     # ── step 5: SLM summary ───────────────────────────────────────────────────
 

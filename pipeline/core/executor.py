@@ -73,7 +73,7 @@ def _extract_pvs1_strength(pvs1_block: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Auto-threshold: compress when variant count exceeds this value
-_AUTO_THRESHOLD = 5
+_AUTO_THRESHOLD = 10
 
 # Prompt loaded from prompts/compression.txt at runtime
 _COMPRESSION_PROMPT_PATH = (
