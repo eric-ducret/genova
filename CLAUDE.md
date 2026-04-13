@@ -158,7 +158,7 @@ class LLMClient(ABC):
         user: str,
         max_tokens: int = 512,
         temperature: float = 0.0,
-        enable_thinking: bool = False,   # always False for Qwen3 in this pipeline
+        enable_thinking: bool = False,   # always False for Qwen3.5 in this pipeline
     ) -> str: ...
 
     @abstractmethod
@@ -180,10 +180,10 @@ Same interface, slower. Useful for testing tool logic without a running vLLM ser
 ```python
 # pipeline/llm/registry.py
 MODELS = {
-    "qwen3-9b": {
+    "qwen3.5-9b": {
         "client": "vllm",
         "model_id": "Qwen/Qwen3.5-9B",
-        "enable_thinking": False,      # MUST be False for Qwen3 in this pipeline
+        "enable_thinking": False,      # MUST be False for Qwen3.5 in this pipeline
         "max_tokens_default": 1024,
     },
     # add new models here
@@ -193,7 +193,7 @@ def get_client(model_name: str, **kwargs) -> LLMClient:
     ...
 ```
 
-**Qwen3 note:** `enable_thinking` must always be `False` in this pipeline.
+**Qwen3.5 note:** `enable_thinking` must always be `False` in this pipeline.
 The thinking mode produces chain-of-thought tokens that bloat the context and
 break downstream parsing. This is enforced at the registry level, not per-tool.
 
