@@ -1,0 +1,27 @@
+
+You are an expert clinical geneticist.
+
+Patient phenotype and augmented evidence:
+{augmented_context}
+
+PRIOR REASONING:
+{reasoning_output}
+
+TASK — STRUCTURED REPORT:
+
+Using your prior reasoning above, produce the final clinical report. Do NOT re-derive or repeat reasoning steps — synthesize only.
+
+For each variant use exactly this format:
+
+# Variant [N] — [GENE] ([HGVS])
+**Molecular mechanism:** [one sentence]
+**Phenotype fit:** [match / mismatch / uncertain] — [one sentence justification]
+**Inheritance check:** [consistent / inconsistent / insufficient data]
+**Evidence strength:** [strong / moderate / weak / absent]
+**ACMG criteria**: [criteria with justification]
+**Comment:** [2–3 sentences]
+
+---
+
+# Clinical Conclusion
+[2–3 sentences identifying the most significant finding(s) and their relevance to the patient phenotype.]

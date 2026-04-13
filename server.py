@@ -1,0 +1,114 @@
+"""
+server.py — FastAPI entry point for the variant analysis pipeline.
+
+Thin server: parses requests, delegates to pipeline.run(), returns results.
+No business logic lives here — all logic is in pipeline/.
+
+Routes:
+    GET  /health     — liveness check
+    POST /analyze    — main pipeline endpoint
+
+The /analyze route signature is fixed and must not be changed:
+existing frontends depend on it (MIGRATION.md constraint).
+
+Startup:
+    Pipeline is instantiated once at server startup via the FastAPI lifespan.
+    LLM client and manifests are loaded at that point, not per request.
+"""
+
+import os
+import logging
+
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+from pipeline.core.normalizer import normalize_upload
+from pipeline.pipeline import Pipeline
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ── LLM backend selection ─────────────────────────────────────────────────────
+# Override with LLM_BACKEND=hf for local dev (no vLLM needed).
+# In production on the A100 node, LLM_BACKEND defaults to vllm.
+_LLM_BACKEND   = os.environ.get("LLM_BACKEND", "vllm")
+_VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8001")
+_USE_4BIT      = os.environ.get("USE_4BIT", "0") == "1"
+
+# ── App setup ─────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Variant Analysis Pipeline")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Pipeline singleton — instantiated on first request (lazy) or at startup.
+# Using a module-level variable avoids a startup dependency on the GPU being ready.
+_pipeline: Pipeline | None = None
+
+
+def _get_pipeline() -> Pipeline:
+    global _pipeline
+    if _pipeline is None:
+        logger.info("[Server] Initialising Pipeline (backend=%s)", _LLM_BACKEND)
+        if _LLM_BACKEND == "hf":
+            # Dev / CPU fallback — build HFClient directly and pass it in
+            from pipeline.llm.hf_client import HFClient
+            _llm = HFClient(model_id="Qwen/Qwen3.5-9B", use_4bit=_USE_4BIT)
+            _pipeline = Pipeline(llm=_llm)
+        else:
+            # Production: vLLM OpenAI-compatible endpoint
+            _pipeline = Pipeline(
+                model_name="qwen3.5-9b",
+                llm_kwargs={"base_url": _VLLM_BASE_URL},
+            )
+    return _pipeline
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    """Liveness check. Returns 200 if the server process is running."""
+    return {"status": "ok", "model": "qwen3.5-9b", "backend": _LLM_BACKEND}
+
+
+@app.post("/analyze")
+async def analyze(
+    csv_file:       UploadFile = File(..., description="Variants CSV file"),
+    patient_report: str        = Form(..., description="Free-text patient phenotype"),
+):
+    """
+    Upload a variants CSV + patient phenotype description.
+    Runs the full four-stage pipeline and returns the result as plain text.
+
+    Workflow:
+      Stage 1 — per-variant retrieval (LitVar2 + AutoPVS1 + ReAct web search)
+      Stage 2 — global context compression (if context exceeds threshold)
+      Stage 3 — step-by-step clinical reasoning
+      Stage 4 — structured report with ACMG criteria
+    """
+    raw = await csv_file.read()
+
+    try:
+        variants = normalize_upload(raw, filename=csv_file.filename or "upload.csv")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not variants:
+        raise HTTPException(status_code=400, detail="CSV contained no variant rows.")
+
+    pipeline = _get_pipeline()
+    result   = await pipeline.run(variants, patient_report)
+
+    return PlainTextResponse(content=result)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

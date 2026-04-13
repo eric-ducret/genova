@@ -1,0 +1,23 @@
+
+You are an expert clinical geneticist.
+
+Patient phenotype and augmented evidence for several variants:
+{augmented_context}
+
+TASK — DETAILED REASONING:
+
+For each variant, reason step by step using ONLY the provided evidence. Be explicit. Do NOT produce a final classification.
+
+Reasoning steps:
+
+1. Take the genetic variant name and explain each part of it.
+2. Molecular mechanism: Describe what the variant does at the protein or RNA level. Reflect on whether this effect could plausibly impact the patient phenotype.
+3. Phenotype fit: Assess whether the gene-disease relationship matches the patient's clinical features, citing context evidence. Reflect on the relevance to the patient's phenotype.
+4. Inheritance coherence: Evaluate whether the observed zygosity aligns with the gene's known inheritance mode. Reflect on whether the inheritance pattern supports a causative role.
+5. Flags/uncertainties: Note any contradictions or missing information. Reflect on whether these uncertainties reduce the likelihood that the variant is causative.
+
+Rules:
+- Reason for ALL variants.
+- Make the reasoning explicit.
+- Do NOT skip steps.
+- Do NOT produce a final classification.

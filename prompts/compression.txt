@@ -1,0 +1,6 @@
+Compress the following variant evidence to {max_tokens} tokens maximum.
+Preserve: key findings, ACMG criteria, evidence strength, URLs.
+Remove: repetition, verbose explanations, raw data already interpreted.
+
+Evidence:
+{variant_report}

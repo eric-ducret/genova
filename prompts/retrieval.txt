@@ -1,0 +1,35 @@
+
+PATIENT PHENOTYPE:
+{patient_report}
+
+VARIANT DATA:
+{variant}
+{litvar2_block}
+{autopvs1_block}
+TASK:
+
+Identify peer-reviewed literature that provides evidence regarding
+the relationship between this specific variant—including all its properties such as exact nucleotide or amino acid change, mutation type (e.g., loss-of-function, missense, nonsense), gene name, and any functional annotations—
+and the patient phenotype.
+
+You may perform and refine up to 5 focused searches.
+Use web_search to locate high-relevance sources,
+then use web_fetch or ncbi_fetch to examine selected articles in detail and extract key findings.
+
+Iteratively refine your queries based on intermediate results.
+Continue until you have gathered the strongest available evidence regarding the variant–phenotype relationship.
+
+Prioritize, in order:
+1. Evidence on the exact variant
+2. Strong genotype–phenotype correlations
+3. Functional or experimental validation
+4. Segregation data or well-documented case reports
+
+Avoid stopping at gene-level associations if variant-level data is available.
+
+Output format:
+- Provide only concise, directly relevant evidence linking (or not linking) the variant to the phenotype.
+- Present each piece of evidence as a separate bullet.
+- Each bullet should be 1–2 sentences max, including key details (study type, cohort size, functional impact, main conclusion).
+- Include the full URL for each source.
+- Do NOT include explanations, commentary, or unrelated information.

@@ -1,0 +1,21 @@
+name: litvar2_summary
+description: "Fetches variant-specific PubMed articles via LitVar2, filters with SLM, returns evidence summary."
+enabled: true
+
+order: 1
+parallel: true
+
+gate:
+  field: RS_ID
+  operator: not_na
+
+compress:
+  enabled: true
+  threshold: auto
+  strategy: slm
+  max_tokens: 300
+
+timeout: 15
+retry:
+  attempts: 2
+  backoff: 2.0
