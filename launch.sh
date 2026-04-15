@@ -1,10 +1,12 @@
-#!/bin/bash
-#SBATCH --job-name=variant-pipeline
+#!/bin/bash --login
+#SBATCH --job-name=variant_pipeline
+
+#SBATCH --time=02:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:a100:1
-#SBATCH --mem=64G
-#SBATCH --cpus-per-task=8
-#SBATCH --time=08:00:00
+#SBATCH --gres=gpu:1
 
 # Start vLLM server
 vllm serve Qwen/Qwen3.5-9B \
