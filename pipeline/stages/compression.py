@@ -59,7 +59,7 @@ def _compress_section(
         "Return only the compressed text — no commentary, no headers."
     )
     user = (
-        f"Compress the following variant evidence section to {max_tokens} tokens maximum:\n\n"
+        f"Compress the following variant evidence section to {max_tokens} tokens maximum:\n\n"  # models are bad at such task in terms of precision but we still have a compression.
         f"{section}"
     )
     try:
