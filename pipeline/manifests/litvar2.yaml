@@ -5,10 +5,6 @@ enabled: true
 order: 1
 parallel: true
 
-gate:
-  field: RS_ID
-  operator: not_na
-
 compress:
   enabled: true
   threshold: auto
