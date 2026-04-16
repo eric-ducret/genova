@@ -30,6 +30,7 @@ entry point regardless of how compute resources were allocated.
 variant-pipeline/
 │
 ├── CLAUDE.md                        ← this file
+├── MIGRATION.md                     ← migration notes from original codebase
 ├── README.md                        ← user-facing quickstart and architecture
 ├── TOOL_DEVELOPMENT.md              ← guide for writing new tools
 ├── launch.sh                        ← SLURM sbatch script
@@ -39,7 +40,6 @@ variant-pipeline/
 ├── pipeline/
 │   ├── __init__.py
 │   ├── pipeline.py                  ← top-level orchestrator
-│   ├── config.py                    ← global config (model, paths, thresholds)
 │   │
 │   ├── core/
 │   │   ├── __init__.py
@@ -66,15 +66,16 @@ variant-pipeline/
 │   ├── tools/
 │   │   ├── __init__.py
 │   │   ├── base.py                  ← Tool, NetworkTool, SLMTool, RAGTool, BotTool
-│   │   ├── litvar2.py
+│   │   ├── litvar2.py               ← LitVar2 literature search (rsID + gene fallback)
 │   │   ├── autopvs1.py
 │   │   ├── websearch.py
+│   │   ├── websearch_agent.py
 │   │   └── ncbi.py
 │   │
 │   └── manifests/
 │       ├── litvar2.yaml
 │       ├── autopvs1.yaml
-│       └── websearch.yaml
+│       └── websearch_agent.yaml
 │
 └── prompts/
     ├── retrieval.txt
@@ -295,6 +296,13 @@ gate:
 
 The Python method always takes precedence over the manifest gate if both are defined.
 
+Manifest gates only support single-field conditions with a single operator. For OR logic
+or multi-field conditions a Python `gate()` method is required, and the `gate:` block
+should be omitted from the manifest entirely. `litvar2_summary` is the current example:
+it gates on RS_ID valid **or** Gene present — this cannot be expressed in a single YAML
+expression, so `litvar2.yaml` has no `gate:` block and the logic lives entirely in the
+Python `gate()` method.
+
 ### Compression
 
 A tool can declare that its output should be compressed when the variant count
@@ -355,6 +363,21 @@ AUTOPVS1 [FAILED — ToolFetchError]: Connection timeout after 15s (https://auto
 This failure note is visible to the SLM in the reasoning stage, which can then
 note the missing evidence in the report rather than reasoning from a gap.
 
+### Implemented tools
+
+| Tool | Class | Gate |
+|---|---|---|
+| `litvar2_summary` | `SLMTool` | RS_ID valid **or** Gene present (Python gate — see below) |
+| `autopvs1` | `NetworkTool` | — |
+| `websearch` / `websearch_agent` | `SLMTool` / `ReActTool` | — |
+| `ncbi` | `NetworkTool` | — |
+
+**`litvar2_summary`** runs two paths depending on what variant fields are available:
+- **rsID present and valid** (`rs\d+`) — variant-level search via the LitVar2 publications endpoint; fetches PMIDs, filters titles with the SLM using the resolved disease query, fetches abstracts, and returns a summary with inline PMID citations prefixed `LitVar2 evidence summary for {rsid}:`.
+- **rsID absent, Gene present** — gene-level fallback via `GET /variant/search/gene/{gene}`; collects and deduplicates PMIDs across the first 10 variants returned for that gene, then runs the same filter → abstracts → summary pipeline. Output is prefixed `LitVar2 gene-level evidence for {gene} (no rsID):` so downstream reasoning stages can distinguish the two.
+
+`_disease_query` is resolved once per pipeline run via a single SLM call (`_resolve_disease_query`), cached as an instance attribute, and reused for all subsequent variants. Both paths use this resolved query for title filtering; the full `patient_phenotype` string is passed to the final summarisation step for richer output. `_gene_fallback` resolves `_disease_query` itself if called directly (e.g. from a unit test) without requiring `run()` to have been called first.
+
 ---
 
 ## Manifest System
@@ -375,7 +398,7 @@ enabled: true                    # set false to disable without deleting
 order: 2                         # execution order (lower = earlier); ties broken alphabetically
 parallel: true                   # whether this tool can run concurrently with others at same order
 
-gate:                            # optional; omit to always run
+gate:                            # optional; omit to always run, or when gate() is in Python
   field: RS_ID                   # variant field to evaluate
   operator: not_na               # operators: equals, not_equals, in, not_in, not_na, na, slm
   value: ~                       # not needed for not_na / na
@@ -653,8 +676,13 @@ class BotTool(Tool):
 
 These rules must be respected in all new code:
 
-1. **Tools are stateless.** All state lives in `ToolContext`. Tools do not store
-   results on `self` between calls.
+1. **Tools are stateless with respect to variant data.** Tools must never store
+   per-variant results on `self` between calls — all variant-scoped state lives in
+   `ToolContext`. The one accepted exception is run-level caching of expensive
+   one-time computations that are identical across all variants (e.g. `_disease_query`
+   in `litvar2_summary`, derived solely from `patient_phenotype`). Such cached values
+   must be pipeline-run-scoped, variant-independent, and initialised in `__init__`
+   as `None`.
 
 2. **Tools never load models.** The LLM client is always accessed via `context.llm`.
 
