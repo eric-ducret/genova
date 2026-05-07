@@ -26,7 +26,7 @@ from pipeline.core.manifest  import ManifestLoader
 from pipeline.core.executor  import Executor
 from pipeline.core.normalizer import TARGET_COLUMNS
 from pipeline.llm.registry   import get_client
-from pipeline.tools          import AutoPVS1Tool, LitVar2SummaryTool, WebSearchAgentTool
+from pipeline.tools          import AutoPVS1Tool, LitVar2SummaryTool, SpliceAITool, WebSearchAgentTool
 from pipeline.stages         import retrieval, compression, reasoning, conclusion
 
 logger = logging.getLogger(__name__)
@@ -114,6 +114,7 @@ class Pipeline:
         # ── Tool instances (one per pipeline tool) ────────────────────────────
         self._tools = [
             LitVar2SummaryTool(),
+            SpliceAITool(),
             AutoPVS1Tool(),
             WebSearchAgentTool(),
         ]
