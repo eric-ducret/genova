@@ -283,6 +283,8 @@ class ReActAgent:
         self.registry = ToolRegistry()
         for t in tools:
             self.registry.register(t)
+        self._last_trace: list[str] = []
+        self.last_scratchpad: list[str] = []
 
     # ── public entry point ──────────────────
 
@@ -299,6 +301,7 @@ class ReActAgent:
                           model always has full context when deciding whether to
                           keep searching or synthesize a conclusion.
         """
+        self._last_trace = []
         conversation = []
         scratchpad: list[str] = []
 
@@ -306,10 +309,14 @@ class ReActAgent:
         # If pre-fetched evidence alone is sufficient, skip web searches entirely.
         if prefetched.strip():
             print("\n[Pre-loop checkpoint] Evaluating pre-fetched evidence...")
+            self._last_trace.append("[Pre-loop checkpoint] Evaluating pre-fetched evidence...")
             if self._check(user_input, scratchpad, prefetched):
                 print("[Pre-loop checkpoint] Pre-fetched evidence sufficient — skipping ReAct loop.")
+                self._last_trace.append("[Pre-loop checkpoint] Sufficient — ReAct loop SKIPPED")
+                self.last_scratchpad = scratchpad
                 return self._final(user_input, conversation, scratchpad, prefetched)
             print("[Pre-loop checkpoint] Pre-fetched evidence insufficient — proceeding with search.")
+            self._last_trace.append("[Pre-loop checkpoint] Insufficient — proceeding with ReAct loop")
 
         # ── ReAct loop ────────────────────────────────────────────────────────
         for step in range(self.cfg.max_steps):
@@ -324,6 +331,7 @@ class ReActAgent:
 
             if action_name is None:
                 print("[Warn] No valid tool selected — finalizing.")
+                self.last_scratchpad = scratchpad
                 return self._final(user_input, conversation, scratchpad, prefetched)
 
             scratchpad.append(f"Action: {action_name}")
@@ -341,9 +349,11 @@ class ReActAgent:
 
             # 5 · Post-step checkpoint (full context: prefetched + scratchpad)
             if self._check(user_input, scratchpad, prefetched):
+                self.last_scratchpad = scratchpad
                 return self._final(user_input, conversation, scratchpad, prefetched)
 
         print("[Warn] Max steps reached.")
+        self.last_scratchpad = scratchpad
         return self._final(user_input, conversation, scratchpad, prefetched)
 
     # ── private helpers ─────────────────────
@@ -423,6 +433,7 @@ class WebSearchAgentTool(ReActTool):
 
     name        = "websearch_agent"
     description = "ReAct agent that searches the web and NCBI for variant-phenotype evidence."
+    _last_trace: list[str] | None = None
 
     def run(self, variant: dict, context: ToolContext) -> str | None:
         """
@@ -435,6 +446,8 @@ class WebSearchAgentTool(ReActTool):
         Tool outputs are included generically from context.all_outputs — no
         hardcoded tool names.
         """
+        self._last_trace = []
+
         # ── Build prefetched block from earlier tools ─────────────────────────
         prefetched_parts = []
         for tool_name, output in context.all_outputs.items():
@@ -475,4 +488,11 @@ class WebSearchAgentTool(ReActTool):
         agent = ReActAgent(cfg, tools, llm=adapted_llm)
 
         output = agent.run(prompt, conversation=[], prefetched=prefetched)
+
+        # Capture ReAct trace from agent
+        self._last_trace.extend(agent._last_trace)
+        if hasattr(agent, 'last_scratchpad') and agent.last_scratchpad:
+            for entry in agent.last_scratchpad:
+                self._last_trace.append(entry)
+
         return output if output else None

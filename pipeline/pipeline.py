@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 import logging
+from collections import defaultdict
 from typing import Optional
 
 from pipeline.core.manifest  import ManifestLoader
@@ -64,6 +65,78 @@ def _parse_variant_str(variant_str: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 # PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_process_details(
+    process_log: list[dict],
+    variants: list[dict],
+) -> str:
+    """
+    Build the PROCESS DETAILS section from the executor's process log.
+    One block per variant, one entry per tool.
+    """
+    SEP_VARIANT = "─" * 56
+    lines = []
+
+    by_variant: dict[int, list[dict]] = defaultdict(list)
+    for entry in process_log:
+        by_variant[entry["variant_index"]].append(entry)
+
+    for i, variant in enumerate(variants):
+        gene  = variant.get("Gene", "?")
+        hgvs  = variant.get("HGVS", variant.get("Variant", "?"))
+        lines.append(f"\n{SEP_VARIANT}")
+        lines.append(f"VARIANT {i + 1} — {gene}  {hgvs}")
+        lines.append(SEP_VARIANT)
+
+        entries = by_variant.get(i, [])
+        if not entries:
+            lines.append("  (no tool entries recorded)")
+            continue
+
+        for entry in entries:
+            tool_name = entry["tool_name"].upper()
+            gate      = entry["gate"]
+
+            if gate == "SKIP":
+                reason = entry.get("gate_reason") or ""
+                lines.append(f"\n[{tool_name}]  GATE: SKIPPED  ({reason})")
+                continue
+
+            lines.append(f"\n[{tool_name}]  GATE: PASS")
+
+            metadata = entry.get("metadata") or {}
+
+            # ── LitVar2 metadata ────────────────────────────────────────
+            if "query" in metadata:
+                query   = metadata.get("query") or "?"
+                n_found = metadata.get("n_found") or 0
+                kept    = metadata.get("kept") or []
+                lines.append(f"  Query     : {query}")
+                lines.append(f"  Articles  : {len(kept)} kept from {n_found} found")
+                if kept:
+                    lines.append("  Kept articles:")
+                    for art in kept:
+                        lines.append(f"    [PMID:{art['pmid']}] {art['title']}")
+
+            # ── WebSearch trace ──────────────────────────────────────────
+            if "trace" in metadata:
+                trace = metadata.get("trace") or []
+                if trace:
+                    lines.append("  ReAct trace:")
+                    for step in trace:
+                        lines.append(f"    {step}")
+
+            # ── Raw output ───────────────────────────────────────────────
+            raw = entry.get("raw_output")
+            if raw:
+                lines.append("  Raw output:")
+                for raw_line in raw.splitlines():
+                    lines.append(f"    {raw_line}")
+            else:
+                lines.append("  Output: (none)")
+
+    return "\n".join(lines)
+
 
 class Pipeline:
     """
@@ -160,6 +233,12 @@ class Pipeline:
             executor=self._executor,
         )
 
+        # Build process details from executor log (before any global compression)
+        process_details = _build_process_details(
+            self._executor.process_log,
+            variant_dicts,
+        )
+
         # ── Stage 2: Global compression (optional) ────────────────────────────
         if self._enable_global_compression:
             augmented_context = compression.run(
@@ -184,7 +263,9 @@ class Pipeline:
         # ── Assemble final output (matches server_main.py /analyze format) ────
         SEP = "=" * 60
         output = (
-            f"{SEP}\nAUGMENTED CONTEXT\n{SEP}\n"
+            f"{SEP}\nPROCESS DETAILS\n{SEP}\n"
+            + process_details + "\n\n"
+            + f"{SEP}\nAUGMENTED CONTEXT\n{SEP}\n"
             + augmented_context + "\n\n"
             + f"{SEP}\nREASONING\n{SEP}\n"
             + reasoning_output + "\n\n"

@@ -165,6 +165,38 @@ def _apply_compression(
 # EXECUTOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _gate_reason(tool: "Tool", variant: dict) -> str:
+    """Best-effort human-readable reason for gate skip."""
+    type_val = variant.get("Type", "NA")
+    hgvs_val = variant.get("HGVS", "NA")
+    return f"type={type_val!r} hgvs={hgvs_val!r}"
+
+
+def _extract_tool_metadata(tool: "Tool") -> dict | None:
+    """
+    Safely extract per-tool metadata attributes set during run().
+    Uses getattr with None default — never raises AttributeError.
+    Returns None if the tool has no metadata attributes.
+    """
+    metadata = {}
+
+    # LitVar2SummaryTool metadata
+    last_query   = getattr(tool, "_last_query",   None)
+    last_n_found = getattr(tool, "_last_n_found", None)
+    last_kept    = getattr(tool, "_last_kept",    None)
+    if last_query is not None or last_kept is not None:
+        metadata["query"]   = last_query
+        metadata["n_found"] = last_n_found
+        metadata["kept"]    = last_kept  # list of {pmid, title}
+
+    # WebSearchAgentTool metadata
+    last_trace = getattr(tool, "_last_trace", None)
+    if last_trace is not None:
+        metadata["trace"] = last_trace  # list of strings
+
+    return metadata if metadata else None
+
+
 class Executor:
     """
     Runs all pipeline tools for a single variant and assembles their outputs
@@ -186,6 +218,7 @@ class Executor:
         manifests: list[dict],
     ):
         self._llm = llm
+        self.process_log: list[dict] = []
 
         # Build name → manifest lookup
         manifest_by_name = {m["name"]: m for m in manifests}
@@ -231,6 +264,9 @@ class Executor:
         Returns:
             A multi-line string containing all tool outputs for this variant.
         """
+        if variant_index == 0:
+            self.process_log = []
+
         all_outputs: dict[str, Optional[str]] = {}
         variant_report = ""
 
@@ -251,6 +287,14 @@ class Executor:
                 gate_result = self._eval_gate(tool, manifest, variant, context)
                 if not gate_result:
                     logger.debug("[Executor] Gate SKIP — %s", tool.name)
+                    self.process_log.append({
+                        "variant_index": variant_index,
+                        "tool_name":     tool.name,
+                        "gate":          "SKIP",
+                        "gate_reason":   _gate_reason(tool, variant),
+                        "raw_output":    None,
+                        "metadata":      None,
+                    })
                     continue
 
                 # ── Tool execution ────────────────────────────────────────────
@@ -258,6 +302,10 @@ class Executor:
                             tool.name, variant_index + 1, total_variants)
 
                 output = self._run_with_retry(tool, variant, context, manifest)
+
+                # ── Capture raw output and metadata BEFORE compression ────────
+                raw_output = output
+                tool_metadata = _extract_tool_metadata(tool)
 
                 # ── Compression ───────────────────────────────────────────────
                 if output and _should_compress(manifest, total_variants):
@@ -268,6 +316,15 @@ class Executor:
                 if output:
                     variant_report += output + "\n\n"
 
+                self.process_log.append({
+                    "variant_index": variant_index,
+                    "tool_name":     tool.name,
+                    "gate":          "PASS",
+                    "gate_reason":   None,
+                    "raw_output":    raw_output,
+                    "metadata":      tool_metadata,
+                })
+
             except PipelineError as e:
                 error_note = (
                     f"{tool.name.upper()} [FAILED — {type(e).__name__}]: {e}"
@@ -275,6 +332,14 @@ class Executor:
                 logger.error("[Executor] %s", error_note)
                 all_outputs[tool.name] = None
                 variant_report += error_note + "\n\n"
+                self.process_log.append({
+                    "variant_index": variant_index,
+                    "tool_name":     tool.name,
+                    "gate":          "PASS",
+                    "gate_reason":   None,
+                    "raw_output":    f"[FAILED — {type(e).__name__}]: {e}",
+                    "metadata":      None,
+                })
 
             except Exception as e:
                 # Unexpected — log and continue so one bad tool doesn't kill the run
@@ -284,6 +349,14 @@ class Executor:
                 logger.exception("[Executor] Unexpected error in %s", tool.name)
                 all_outputs[tool.name] = None
                 variant_report += error_note + "\n\n"
+                self.process_log.append({
+                    "variant_index": variant_index,
+                    "tool_name":     tool.name,
+                    "gate":          "PASS",
+                    "gate_reason":   None,
+                    "raw_output":    f"[FAILED — UnexpectedError]: {e}",
+                    "metadata":      None,
+                })
 
         return variant_report.strip()
 

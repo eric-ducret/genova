@@ -94,6 +94,9 @@ class LitVar2SummaryTool(SLMTool):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._disease_query: str | None = None
+        self._last_query: str | None = None
+        self._last_n_found: int = 0
+        self._last_kept: list[dict] | None = None
 
     # ── gate ──────────────────────────────────────────────────────────────────
 
@@ -364,6 +367,14 @@ class LitVar2SummaryTool(SLMTool):
         selected_pmids = self._select_relevant_pmids(titles, self._disease_query, context)
         logger.info("Gene fallback %s: selected %d/%d papers", gene, len(selected_pmids), len(titles))
 
+        self._last_query   = gene
+        self._last_n_found = len(titles)
+        self._last_kept    = [
+            {"pmid": pmid, "title": titles[pmid]}
+            for pmid in selected_pmids
+            if pmid in titles
+        ]
+
         papers = self._fetch_abstracts(selected_pmids)
         if not papers:
             return None
@@ -391,6 +402,10 @@ class LitVar2SummaryTool(SLMTool):
         - rsID absent, Gene present → gene-level fallback
         - Both absent              → None
         """
+        self._last_query   = None
+        self._last_n_found = 0
+        self._last_kept    = None
+
         rsid = context.field("RS_ID")
         gene = context.field("Gene")
 
@@ -416,6 +431,14 @@ class LitVar2SummaryTool(SLMTool):
             # ── step 3: SLM filter (disease query, not raw phenotype) ─────────
             selected_pmids = self._select_relevant_pmids(titles, self._disease_query, context)
             logger.info("Selected %d/%d papers for abstract fetch", len(selected_pmids), len(titles))
+
+            self._last_query   = rsid
+            self._last_n_found = len(titles)
+            self._last_kept    = [
+                {"pmid": pmid, "title": titles[pmid]}
+                for pmid in selected_pmids
+                if pmid in titles
+            ]
 
             # ── step 4: abstracts ─────────────────────────────────────────────
             papers = self._fetch_abstracts(selected_pmids)
