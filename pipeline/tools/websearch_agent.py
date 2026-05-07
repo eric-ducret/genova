@@ -112,7 +112,7 @@ def _scratchpad_str(scratchpad: list[str]) -> str:
 def _prefetched_str(prefetched: str) -> str:
     """Format the pre-fetched block for inclusion in prompts."""
     return (
-        f"\n\nPre-fetched evidence (LitVar2 / AutoPVS1):\n{prefetched}"
+        f"\n\nPre-fetched evidence (prior tools):\n{prefetched}"
         if prefetched.strip() else ""
     )
 
@@ -168,7 +168,7 @@ def checkpoint_messages(user_input: str, scratchpad: list[str],
       - After each tool observation inside the loop to check if further search is needed.
     """
     pre_block = (
-        f"Pre-fetched evidence (LitVar2 / AutoPVS1):\n{prefetched.strip()}\n\n"
+        f"Pre-fetched evidence (prior tools):\n{prefetched.strip()}\n\n"
         if prefetched.strip() else ""
     )
     obs_block = (
@@ -201,7 +201,7 @@ def final_answer_messages(user_input: str, conversation: list[dict],
     as distinct labelled blocks, ensuring nothing is silently omitted.
     """
     pre_block = (
-        f"Pre-fetched evidence (LitVar2 / AutoPVS1):\n{prefetched.strip()}\n\n"
+        f"Pre-fetched evidence (prior tools):\n{prefetched.strip()}\n\n"
         if prefetched.strip() else ""
     )
     obs_block = (
@@ -407,7 +407,7 @@ _RETRIEVAL_PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "retr
 # Inline fallback used only when the prompt file has not been created yet
 _RETRIEVAL_TEMPLATE_FALLBACK = (
     "PATIENT PHENOTYPE:\n{patient_report}\n\n"
-    "VARIANT DATA:\n{variant}\n{litvar2_block}{autopvs1_block}\n"
+    "VARIANT DATA:\n{variant}\n{prior_evidence_block}\n"
     "TASK: Search for evidence linking this variant to the patient phenotype."
 )
 
@@ -429,19 +429,18 @@ class WebSearchAgentTool(ReActTool):
         Instantiate ReActAgent with context.llm (wrapped in _LLMAdapter) and
         the standard web tools, then run the retrieval prompt for this variant.
 
-        Pre-fetched evidence from earlier tools (LitVar2, AutoPVS1) is passed to
-        the agent via the prefetched= argument so it can decide whether to skip
-        web search entirely.
+        Pre-fetched evidence from all earlier tools (LitVar2, AutoPVS1, SpliceAI,
+        and any future tools at order < 3) is passed to the agent via the
+        prefetched= argument so it can decide whether to skip web search entirely.
+        Tool outputs are included generically from context.all_outputs — no
+        hardcoded tool names.
         """
         # ── Build prefetched block from earlier tools ─────────────────────────
-        litvar2_block  = context.all_outputs.get("litvar2_summary") or ""
-        autopvs1_block = context.all_outputs.get("autopvs1") or ""
-
         prefetched_parts = []
-        if litvar2_block:
-            prefetched_parts.append(f"LITVAR2 EVIDENCE:\n{litvar2_block}")
-        if autopvs1_block:
-            prefetched_parts.append(f"AUTOPVS1 EVIDENCE:\n{autopvs1_block}")
+        for tool_name, output in context.all_outputs.items():
+            if output:
+                label = tool_name.upper().replace("_", " ")
+                prefetched_parts.append(f"{label} EVIDENCE:\n{output}")
         prefetched = "\n\n".join(prefetched_parts)
 
         # ── Build retrieval prompt ────────────────────────────────────────────
@@ -453,14 +452,20 @@ class WebSearchAgentTool(ReActTool):
             f"{k}={variant.get(k, 'NA')}" for k in TARGET_COLUMNS
         )
 
-        litvar2_fmt  = f"\nPRE-FETCHED LITVAR2 EVIDENCE:\n{litvar2_block}\n" if litvar2_block else ""
-        autopvs1_fmt = f"\n{autopvs1_block}\n" if autopvs1_block else ""
+        prior_evidence_block = ""
+        if context.all_outputs:
+            parts = []
+            for tool_name, output in context.all_outputs.items():
+                if output:
+                    label = tool_name.upper().replace("_", " ")
+                    parts.append(f"PRE-FETCHED {label} EVIDENCE:\n{output}")
+            if parts:
+                prior_evidence_block = "\n\n".join(parts) + "\n"
 
         prompt = template.format(
             patient_report=context.patient_phenotype,
             variant=variant_str,
-            litvar2_block=litvar2_fmt,
-            autopvs1_block=autopvs1_fmt,
+            prior_evidence_block=prior_evidence_block,
         )
 
         # ── Instantiate and run agent ─────────────────────────────────────────

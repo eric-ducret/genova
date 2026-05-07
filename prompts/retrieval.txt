@@ -4,8 +4,7 @@ PATIENT PHENOTYPE:
 
 VARIANT DATA:
 {variant}
-{litvar2_block}
-{autopvs1_block}
+{prior_evidence_block}
 TASK:
 
 Identify peer-reviewed literature that provides evidence regarding
