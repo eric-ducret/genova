@@ -1,0 +1,21 @@
+name: spliceai
+description: "Fetches SpliceAI delta scores from the Broad Institute API for splice impact prediction."
+enabled: true
+
+order: 1
+parallel: true
+
+# Gate is evaluated by SpliceAITool.gate() (Python method).
+# Skips synonymous, intergenic, UTR variants and unresolvable coordinates.
+gate: ~
+
+compress:
+  enabled: true
+  threshold: auto
+  strategy: slm
+  max_tokens: 250
+
+timeout: 60
+retry:
+  attempts: 2
+  backoff: 3.0
