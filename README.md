@@ -18,12 +18,25 @@ CSV / Excel  ──►  normalize_upload()
                         ▼
              Pipeline.run(variants, phenotype)
                         │
-            ┌───────────┼───────────┐
-            │           │           │
-        LitVar2      AutoPVS1   WebSearch
-        (order 1)   (order 2)   Agent (3)
-            │           │           │
-            └───────────┴───────────┘
+        ┌─────────────────────────────────────────┐
+        │           order 1 — parallel             │
+        │   LitVar2SummaryTool    SpliceAITool     │
+        └──────────────┬──────────────────────────┘
+                       │  per-variant outputs
+        ┌──────────────┴──────────────────────────┐
+        │           order 2 — parallel             │
+        │              AutoPVS1Tool                │
+        └──────────────┬──────────────────────────┘
+                       │  per-variant outputs
+        ┌──────────────┴──────────────────────────┐
+        │           order 3 — serial               │
+        │          WebSearchAgentTool              │
+        │   (receives all outputs for this         │
+        │    variant — searches only if needed)    │
+        └──────────────┬──────────────────────────┘
+                       │
+                  mini-doc for
+                  this variant
                         │ mini-docs
                         ▼
               [Stage 2 — optional compression]

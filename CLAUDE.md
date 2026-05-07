@@ -40,6 +40,7 @@ variant-pipeline/
 ├── pipeline/
 │   ├── __init__.py
 │   ├── pipeline.py                  ← top-level orchestrator
+│   ├── config.py                    ← global pipeline configuration (GENOME_BUILD, EXECUTION_MODE)
 │   │
 │   ├── core/
 │   │   ├── __init__.py
@@ -67,7 +68,8 @@ variant-pipeline/
 │   │   ├── __init__.py
 │   │   ├── base.py                  ← Tool, NetworkTool, SLMTool, RAGTool, BotTool
 │   │   ├── litvar2.py               ← LitVar2 literature search (rsID + gene fallback)
-│   │   ├── autopvs1.py
+│   │   ├── autopvs1.py              ← AutoPVS1 PVS1 criterion evaluation (LoF variants)
+│   │   ├── spliceai.py              ← SpliceAI splice impact delta scores (Broad API)
 │   │   ├── websearch.py
 │   │   ├── websearch_agent.py
 │   │   └── ncbi.py
@@ -75,6 +77,7 @@ variant-pipeline/
 │   └── manifests/
 │       ├── litvar2.yaml
 │       ├── autopvs1.yaml
+│       ├── spliceai.yaml
 │       └── websearch_agent.yaml
 │
 └── prompts/
@@ -365,18 +368,28 @@ note the missing evidence in the report rather than reasoning from a gap.
 
 ### Implemented tools
 
-| Tool | Class | Gate |
-|---|---|---|
-| `litvar2_summary` | `SLMTool` | RS_ID valid **or** Gene present (Python gate — see below) |
-| `autopvs1` | `NetworkTool` | — |
-| `websearch` / `websearch_agent` | `SLMTool` / `ReActTool` | — |
-| `ncbi` | `NetworkTool` | — |
+| Tool | Class | Order | Gate |
+|---|---|---|---|
+| `litvar2_summary` | `SLMTool` | 1 (parallel) | RS_ID valid **or** Gene present (Python gate) |
+| `spliceai` | `NetworkTool` | 1 (parallel) | Python gate — skips synonymous, intergenic, UTR, unresolvable coords |
+| `autopvs1` | `NetworkTool` | 2 (parallel) | Python gate — LoF/frameshift/splice variants only |
+| `websearch_agent` | `ReActTool` | 3 (serial) | None — internal pre-loop checkpoint decides whether to search |
+| `ncbi` | `NetworkTool` | — | — |
 
 **`litvar2_summary`** runs two paths depending on what variant fields are available:
 - **rsID present and valid** (`rs\d+`) — variant-level search via the LitVar2 publications endpoint; fetches PMIDs, filters titles with the SLM using the resolved disease query, fetches abstracts, and returns a summary with inline PMID citations prefixed `LitVar2 evidence summary for {rsid}:`.
 - **rsID absent, Gene present** — gene-level fallback via `GET /variant/search/gene/{gene}`; collects and deduplicates PMIDs across the first 10 variants returned for that gene, then runs the same filter → abstracts → summary pipeline. Output is prefixed `LitVar2 gene-level evidence for {gene} (no rsID):` so downstream reasoning stages can distinguish the two.
 
 `_disease_query` is resolved once per pipeline run via a single SLM call (`_resolve_disease_query`), cached as an instance attribute, and reused for all subsequent variants. Both paths use this resolved query for title filtering; the full `patient_phenotype` string is passed to the final summarisation step for richer output. `_gene_fallback` resolves `_disease_query` itself if called directly (e.g. from a unit test) without requiring `run()` to have been called first.
+
+**`spliceai`** queries the Broad Institute SpliceAI API and returns delta scores
+(DS_AG, DS_AL, DS_DG, DS_DL) for acceptor/donor gain and loss, along with the
+`sai10kPredictions` clinical interpretation block (aberration type, confidence,
+frameshift description). Only the MANE Select transcript is reported. Coordinates
+and genome build are sourced from the canonical variant dict fields; build is read
+from `pipeline/config.py` (`GENOME_BUILD`). Skips synonymous, intergenic, and UTR
+variants via Python gate. Output labels are enriched for SLM readability
+(plain-English aberration names, explicit delta score scale).
 
 ---
 
