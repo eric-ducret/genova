@@ -286,9 +286,12 @@ def fetch_and_format_autopvs1(
 # PVS1 GATE CONSTANTS  (ported from server_main._pvs1_decision)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Variant types that unambiguously warrant PVS1
+# Variant types that unambiguously warrant PVS1.
+# "stoploss" is intentionally excluded: stop-loss variants extend the protein
+# rather than truncate it, so PVS1 does not apply and AutoPVS1 would give
+# misleading output for that class.
 _CLEAR_LOF_TYPES = {
-    "frameshift", "nonsense", "stopgain", "stoploss",
+    "frameshift", "nonsense", "stopgain",
     "splice-3", "splice-5", "splice_site", "splicing",
     "start_lost", "initiator_codon", "deletion", "indel",
 }
