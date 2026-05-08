@@ -16,8 +16,9 @@ Reasoning steps:
 4. Inheritance coherence: Evaluate whether the observed zygosity aligns with the gene's known inheritance mode. Reflect on whether the inheritance pattern supports a causative role.
 5. Flags/uncertainties: Note any contradictions or missing information. Reflect on whether these uncertainties reduce the likelihood that the variant is causative.
 
-CROSS-VARIANT ANALYSIS (after all variants):
-Identify any combinatorial relationships between variants (compound heterozygosity, digenic, modifier). Assess whether variants collectively explain the full phenotype better than individually. Phase is unknown unless stated. If no interactions are relevant, state so in one sentence.
+CROSS-VARIANT ANALYSIS (after all variants, 3 lines maximum):
+List only confirmed combinatorial relationships (compound het, digenic, modifier) as: GENE1/GENE2 — relationship type — one-sentence rationale.
+If none: "No inter-variant relationships identified." Nothing more.
 
 Rules:
 - Reason for ALL variants.
