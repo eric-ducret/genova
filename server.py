@@ -16,14 +16,11 @@ Startup:
     LLM client and manifests are loaded at that point, not per request.
 """
 
-import asyncio
-import io
-import sys
 import os
 import logging
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.core.normalizer import normalize_upload
@@ -88,16 +85,7 @@ async def analyze(
 ):
     """
     Upload a variants CSV + patient phenotype description.
-    Runs the full four-stage pipeline and streams output in two phases:
-
-    Phase 1 — Live feed: each print() from the pipeline is forwarded immediately.
-    Phase 2 — Structured output: after pipeline completes, writes %%END_STREAM%%
-              followed by the full structured result (PROCESS DETAILS + AUGMENTED
-              CONTEXT + REASONING + FINAL REPORT sections).
-
-    NOTE: sys.stdout redirect is not thread-safe under multi-worker deployments.
-    Safe for current SLURM single-worker setup. For multi-worker, use
-    a threading.local() stdout redirect or a logging handler instead.
+    Runs the full four-stage pipeline and returns the structured report as plain text.
     """
     raw = await csv_file.read()
 
@@ -110,67 +98,8 @@ async def analyze(
         raise HTTPException(status_code=400, detail="CSV contained no variant rows.")
 
     pipeline = _get_pipeline()
-
-    # Per-request queue — avoids global stdout contamination in concurrent requests
-    queue: asyncio.Queue[str | None] = asyncio.Queue()
-    loop = asyncio.get_event_loop()
-
-    class _QueueWriter(io.TextIOBase):
-        """Captures print() output and puts lines into the async queue."""
-        def __init__(self):
-            self._buf = ""
-
-        def write(self, text: str) -> int:
-            self._buf += text
-            while "\n" in self._buf:
-                line, self._buf = self._buf.split("\n", 1)
-                loop.call_soon_threadsafe(queue.put_nowait, line + "\n")
-            return len(text)
-
-        def flush(self):
-            if self._buf:
-                loop.call_soon_threadsafe(queue.put_nowait, self._buf)
-                self._buf = ""
-
-    async def _run_pipeline():
-        """Run the pipeline, redirecting its stdout to the queue."""
-        original_stdout = sys.stdout
-        writer = _QueueWriter()
-        # NOTE: sys.stdout redirect is not thread-safe under multi-worker deployments.
-        # Safe for current SLURM single-worker setup. For multi-worker, use
-        # a threading.local() stdout redirect or a logging handler instead.
-        sys.stdout = writer
-        result = None
-        error  = None
-        try:
-            result = await pipeline.run(variants, patient_report)
-        except Exception as e:
-            error = str(e)
-            logger.exception("[Server] Pipeline error during streaming run")
-        finally:
-            writer.flush()
-            sys.stdout = original_stdout
-        # Signal end of live feed and emit structured output
-        if error:
-            await queue.put(f"\n%%END_STREAM%%\n[Pipeline error: {error}]\n")
-        else:
-            await queue.put(f"\n%%END_STREAM%%\n{result}")
-        await queue.put(None)  # sentinel — generator stops
-
-    async def _generate():
-        task = asyncio.create_task(_run_pipeline())
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            yield item
-        await task  # ensure any exceptions are propagated
-
-    return StreamingResponse(
-        _generate(),
-        media_type="text/plain",
-        headers={"X-Content-Type-Options": "nosniff"},
-    )
+    result = await pipeline.run(variants, patient_report)
+    return PlainTextResponse(content=result)
 
 
 if __name__ == "__main__":
