@@ -50,9 +50,12 @@ ABERRATION_LABELS = {
     "frameshift":       "Frameshift (predicted)",
 }
 
-# Variant types that cannot affect splicing — skip entirely
+# Variant types that cannot affect splicing — skip entirely.
+# Synonymous/silent variants are intentionally NOT excluded: they can disrupt
+# exonic splicing enhancers/silencers or create pseudo-splice sites, and
+# SpliceAI scores them reliably.
 _NO_SPLICE_TYPES = {
-    "synonymous", "silent", "intergenic", "upstream", "downstream",
+    "intergenic", "upstream", "downstream",
     "utr", "utr3", "utr5",
 }
 
