@@ -41,7 +41,7 @@ COLUMN_ALIASES = {
     "genomic_position": "Position", "coord": "Position",
     # RS_ID
     "rs_id": "RS_ID", "rsid": "RS_ID", "dbsnp": "RS_ID",
-    "rs": "RS_ID", "snp_id": "RS_ID",
+    "rs": "RS_ID", "snp_id": "RS_ID", "rs id": "RS_ID",
     # Ref_seq
     "ref_seq": "Ref_seq", "ref": "Ref_seq", "reference": "Ref_seq",
     "ref_allele": "Ref_seq", "reference_allele": "Ref_seq",
@@ -61,7 +61,7 @@ COLUMN_ALIASES = {
     "zyg": "Zygosity",
     # Gene
     "gene": "Gene", "gene_name": "Gene", "gene_symbol": "Gene",
-    "hugo": "Gene", "symbol": "Gene",
+    "hugo": "Gene", "symbol": "Gene", "genes": "Gene",
     # OMIM_phenotype
     "omim_phenotype": "OMIM_phenotype", "omim": "OMIM_phenotype",
     "phenotype": "OMIM_phenotype", "disease": "OMIM_phenotype",
