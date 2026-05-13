@@ -1,3 +1,6 @@
+> **Archived.** Migration is complete. This document is archived for historical reference only.
+> The constraints, task list, and in-progress notes below no longer apply to the current codebase.
+
 # MIGRATION.md — Refactoring Instructions for Claude Code
 
 This document tells Claude Code exactly what to do with the existing source files.

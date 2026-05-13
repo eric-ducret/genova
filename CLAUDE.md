@@ -18,7 +18,7 @@ entry point regardless of how compute resources were allocated.
 
 **Core philosophy:**
 - The framework handles orchestration. Tools handle one thing each.
-- Adding a new tool = one `.py` file + one `.yaml` manifest. Nothing else changes.
+- Adding a new tool = one `.py` file + one `.yaml` manifest + one import line in `pipeline/tools/__init__.py` + one instance line in `Pipeline._tools` (`pipeline/pipeline.py`).
 - The SLM is a shared resource. Tools request it via context; they do not own it.
 - Errors are informative, not silent. Failures appear in the report with context.
 
@@ -185,9 +185,9 @@ Same interface, slower. Useful for testing tool logic without a running vLLM ser
 # pipeline/llm/registry.py
 MODELS = {
     "qwen3.5-9b": {
-        "client": "vllm",
+        "client": "hf",            # currently "hf" (dev default); change to "vllm" for production
         "model_id": "Qwen/Qwen3.5-9B",
-        "enable_thinking": False,      # MUST be False for Qwen3.5 in this pipeline
+        "enable_thinking": False,  # MUST be False for Qwen3.5 in this pipeline
         "max_tokens_default": 1024,
     },
     # add new models here
@@ -374,7 +374,6 @@ note the missing evidence in the report rather than reasoning from a gap.
 | `spliceai` | `NetworkTool` | 1 (parallel) | Python gate — skips synonymous, intergenic, UTR, unresolvable coords |
 | `autopvs1` | `NetworkTool` | 2 (parallel) | Python gate — LoF/frameshift/splice variants only |
 | `websearch_agent` | `ReActTool` | 3 (serial) | None — internal pre-loop checkpoint decides whether to search |
-| `ncbi` | `NetworkTool` | — | — |
 
 **`litvar2_summary`** runs two paths depending on what variant fields are available:
 - **rsID present and valid** (`rs\d+`) — variant-level search via the LitVar2 publications endpoint; fetches PMIDs, filters titles with the SLM using the resolved disease query, fetches abstracts, and returns a summary with inline PMID citations prefixed `LitVar2 evidence summary for {rsid}:`.
@@ -460,15 +459,18 @@ Switching between modes requires no changes to tool code.
 
 ### Stage 1 — Retrieval (`stages/retrieval.py`)
 
-For each variant, loads all enabled manifests, evaluates gates, sorts by order,
-and executes tools. Assembles outputs into a per-variant mini-doc string.
+For each variant, calls `executor.run_variant()` and collects the returned mini-doc.
+`retrieval.py` is a thin loop — manifest loading, gate evaluation, tool ordering,
+execution, and per-tool compression all happen inside the Executor.
 
 ```
-variant dict
-    → gate evaluation (skip if False)
-    → tool.run(variant, context)
-    → compression (if configured and threshold met)
-    → append to mini-doc
+retrieval.py (per variant)
+    → executor.run_variant(variant, ...)
+          → gate evaluation (skip if False)
+          → tool.run(variant, context)
+          → compression (if configured and threshold met)
+          → append to mini-doc
+    ← mini-doc string
 ```
 
 All mini-docs are concatenated into the augmented context document passed to Stage 2.
@@ -500,7 +502,7 @@ Output format per variant:
 **Phenotype fit:** match | mismatch | uncertain — ...
 **Inheritance check:** consistent | inconsistent | insufficient data
 **Evidence strength:** strong | moderate | weak | absent
-**ACMG criteria:** ...
+**ACMG criteria**: ...
 **Comment:** ...
 ```
 
@@ -540,7 +542,7 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 
 ### Local / dev
 
-Use `hf_client` by setting `LLM_BACKEND=hf` in config. No vLLM needed.
+Set `LLM_BACKEND=hf` to use `hf_client`. No vLLM needed.
 Slower but identical pipeline behavior.
 
 ### Client (login node)
@@ -705,7 +707,9 @@ These rules must be respected in all new code:
    Never return error strings. Never raise bare `Exception`.
 
 5. **Prompts live in files.** All SLM prompts longer than one sentence belong in
-   `prompts/`. Load them with `Path("prompts/my_prompt.txt").read_text()`.
+   `prompts/`. Load them with:
+   `Path(__file__).parent.parent.parent / "prompts" / "my_prompt.txt"`.
+   This resolves relative to the source file, not the working directory.
    Do not hardcode multi-line prompts in Python.
 
 6. **Manifests are the source of truth for ordering and gating.**

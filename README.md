@@ -113,23 +113,55 @@ with `"NA"`. Common column names are auto-detected via `COLUMN_ALIASES` in
 
 ## Output format
 
-Plain text with three sections:
+Plain text with four sections separated by `=`×60 banners:
 
 ```
+============================================================
+PROCESS DETAILS
+============================================================
+
+────────────────────────────────────────────────────────
+VARIANT 1 — GENE  NM_xxx.x:c.xxx
+────────────────────────────────────────────────────────
+
+[LITVAR2_SUMMARY]  GATE: PASS
+  Query     : <disease query>
+  Articles  : N kept from M found
+  Kept articles:
+    [PMID:12345678] Title of article
+
+[SPLICEAI]  GATE: PASS
+  Raw output:
+    SpliceAI scores ...
+
+[AUTOPVS1]  GATE: SKIPPED  (variant type not LoF)
+
+[WEBSEARCH_AGENT]  GATE: PASS
+  ReAct trace:
+    Step 1: ...
+  Raw output:
+    ...
+
 ============================================================
 AUGMENTED CONTEXT
 ============================================================
 PATIENT DATA:
-...
+<patient phenotype>
 
 VARIANT DATA:
+
 VARIANT 1:
+Variant=..., Chromosome=..., Gene=..., ...
+
+<tool outputs for variant 1>
+
+VARIANT 2:
 ...
 
 ============================================================
 REASONING
 ============================================================
-...
+<step-by-step clinical reasoning per variant>
 
 ============================================================
 FINAL REPORT
@@ -142,9 +174,24 @@ FINAL REPORT
 **ACMG criteria**: ...
 **Comment:** ...
 
+---
+
 # Clinical Conclusion
 ...
 ```
+
+**PROCESS DETAILS** logs each tool's gate outcome (`PASS` or `SKIPPED` with reason)
+and its metadata: LitVar2 keeps article titles and PMIDs; WebSearchAgent records the
+full ReAct trace; all tools append their raw string output.
+
+**AUGMENTED CONTEXT** is the evidence document assembled by Stage 1 (and optionally
+compressed by Stage 2) that is fed to the SLM reasoning and conclusion stages.
+
+**REASONING** is the free-form step-by-step output of Stage 3 (not shown in the final
+clinical report — used only as input to Stage 4).
+
+**FINAL REPORT** is the structured Stage 4 output: one block per variant followed by
+a `# Clinical Conclusion` paragraph.
 
 ---
 

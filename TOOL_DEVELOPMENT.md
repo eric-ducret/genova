@@ -95,7 +95,8 @@ class MyTool(SLMTool):
    Never return an error string. Never raise bare `Exception`.
 
 5. **Prompts in files.** Multi-line SLM prompts belong in `prompts/`.
-   Load with `Path("prompts/my_prompt.txt").read_text()`. Do not hardcode.
+   Load with `(Path(__file__).parent.parent.parent / "prompts" / "my_prompt.txt").read_text()`.
+   This anchors the path to the source file location, not the working directory. Do not hardcode.
 
 6. **Return free-form string or None.** No structured output required.
    The SLM handles synthesis in stages 3 and 4.
