@@ -34,6 +34,10 @@ class ToolContext:
     db: Any | None = None                # VectorStore | None — None if no DB configured
     browser: Any | None = None           # BrowserSession | None — None if no bot configured
 
+    # ── Run-level metadata ────────────────────────────────────────────────────
+    genome_build: str = "hg19"
+    raw_fields: dict = field(default_factory=dict)
+
     # ── Convenience ───────────────────────────────────────────────────────────
 
     def field(self, name: str) -> str:

@@ -23,6 +23,7 @@ import logging
 from collections import defaultdict
 from typing import Optional
 
+from pipeline.config          import DEFAULT_GENOME_BUILD
 from pipeline.core.manifest  import ManifestLoader
 from pipeline.core.executor  import Executor
 from pipeline.core.normalizer import TARGET_COLUMNS
@@ -202,13 +203,21 @@ class Pipeline:
 
     # ── public ────────────────────────────────────────────────────────────────
 
-    async def run(self, variants: list[str], patient_phenotype: str) -> str:
+    async def run(
+        self,
+        variants: list[dict],
+        patient_phenotype: str,
+        genome_build: str = DEFAULT_GENOME_BUILD,
+        raw_rows: list[dict] | None = None,
+    ) -> str:
         """
         Execute the full four-stage pipeline and return the combined output.
 
         Args:
-            variants:          List of key=value variant strings from normalize_upload().
+            variants:          List of normalized variant dicts from normalize_upload().
             patient_phenotype: Free-text patient phenotype string from the request.
+            genome_build:      Reference genome build for this run ("hg19" or "hg38").
+            raw_rows:          Full original CSV rows, one dict per variant.
 
         Returns:
             Combined output string:
@@ -222,21 +231,21 @@ class Pipeline:
         if not variants:
             raise ValueError("variants list is empty — nothing to analyze.")
 
-        # ── String → dict conversion ──────────────────────────────────────────
-        variant_dicts = [_parse_variant_str(v) for v in variants]
-        logger.info("[Pipeline] Processing %d variants.", len(variant_dicts))
+        logger.info("[Pipeline] Processing %d variants.", len(variants))
 
         # ── Stage 1: Retrieval ────────────────────────────────────────────────
         augmented_context = retrieval.run(
-            variants=variant_dicts,
+            variants=variants,
             patient_phenotype=patient_phenotype,
             executor=self._executor,
+            genome_build=genome_build,
+            raw_rows=raw_rows,
         )
 
         # Build process details from executor log (before any global compression)
         process_details = _build_process_details(
             self._executor.process_log,
-            variant_dicts,
+            variants,
         )
 
         # ── Stage 2: Global compression (optional) ────────────────────────────

@@ -475,14 +475,13 @@ class WebSearchAgentTool(ReActTool):
             if parts:
                 prior_evidence_block = "\n\n".join(parts) + "\n"
 
-        prompt = template.format(
-            patient_report=context.patient_phenotype,
-            variant=variant_str,
-            prior_evidence_block=prior_evidence_block,
-        )
+        prompt = (template
+            .replace("{patient_report}", context.patient_phenotype)
+            .replace("{variant}", variant_str)
+            .replace("{prior_evidence_block}", prior_evidence_block))
 
         # ── Instantiate and run agent ─────────────────────────────────────────
-        cfg   = AgentConfig(model_id="Qwen/Qwen3.5-9B", max_steps=6)
+        cfg   = AgentConfig(model_id="Qwen/Qwen3.5-9B", max_steps=4)
         tools = [WebSearchTool(), WebFetchTool(max_chars=2000), NCBIFetchTool()]
         adapted_llm = _LLMAdapter(context.llm)
         agent = ReActAgent(cfg, tools, llm=adapted_llm)

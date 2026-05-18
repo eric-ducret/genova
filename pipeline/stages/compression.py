@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 _CHARS_PER_TOKEN = 4
 
 # Default thresholds
-_DEFAULT_TOKEN_THRESHOLD    = 28_000   # trigger compression above this
-_DEFAULT_MAX_TOKENS_PER_VAR = 1_200    # target per variant after compression
+_DEFAULT_TOKEN_THRESHOLD    = 4000   # trigger compression above this
+_DEFAULT_MAX_TOKENS_PER_VAR = 600    # target per variant after compression
 
 
 def _estimate_tokens(text: str) -> int:

@@ -65,10 +65,9 @@ def run(augmented_context: str, reasoning: str, llm: "LLMClient") -> str:
     """
     logger.info("[Conclusion] Generating structured report...")
     template   = _load_prompt()
-    user_prompt = template.format(
-        augmented_context=augmented_context,
-        reasoning_output=reasoning,
-    )
+    user_prompt = (template
+        .replace("{augmented_context}", augmented_context)
+        .replace("{reasoning_output}", reasoning))
 
     return llm.generate(
         system="You are an expert clinical geneticist.",

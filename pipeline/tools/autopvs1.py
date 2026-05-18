@@ -322,6 +322,11 @@ class AutoPVS1Tool(NetworkTool):
 
         Uses Type field first, then HGVS clues, then LLM.
         """
+        # AutoPVS1 web service is hg19 only
+        if context.genome_build not in ("hg19", "37", "GRCh37", "b37"):
+            print(f"[PVS1 gate] SKIP — AutoPVS1 is hg19 only, build={context.genome_build!r}")
+            return False
+
         type_val = variant.get("Type", "").lower()
         hgvs_val = variant.get("HGVS", "").lower()
 

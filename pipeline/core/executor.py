@@ -28,6 +28,7 @@ import time
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from pipeline.config import DEFAULT_GENOME_BUILD
 from pipeline.core.context import ToolContext
 from pipeline.core.errors import PipelineError, SLMError, ToolGateError
 from pipeline.core.manifest import ManifestLoader, eval_manifest_gate
@@ -248,6 +249,8 @@ class Executor:
         patient_phenotype: str,
         variant_index: int,
         total_variants: int,
+        genome_build: str = DEFAULT_GENOME_BUILD,
+        raw_fields: dict | None = None,
     ) -> str:
         """
         Run all tools for one variant and return the assembled mini-doc string.
@@ -280,6 +283,8 @@ class Executor:
                 variant_index=variant_index,
                 total_variants=total_variants,
                 llm=self._llm,
+                genome_build=genome_build,
+                raw_fields=raw_fields or {},
             )
 
             try:
@@ -393,7 +398,7 @@ class Executor:
 
         # Manifest gate (only reached if tool uses the default Tool.gate)
         try:
-            manifest_result = eval_manifest_gate(manifest, variant)
+            manifest_result = eval_manifest_gate(manifest, variant, context)
         except Exception as e:
             raise ToolGateError(
                 f"Manifest gate evaluation failed for {tool.name}: {e}"

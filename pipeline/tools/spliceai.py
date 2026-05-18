@@ -19,7 +19,6 @@ import requests
 from pipeline.tools.base import NetworkTool
 from pipeline.core.context import ToolContext
 from pipeline.core.errors import ToolFetchError, ToolParseError
-from pipeline.config import GENOME_BUILD
 
 # Reuse the coord extractor already written for AutoPVS1
 from pipeline.tools.autopvs1 import parse_variant_coords
@@ -114,7 +113,7 @@ def fetch_and_format_spliceai(
     pos: str,
     ref: str,
     alt: str,
-    hg: str = GENOME_BUILD,
+    hg: str = "hg19",
     distance: int = 500,
     mask: int = 0,
     timeout: int = 60,
@@ -281,7 +280,7 @@ class SpliceAITool(NetworkTool):
 
         return fetch_and_format_spliceai(
             chrom, pos, ref, alt,
-            hg=GENOME_BUILD,
+            hg=context.genome_build,
             distance=self.distance,
             mask=self.mask,
             timeout=self.timeout,

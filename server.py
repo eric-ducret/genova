@@ -90,7 +90,9 @@ async def analyze(
     raw = await csv_file.read()
 
     try:
-        variants = normalize_upload(raw, filename=csv_file.filename or "upload.csv")
+        variants, raw_rows = normalize_upload(
+            raw, filename=csv_file.filename or "upload.csv"
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -98,7 +100,12 @@ async def analyze(
         raise HTTPException(status_code=400, detail="CSV contained no variant rows.")
 
     pipeline = _get_pipeline()
-    result = await pipeline.run(variants, patient_report)
+    result = await pipeline.run(
+        variants,
+        patient_report,
+        raw_rows=raw_rows,
+        # genome_build uses DEFAULT_GENOME_BUILD — auto-detection comes later
+    )
     return PlainTextResponse(content=result)
 
 

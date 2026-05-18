@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import yaml
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from pipeline.core.errors import ManifestError
+
+if TYPE_CHECKING:
+    from pipeline.core.context import ToolContext
 
 
 # Path resolved relative to this file so it works regardless of cwd
@@ -25,7 +28,11 @@ MANIFESTS_DIR = Path(__file__).parent.parent / "manifests"
 
 REQUIRED_FIELDS = {"name", "enabled"}
 
-VALID_OPERATORS = {"equals", "not_equals", "in", "not_in", "not_na", "na", "slm"}
+VALID_OPERATORS = {
+    "equals", "not_equals", "in", "not_in", "not_na", "na", "slm",
+    "raw_not_na", "raw_na",      # check context.raw_fields
+    "context_equals",            # check a ToolContext attribute by name
+}
 
 
 class ManifestLoader:
@@ -132,7 +139,11 @@ class ManifestLoader:
 # ── Gate evaluation ───────────────────────────────────────────────────────────
 
 
-def eval_manifest_gate(manifest: dict, variant: dict) -> Optional[bool]:
+def eval_manifest_gate(
+    manifest: dict,
+    variant: dict,
+    context: "ToolContext | None" = None,
+) -> Optional[bool]:
     """
     Evaluate the manifest-level gate expression against a variant dict.
 
@@ -190,6 +201,24 @@ def eval_manifest_gate(manifest: dict, variant: dict) -> Optional[bool]:
 
     if operator == "not_in":
         return str(field_val) not in [str(v) for v in (value or [])]
+
+    if operator == "raw_not_na":
+        if context is None:
+            return True  # no context — default to run
+        val = context.raw_fields.get(field_name, "NA")
+        return val not in (None, "NA", "", "na", "Na", ".", "nan")
+
+    if operator == "raw_na":
+        if context is None:
+            return False  # no context — default to skip
+        val = context.raw_fields.get(field_name, "NA")
+        return val in (None, "NA", "", "na", "Na", ".", "nan")
+
+    if operator == "context_equals":
+        if context is None:
+            return True
+        ctx_val = getattr(context, field_name, None)
+        return str(ctx_val) == str(value)
 
     raise ManifestError(
         f"Unknown gate operator {operator!r} in manifest {manifest.get('name')!r}"

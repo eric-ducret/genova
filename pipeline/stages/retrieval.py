@@ -47,6 +47,8 @@ def run(
     variants: list[dict],
     patient_phenotype: str,
     executor: "Executor",
+    genome_build: str = "hg19",
+    raw_rows: list[dict] | None = None,
 ) -> str:
     """
     Stage 1 — Per-variant tool fan-out.
@@ -67,12 +69,16 @@ def run(
         logger.info("[Retrieval] Variant %d/%d: %s", i + 1, total,
                     variant.get("Variant", "?"))
 
+        raw_fields = raw_rows[i] if (raw_rows and i < len(raw_rows)) else {}
+
         variant_str  = _variant_dict_to_str(variant)
         mini_doc     = executor.run_variant(
             variant=variant,
             patient_phenotype=patient_phenotype,
             variant_index=i,
             total_variants=total,
+            genome_build=genome_build,
+            raw_fields=raw_fields,
         )
 
         section = f"VARIANT {i + 1}:\n{variant_str}\n\n{mini_doc}"

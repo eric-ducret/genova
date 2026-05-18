@@ -6,15 +6,12 @@ Unknown columns are silently ignored.
 Missing target columns are filled with "NA".
 
 Public function:
-    normalize_upload(raw: bytes, filename: str) -> list[str]
+    normalize_upload(raw: bytes, filename: str) -> tuple[list[dict], list[dict]]
         Accepts raw file bytes + original filename (used to detect .xlsx vs .csv).
-        Returns a list of key=value variant strings ready for the pipeline.
+        Returns (normalized_variant_dicts, raw_field_dicts).
 """
 
 import io
-import re
-import csv
-from typing import Optional
 
 import pandas as pd
 
@@ -42,6 +39,7 @@ COLUMN_ALIASES = {
     # RS_ID
     "rs_id": "RS_ID", "rsid": "RS_ID", "dbsnp": "RS_ID",
     "rs": "RS_ID", "snp_id": "RS_ID", "rs id": "RS_ID",
+    "avsnp150": "RS_ID",
     # Ref_seq
     "ref_seq": "Ref_seq", "ref": "Ref_seq", "reference": "Ref_seq",
     "ref_allele": "Ref_seq", "reference_allele": "Ref_seq",
@@ -49,9 +47,11 @@ COLUMN_ALIASES = {
     "var_seq": "Var_seq", "alt": "Var_seq", "alt_seq": "Var_seq",
     "alternate": "Var_seq", "alt_allele": "Var_seq",
     "alternate_allele": "Var_seq", "obs": "Var_seq",
-    # Type
+    # Type — ExonicFunc takes priority; Func is a lower-priority fallback
     "type": "Type", "variant_type": "Type", "mutation_type": "Type",
     "class": "Type", "var_type": "Type",
+    "exonicfunc": "Type",
+    "func": "Type",
     # HGVS
     "hgvs": "HGVS", "cdna": "HGVS", "hgvs_c": "HGVS",
     "hgvs_p": "HGVS", "c_dot": "HGVS", "p_dot": "HGVS",
@@ -76,6 +76,7 @@ COLUMN_ALIASES = {
     "clinical_significance": "ClinVar_class", "classification": "ClinVar_class",
     "pathogenicity": "ClinVar_class", "clinsig": "ClinVar_class",
     "interp": "ClinVar_class",
+    "clnsig": "ClinVar_class",
     # Allelic_balance
     "allelic_balance": "Allelic_balance", "ab": "Allelic_balance",
     "vaf": "Allelic_balance", "allele_fraction": "Allelic_balance",
@@ -85,10 +86,41 @@ COLUMN_ALIASES = {
     "af": "Frequency", "allele_frequency": "Frequency",
     "population_frequency": "Frequency", "gnomad_af": "Frequency",
     "exac_af": "Frequency",
+    "gnomad30_af_popmax": "Frequency",
+    "gnomad211_exome_af": "Frequency",
     # CADD_score
     "cadd_score": "CADD_score", "cadd": "CADD_score", "phred": "CADD_score",
     "cadd_phred": "CADD_score",
+    "cadd_v17_phred": "CADD_score",
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TYPE NORMALISATION MAP  (ANNOVAR ExonicFunc/Func → pipeline vocabulary)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_TYPE_MAP = {
+    "nonsynonymous snv":          "SNV",
+    "synonymous snv":             "synonymous",
+    "stopgain":                   "nonsense",
+    "stoploss":                   "stoploss",
+    "frameshift substitution":    "frameshift",
+    "frameshift insertion":       "frameshift",
+    "frameshift deletion":        "frameshift",
+    "nonframeshift substitution": "indel",
+    "nonframeshift insertion":    "indel",
+    "nonframeshift deletion":     "indel",
+    "splicing":                   "splicing",
+    "exonic":                     "SNV",
+    "intronic":                   "intronic",
+    "intergenic":                 "intergenic",
+    "upstream":                   "upstream",
+    "downstream":                 "downstream",
+    "utr3":                       "utr3",
+    "utr5":                       "utr5",
+    "ncrna_exonic":               "synonymous",
+    "ncrna_intronic":             "intronic",
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -100,50 +132,116 @@ def _clean(v) -> str:
     return "NA" if s in ("", "nan", "NaN", "None", "none", "NULL", "null", ".") else s
 
 
+def _normalize_type(raw: str) -> str:
+    """Map ANNOVAR ExonicFunc/Func values to pipeline Type vocabulary."""
+    return _TYPE_MAP.get(raw.strip().lower(), raw)
+
+
+def _parse_aachange(raw: str) -> str:
+    """Extract a display HGVS string from ANNOVAR AAChange annotation."""
+    if not raw or raw in ("NA", ".", "", "nan"):
+        return "NA"
+    first = raw.split("|")[0]
+    parts = first.split(":")
+    # expected: GENE, NM_xxx, exonN, c.xxx, p.xxx
+    if len(parts) >= 5:
+        return f"{parts[1]}:{parts[3]} {parts[4]}"
+    elif len(parts) >= 4:
+        return f"{parts[1]}:{parts[3]}"
+    return "NA"
+
+
+def _extract_raw_fields(df: pd.DataFrame) -> list[dict]:
+    """Return full original rows as dicts, one per variant."""
+    return [
+        {col: _clean(row[col]) for col in df.columns}
+        for _, row in df.iterrows()
+    ]
+
+
 def _map_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Rename columns to TARGET_COLUMNS names using COLUMN_ALIASES.
     Columns that don't match any alias are kept as-is (they'll be ignored later).
+    When two columns alias to the same target, ExonicFunc takes priority over Func
+    for the Type field; otherwise first-encountered wins.
     """
     df.columns = [str(c) for c in df.columns]
-    mapping = {}
-    for col in df.columns:
+    claimed: set[str] = set()
+    mapping: dict[str, str] = {}
+
+    # Sort so ExonicFunc is processed before Func, enforcing Type field priority
+    cols = sorted(
+        df.columns,
+        key=lambda c: (0 if c.strip().lower() == "exonicfunc" else 1),
+    )
+
+    for col in cols:
         canonical = COLUMN_ALIASES.get(col.strip().lower())
-        if canonical:
+        if canonical and canonical not in claimed:
             mapping[col] = canonical
+            claimed.add(canonical)
+
     if mapping:
         df = df.rename(columns=mapping)
     return df
 
 
-def _build_normalized_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Project df onto TARGET_COLUMNS, filling missing ones with 'NA'."""
+def _build_normalized_df(df: pd.DataFrame, df_original: pd.DataFrame) -> pd.DataFrame:
+    """Project df onto TARGET_COLUMNS, filling missing ones with 'NA'.
+
+    Post-processing:
+      - If HGVS is all NA but AAChange exists in the original input, fill from AAChange.
+      - Normalise Type values through the ANNOVAR vocabulary map.
+    """
     out = pd.DataFrame()
     for col in TARGET_COLUMNS:
         if col in df.columns:
             out[col] = df[col].apply(_clean)
         else:
             out[col] = "NA"
+
+    # Fill HGVS from AAChange if needed
+    if (out["HGVS"] == "NA").all():
+        aa_col = next(
+            (c for c in df_original.columns if c.strip().lower() == "aachange"),
+            None,
+        )
+        if aa_col is not None:
+            out["HGVS"] = df_original[aa_col].apply(
+                lambda v: _parse_aachange(_clean(v))
+            ).values
+
+    # Normalise Type vocabulary
+    out["Type"] = out["Type"].apply(
+        lambda v: _normalize_type(v) if v != "NA" else v
+    )
+
     return out
 
 
-def _df_to_variant_strings(df: pd.DataFrame) -> list[str]:
-    """Convert each row of a normalized DataFrame to a key=value string."""
-    variants = []
-    for _, row in df.iterrows():
-        parts = [f"{col}={row[col]}" for col in TARGET_COLUMNS]
-        variants.append(", ".join(parts))
-    return variants
+def _df_to_variant_dicts(df: pd.DataFrame) -> list[dict]:
+    """Convert each row of a normalized DataFrame to a plain dict."""
+    return [
+        {col: row[col] for col in TARGET_COLUMNS}
+        for _, row in df.iterrows()
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PUBLIC API
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def normalize_upload(raw: bytes, filename: str = "upload.csv") -> list[str]:
+def normalize_upload(
+    raw: bytes,
+    filename: str = "upload.csv",
+) -> tuple[list[dict], list[dict]]:
     """
-    Accept raw file bytes from any CSV or Excel upload and return a list of
-    normalized key=value variant strings for the pipeline.
+    Accept raw file bytes from any CSV or Excel upload and return a tuple of
+    (normalized_variant_dicts, raw_field_dicts).
+
+    - normalized_variant_dicts: one dict per row, keyed by TARGET_COLUMNS
+    - raw_field_dicts:          one dict per row, full original columns before normalization
 
     Supports:
       - .csv  (any delimiter — auto-detected)
@@ -177,13 +275,16 @@ def normalize_upload(raw: bytes, filename: str = "upload.csv") -> list[str]:
         raise ValueError("File contains no data rows.")
 
     # ── Normalize ─────────────────────────────────────────────────────────────
+    df_original = df.copy()          # preserve original before column mapping
     df = _map_columns(df)
-    df = _build_normalized_df(df)
+    df = _build_normalized_df(df, df_original)
 
     if df.empty:
         raise ValueError("No variant rows found after normalization.")
 
-    variants = _df_to_variant_strings(df)
+    variants  = _df_to_variant_dicts(df)
+    raw_rows  = _extract_raw_fields(df_original)
+
     print(f"[csv_normalizer] {len(variants)} variants loaded from '{filename}'")
 
     # Log which target columns were actually populated
@@ -193,7 +294,7 @@ def normalize_upload(raw: bytes, filename: str = "upload.csv") -> list[str]:
     if missing:
         print(f"[csv_normalizer] Missing (→ NA)   : {missing}")
 
-    return variants
+    return variants, raw_rows
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -213,7 +314,7 @@ if __name__ == "__main__":
     with open(input_path, "rb") as f:
         raw = f.read()
 
-    variants = normalize_upload(raw, filename=input_path)
+    variants, _ = normalize_upload(raw, filename=input_path)
 
     # Write as CSV for inspection
     import csv as _csv
@@ -221,10 +322,6 @@ if __name__ == "__main__":
         writer = _csv.writer(f)
         writer.writerow(TARGET_COLUMNS)
         for v in variants:
-            row = {}
-            for part in v.split(", "):
-                k, _, val = part.partition("=")
-                row[k] = val
-            writer.writerow([row.get(c, "NA") for c in TARGET_COLUMNS])
+            writer.writerow([v.get(c, "NA") for c in TARGET_COLUMNS])
 
     print(f"Saved normalized CSV to {output_path}")
