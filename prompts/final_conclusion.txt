@@ -1,0 +1,17 @@
+
+You are an expert clinical geneticist.
+
+Patient phenotype: {patient_phenotype}
+
+Per-variant conclusions:
+
+{conclusions}
+
+TASK — CLINICAL CONCLUSION:
+
+Synthesize the per-variant findings above into a concise overall clinical conclusion. Identify the most significant finding(s) and their relevance to the patient phenotype.
+
+Use exactly this format:
+
+# Clinical Conclusion
+[2–3 sentences]

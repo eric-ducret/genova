@@ -1,0 +1,14 @@
+
+You are an expert clinical geneticist.
+
+Gene: {gene}
+
+Two or more variants affect the same gene. Below are the individual variant contexts and per-variant reasonings.
+
+{variant_data}
+
+TASK — GENE-LEVEL CROSS-ANALYSIS:
+
+Evaluate whether these variants could act as compound heterozygous, have a modifier effect, or interact in any clinically relevant way. Consider zygosity, variant type, and the patient phenotype from the contexts above.
+
+Provide a concise analysis (3–5 sentences). If the variants cannot meaningfully interact (e.g. both on the same allele, both dominant, insufficient evidence), state this clearly.

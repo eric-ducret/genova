@@ -6,7 +6,7 @@ Wires together:
   - Tool instances
   - Manifest loader
   - Executor
-  - Stage functions (retrieval → compression → reasoning → conclusion)
+  - Stage functions (retrieval → compression → reasoning → cross_analysis → conclusion → final_conclusion)
 
 Design rule: server.py calls pipeline.run() and knows nothing about variants.
 All logic lives here and in the stages/tools/core modules.
@@ -14,6 +14,15 @@ All logic lives here and in the stages/tools/core modules.
 Public API:
     Pipeline(model_name, llm_kwargs)   — create and configure
     Pipeline.run(variants, phenotype)  — execute the full pipeline, return report string
+
+New per-variant flow (reduces SLM memory pressure vs. old all-at-once flow):
+
+  retrieval:         variants → list[str]  (one context slice per variant)
+  compression:       list[str] → list[str] (optional, per-slice)
+  reasoning:         per slice → list[str] (one reasoning block per variant)
+  cross_analysis:    per gene with ≥2 variants → dict[gene, str]
+  conclusion:        per slice + reasoning + cross_analysis → list[str]
+  final_conclusion:  all conclusions → str  (the # Clinical Conclusion paragraph)
 """
 
 from __future__ import annotations
@@ -29,7 +38,7 @@ from pipeline.core.executor  import Executor
 from pipeline.core.normalizer import TARGET_COLUMNS
 from pipeline.llm.registry   import get_client
 from pipeline.tools          import AutoPVS1Tool, LitVar2SummaryTool, SpliceAITool, WebSearchAgentTool
-from pipeline.stages         import retrieval, compression, reasoning, conclusion
+from pipeline.stages         import retrieval, compression, reasoning, conclusion, cross_analysis, final_conclusion
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +73,50 @@ def _parse_variant_str(variant_str: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PIPELINE
+# HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# Matches the shared PATIENT DATA … VARIANT DATA:\n\n header within each slice
+_SLICE_HEADER_RE = re.compile(r"^(PATIENT DATA:.*?VARIANT DATA:\n\n)", re.DOTALL)
+
+
+def _group_by_gene(variants: list[dict]) -> dict[str, list[int]]:
+    """
+    Return a mapping of gene symbol → list of 0-based variant indices.
+
+    Variants with Gene == "NA" or missing Gene are excluded (they cannot
+    participate in gene-level cross-analysis).
+    """
+    groups: dict[str, list[int]] = defaultdict(list)
+    for i, variant in enumerate(variants):
+        gene = variant.get("Gene", "NA")
+        if gene and gene != "NA":
+            groups[gene].append(i)
+    return dict(groups)
+
+
+def _reconstruct_full_context(context_slices: list[str]) -> str:
+    """
+    Reconstruct the full augmented context string from per-variant slices.
+
+    Used only for display in the AUGMENTED CONTEXT section of the final output.
+    Each slice contains a PATIENT DATA header + one VARIANT block; this helper
+    emits the header once, then concatenates the VARIANT blocks from all slices.
+    """
+    if not context_slices:
+        return ""
+
+    m = _SLICE_HEADER_RE.match(context_slices[0])
+    if not m:
+        # Fallback: concatenate slices separated by a blank line
+        return "\n\n".join(s.rstrip() for s in context_slices) + "\n"
+
+    header     = m.group(1)
+    header_len = len(header)
+
+    variant_sections = [s[header_len:].rstrip() for s in context_slices]
+    return header + "\n\n".join(variant_sections) + "\n"
+
 
 def _build_process_details(
     process_log: list[dict],
@@ -139,6 +190,10 @@ def _build_process_details(
     return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class Pipeline:
     """
     Full variant analysis pipeline.
@@ -152,7 +207,7 @@ class Pipeline:
             If True, Stage 2 (global context compression) runs when the
             assembled context exceeds the token threshold. Default: True.
         global_compression_threshold:
-            Token count above which Stage 2 triggers. Default: 28 000.
+            Token count above which Stage 2 triggers. Default: 4 000.
     """
 
     def __init__(
@@ -161,11 +216,11 @@ class Pipeline:
         llm_kwargs: Optional[dict] = None,
         llm=None,                              # pre-built LLMClient (overrides model_name)
         enable_global_compression: bool = True,
-        global_compression_threshold: int = 28_000,
+        global_compression_threshold: int = 4_000,
     ):
         self._model_name = model_name
         self._llm_kwargs = llm_kwargs or {}
-        self._enable_global_compression  = enable_global_compression
+        self._enable_global_compression   = enable_global_compression
         self._global_compression_threshold = global_compression_threshold
 
         # ── LLM client (loaded once at startup) ──────────────────────────────
@@ -211,7 +266,15 @@ class Pipeline:
         raw_rows: list[dict] | None = None,
     ) -> str:
         """
-        Execute the full four-stage pipeline and return the combined output.
+        Execute the full per-variant pipeline and return the combined output.
+
+        Pipeline flow:
+            Stage 1 — retrieval:       variants → list[str] (one context slice per variant)
+            Stage 2 — compression:     list[str] → list[str] (optional, per-slice)
+            Stage 3 — reasoning:       per slice → list[str]
+            Stage 3.5 — cross_analysis: per gene with ≥2 variants → dict[gene, str]
+            Stage 4 — conclusion:      per slice + reasoning + cross_analysis → list[str]
+            Stage 5 — final_conclusion: all conclusions → str
 
         Args:
             variants:          List of normalized variant dicts from normalize_upload().
@@ -220,10 +283,8 @@ class Pipeline:
             raw_rows:          Full original CSV rows, one dict per variant.
 
         Returns:
-            Combined output string:
-                AUGMENTED CONTEXT section
-                REASONING section
-                FINAL REPORT section
+            Combined output string with PROCESS DETAILS, AUGMENTED CONTEXT,
+            REASONING, and FINAL REPORT sections separated by === banners.
 
         Raises:
             ValueError if variants is empty.
@@ -231,10 +292,14 @@ class Pipeline:
         if not variants:
             raise ValueError("variants list is empty — nothing to analyze.")
 
-        logger.info("[Pipeline] Processing %d variants.", len(variants))
+        n = len(variants)
+        logger.info("[Pipeline] Processing %d variants.", n)
+
+        SEP         = "=" * 60
+        SEP_VARIANT = "─" * 56
 
         # ── Stage 1: Retrieval ────────────────────────────────────────────────
-        augmented_context = retrieval.run(
+        context_slices: list[str] = retrieval.run(
             variants=variants,
             patient_phenotype=patient_phenotype,
             executor=self._executor,
@@ -243,42 +308,97 @@ class Pipeline:
         )
 
         # Build process details from executor log (before any global compression)
-        process_details = _build_process_details(
-            self._executor.process_log,
-            variants,
-        )
+        process_details = _build_process_details(self._executor.process_log, variants)
 
         # ── Stage 2: Global compression (optional) ────────────────────────────
         if self._enable_global_compression:
-            augmented_context = compression.run(
-                augmented_context=augmented_context,
+            context_slices = compression.run(
+                context_slices=context_slices,
                 llm=self._llm,
                 token_threshold=self._global_compression_threshold,
             )
 
-        # ── Stage 3: Reasoning ────────────────────────────────────────────────
-        reasoning_output = reasoning.run(
-            augmented_context=augmented_context,
+        # ── Stage 3: Per-variant reasoning ────────────────────────────────────
+        reasonings: list[str] = []
+        for i, (variant_ctx, variant) in enumerate(zip(context_slices, variants)):
+            gene = variant.get("Gene", "?")
+            logger.info(
+                "[Pipeline] Reasoning %d/%d — %s...", i + 1, n, gene
+            )
+            reasonings.append(
+                reasoning.run_one(variant_context=variant_ctx, llm=self._llm)
+            )
+
+        # ── Stage 3.5: Gene-level cross-analysis ─────────────────────────────
+        gene_groups    = _group_by_gene(variants)
+        cross_analyses: dict[str, str] = {}
+
+        for gene, indices in gene_groups.items():
+            if len(indices) >= 2:
+                logger.info(
+                    "[Pipeline] Cross-analysis for gene %s (%d variants)...",
+                    gene, len(indices),
+                )
+                cross_analyses[gene] = cross_analysis.run(
+                    gene=gene,
+                    variant_contexts=[context_slices[j] for j in indices],
+                    reasonings=[reasonings[j] for j in indices],
+                    llm=self._llm,
+                )
+
+        # ── Stage 4: Per-variant conclusion ───────────────────────────────────
+        conclusions: list[str] = []
+        for i, (variant_ctx, r, variant) in enumerate(
+            zip(context_slices, reasonings, variants)
+        ):
+            gene = variant.get("Gene", "NA")
+            ca   = cross_analyses.get(gene) if gene != "NA" else None
+            logger.info(
+                "[Pipeline] Conclusion %d/%d — %s...", i + 1, n, gene
+            )
+            conclusions.append(
+                conclusion.run_one(
+                    variant_context=variant_ctx,
+                    reasoning=r,
+                    cross_analysis=ca,
+                    llm=self._llm,
+                )
+            )
+
+        # ── Stage 5: Final clinical conclusion ────────────────────────────────
+        logger.info("[Pipeline] Generating final clinical conclusion...")
+        final_summary = final_conclusion.run(
+            conclusions=conclusions,
+            patient_phenotype=patient_phenotype,
             llm=self._llm,
         )
 
-        # ── Stage 4: Conclusion ───────────────────────────────────────────────
-        report = conclusion.run(
-            augmented_context=augmented_context,
-            reasoning=reasoning_output,
-            llm=self._llm,
-        )
+        # ── Assemble final output ─────────────────────────────────────────────
 
-        # ── Assemble final output (matches server_main.py /analyze format) ────
-        SEP = "=" * 60
+        # AUGMENTED CONTEXT: reconstruct single readable block from slices
+        full_context_display = _reconstruct_full_context(context_slices)
+
+        # REASONING: one block per variant with variant header
+        reasoning_parts = []
+        for i, (r, variant) in enumerate(zip(reasonings, variants)):
+            gene = variant.get("Gene", "?")
+            hgvs = variant.get("HGVS", variant.get("Variant", "?"))
+            reasoning_parts.append(
+                f"{SEP_VARIANT}\nVARIANT {i + 1} — {gene}  {hgvs}\n{SEP_VARIANT}\n{r}"
+            )
+        reasoning_display = "\n\n".join(reasoning_parts)
+
+        # FINAL REPORT: per-variant blocks + final conclusion paragraph
+        final_report = "\n\n---\n\n".join(conclusions) + "\n\n---\n\n" + final_summary
+
         output = (
             f"{SEP}\nPROCESS DETAILS\n{SEP}\n"
             + process_details + "\n\n"
             + f"{SEP}\nAUGMENTED CONTEXT\n{SEP}\n"
-            + augmented_context + "\n\n"
+            + full_context_display + "\n\n"
             + f"{SEP}\nREASONING\n{SEP}\n"
-            + reasoning_output + "\n\n"
+            + reasoning_display + "\n\n"
             + f"{SEP}\nFINAL REPORT\n{SEP}\n"
-            + report + "\n"
+            + final_report + "\n"
         )
         return output

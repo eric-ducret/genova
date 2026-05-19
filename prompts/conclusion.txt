@@ -7,11 +7,13 @@ Patient phenotype and augmented evidence:
 PRIOR REASONING:
 {reasoning_output}
 
-TASK — STRUCTURED REPORT:
+{cross_analysis_block}
 
-Using your prior reasoning above, produce the final clinical report. Do NOT re-derive or repeat reasoning steps — synthesize only.
+TASK — STRUCTURED REPORT FOR THIS VARIANT:
 
-For each variant use exactly this format:
+Using your prior reasoning above, produce the final clinical report for this variant. Do NOT re-derive or repeat reasoning steps — synthesize only.
+
+Use exactly this format:
 
 # Variant [N] — [GENE] ([HGVS])
 **Molecular mechanism:** [one sentence]
@@ -20,8 +22,3 @@ For each variant use exactly this format:
 **Evidence strength:** [strong / moderate / weak / absent]
 **ACMG criteria**: [criteria with justification]
 **Comment:** [2–3 sentences]
-
----
-
-# Clinical Conclusion
-[2–3 sentences identifying the most significant finding(s) and their relevance to the patient phenotype.]

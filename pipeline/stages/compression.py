@@ -4,14 +4,26 @@ pipeline/stages/compression.py — Global context compression stage.
 This is Stage 2 of the pipeline — separate from per-tool compression
 (which compresses individual tool outputs in the executor).
 
-Global compression runs after all per-variant mini-docs are assembled.
-It triggers when the total assembled context exceeds the token threshold
-and compresses each VARIANT section independently to fit in the SLM context window.
+Global compression runs after all per-variant context slices are assembled by
+Stage 1 (retrieval). It triggers when the total assembled context exceeds the
+token threshold and compresses each variant slice independently.
+
+Each slice has the structure:
+    PATIENT DATA:
+    {patient_phenotype}
+
+    VARIANT DATA:
+
+    VARIANT N:
+    {tool outputs}
+
+The PATIENT DATA header is preserved within each slice; only the VARIANT body
+is passed to the SLM for compression.
 
 Public API:
-    run(augmented_context, llm, token_threshold, max_tokens_per_variant) -> str
+    run(context_slices, llm, token_threshold, max_tokens_per_variant) -> list[str]
 
-Note: If the context is within the threshold, it is returned unchanged.
+Note: If the context is within the threshold, the input list is returned unchanged.
 """
 
 from __future__ import annotations
@@ -32,16 +44,12 @@ _CHARS_PER_TOKEN = 4
 _DEFAULT_TOKEN_THRESHOLD    = 4000   # trigger compression above this
 _DEFAULT_MAX_TOKENS_PER_VAR = 600    # target per variant after compression
 
+# Matches the shared header within each slice (PATIENT DATA … VARIANT DATA:\n\n)
+_SLICE_HEADER_RE = re.compile(r"^(PATIENT DATA:.*?VARIANT DATA:\n\n)", re.DOTALL)
+
 
 def _estimate_tokens(text: str) -> int:
     return len(text) // _CHARS_PER_TOKEN
-
-
-# Matches "VARIANT N:\n..." sections produced by retrieval.py
-_VARIANT_SECTION_RE = re.compile(
-    r"(VARIANT \d+:.*?)(?=\nVARIANT \d+:|\Z)",
-    re.DOTALL,
-)
 
 
 def _compress_section(
@@ -59,7 +67,7 @@ def _compress_section(
         "Return only the compressed text — no commentary, no headers."
     )
     user = (
-        f"Compress the following variant evidence section to {max_tokens} tokens maximum:\n\n"  # models are bad at such task in terms of precision but we still have a compression.
+        f"Compress the following variant evidence section to {max_tokens} tokens maximum:\n\n"
         f"{section}"
     )
     try:
@@ -82,57 +90,56 @@ def _compress_section(
 
 
 def run(
-    augmented_context: str,
+    context_slices: list[str],
     llm: "LLMClient",
     token_threshold: int = _DEFAULT_TOKEN_THRESHOLD,
     max_tokens_per_variant: int = _DEFAULT_MAX_TOKENS_PER_VAR,
-) -> str:
+) -> list[str]:
     """
     Stage 2 — Global context compression (optional).
 
-    If the augmented context is within the token threshold, returns it unchanged.
-    Otherwise, splits the context at VARIANT section boundaries and compresses
-    each variant section independently using the SLM.
-
-    The PATIENT DATA header and VARIANT DATA header are preserved unchanged.
+    If the total context is within the token threshold, returns the input list
+    unchanged. Otherwise, compresses the VARIANT body of each slice independently
+    using the SLM, preserving the PATIENT DATA header in each slice.
 
     Args:
-        augmented_context:      Output from stages/retrieval.run().
+        context_slices:         Output from stages/retrieval.run() — one str per variant.
         llm:                    Shared LLMClient instance.
-        token_threshold:        Context size (tokens) above which compression triggers.
-        max_tokens_per_variant: Target token budget per variant after compression.
+        token_threshold:        Total context size (tokens) above which compression triggers.
+        max_tokens_per_variant: Target token budget per variant body after compression.
 
     Returns:
-        Compressed (or unchanged) augmented context string.
+        List of context slices, compressed or unchanged.
     """
-    estimated = _estimate_tokens(augmented_context)
+    total_text = "".join(context_slices)
+    estimated  = _estimate_tokens(total_text)
+
     if estimated <= token_threshold:
         logger.info(
             "[Compression] Context within threshold (%d ≤ %d tokens) — skipping.",
             estimated, token_threshold,
         )
-        return augmented_context
+        return context_slices
 
     logger.info(
-        "[Compression] Context exceeds threshold (%d > %d tokens) — compressing.",
-        estimated, token_threshold,
+        "[Compression] Context exceeds threshold (%d > %d tokens) — compressing %d slices.",
+        estimated, token_threshold, len(context_slices),
     )
 
-    # Split into header (PATIENT DATA + VARIANT DATA preamble) and variant sections
-    header_match = re.match(r"(.*?VARIANT DATA:\n\n)", augmented_context, re.DOTALL)
-    header = header_match.group(1) if header_match else ""
-    body   = augmented_context[len(header):]
+    compressed_slices: list[str] = []
+    for i, slice_ in enumerate(context_slices):
+        logger.info("[Compression] Compressing variant slice %d/%d", i + 1, len(context_slices))
 
-    sections = _VARIANT_SECTION_RE.findall(body)
-    if not sections:
-        logger.warning("[Compression] Could not parse variant sections — returning as-is.")
-        return augmented_context
+        # Split each slice into shared header and variant body
+        header_match = _SLICE_HEADER_RE.match(slice_)
+        header       = header_match.group(1) if header_match else ""
+        variant_body = slice_[len(header):]
 
-    compressed_sections = []
-    for i, section in enumerate(sections):
-        logger.info("[Compression] Compressing variant section %d/%d", i + 1, len(sections))
-        compressed_sections.append(
-            _compress_section(section.strip(), llm, max_tokens_per_variant)
-        )
+        if not variant_body.strip():
+            compressed_slices.append(slice_)
+            continue
 
-    return header + "\n\n".join(compressed_sections) + "\n"
+        compressed_body = _compress_section(variant_body.strip(), llm, max_tokens_per_variant)
+        compressed_slices.append(header + compressed_body.strip() + "\n")
+
+    return compressed_slices

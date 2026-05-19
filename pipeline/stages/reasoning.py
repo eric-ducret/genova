@@ -3,13 +3,14 @@ pipeline/stages/reasoning.py — SLM step-by-step clinical reasoning stage.
 
 Ported from run_reasoning() in server_main.py.
 
-Single SLM call. Takes the full augmented context (from Stage 1/2) and produces
-step-by-step clinical reasoning for each variant. Does NOT produce a classification.
+Single SLM call per variant. Takes one variant's context string (from Stage 1/2)
+and produces step-by-step clinical reasoning for that variant. Does NOT produce
+a classification.
 
 Prompt loaded from prompts/reasoning.txt.
 
 Public API:
-    run(augmented_context, llm) -> str
+    run_one(variant_context, llm) -> str
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "reasoning.txt"
 
-MAX_NEW_TOKENS_REASONING = 3000
+MAX_NEW_TOKENS_REASONING = 1500
 
 
 def _load_prompt() -> str:
@@ -37,23 +38,21 @@ def _load_prompt() -> str:
     )
 
 
-def run(augmented_context: str, llm: "LLMClient") -> str:
+def run_one(variant_context: str, llm: "LLMClient") -> str:
     """
-    Stage 3 — Step-by-step clinical reasoning.
-
-    Ported verbatim logic from server_main.run_reasoning():
-        _chat(system, REASONING_TEMPLATE.format(augmented_context=...), max_new_tokens=3000)
+    Stage 3 — Step-by-step clinical reasoning for one variant.
 
     Args:
-        augmented_context: Output from Stage 1 (retrieval) or Stage 2 (compression).
-        llm:               Shared LLMClient instance.
+        variant_context: Per-variant context string from Stage 1/2 (retrieval/compression).
+                         Contains PATIENT DATA header + one VARIANT block.
+        llm:             Shared LLMClient instance.
 
     Returns:
-        Step-by-step reasoning text for all variants. No final classification.
+        Step-by-step reasoning text for this variant. No final classification.
     """
     logger.info("[Reasoning] Running step-by-step reasoning...")
-    template = _load_prompt()
-    user_prompt = template.replace("{augmented_context}", augmented_context)
+    template    = _load_prompt()
+    user_prompt = template.replace("{augmented_context}", variant_context)
 
     return llm.generate(
         system="You are an expert clinical geneticist.",
