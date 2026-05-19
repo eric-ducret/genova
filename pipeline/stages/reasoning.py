@@ -44,7 +44,7 @@ def run_one(variant_context: str, llm: "LLMClient") -> str:
 
     Args:
         variant_context: Per-variant context string from Stage 1/2 (retrieval/compression).
-                         Contains PATIENT DATA header + one VARIANT block.
+                         Contains PATIENT DATA header + one VARIANT block with tool outputs.
         llm:             Shared LLMClient instance.
 
     Returns:

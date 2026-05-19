@@ -6,7 +6,7 @@ Wires together:
   - Tool instances
   - Manifest loader
   - Executor
-  - Stage functions (retrieval → compression → reasoning → cross_analysis → conclusion → final_conclusion)
+  - Stage functions (retrieval → reasoning → cross_analysis → conclusion → final_conclusion)
 
 Design rule: server.py calls pipeline.run() and knows nothing about variants.
 All logic lives here and in the stages/tools/core modules.
@@ -18,7 +18,6 @@ Public API:
 New per-variant flow (reduces SLM memory pressure vs. old all-at-once flow):
 
   retrieval:         variants → list[str]  (one context slice per variant)
-  compression:       list[str] → list[str] (optional, per-slice)
   reasoning:         per slice → list[str] (one reasoning block per variant)
   cross_analysis:    per gene with ≥2 variants → dict[gene, str]
   conclusion:        per slice + reasoning + cross_analysis → list[str]
@@ -38,7 +37,7 @@ from pipeline.core.executor  import Executor
 from pipeline.core.normalizer import TARGET_COLUMNS
 from pipeline.llm.registry   import get_client
 from pipeline.tools          import AutoPVS1Tool, LitVar2SummaryTool, SpliceAITool, WebSearchAgentTool
-from pipeline.stages         import retrieval, compression, reasoning, conclusion, cross_analysis, final_conclusion
+from pipeline.stages         import retrieval, reasoning, conclusion, cross_analysis, final_conclusion
 
 logger = logging.getLogger(__name__)
 
@@ -203,11 +202,6 @@ class Pipeline:
     Args:
         model_name: Key in pipeline.llm.registry.MODELS (default "qwen3.5-9b").
         llm_kwargs: Forwarded to get_client() — e.g. base_url for VLLMClient.
-        enable_global_compression:
-            If True, Stage 2 (global context compression) runs when the
-            assembled context exceeds the token threshold. Default: True.
-        global_compression_threshold:
-            Token count above which Stage 2 triggers. Default: 4 000.
     """
 
     def __init__(
@@ -215,13 +209,9 @@ class Pipeline:
         model_name: str = "qwen3.5-9b",
         llm_kwargs: Optional[dict] = None,
         llm=None,                              # pre-built LLMClient (overrides model_name)
-        enable_global_compression: bool = True,
-        global_compression_threshold: int = 4_000,
     ):
         self._model_name = model_name
         self._llm_kwargs = llm_kwargs or {}
-        self._enable_global_compression   = enable_global_compression
-        self._global_compression_threshold = global_compression_threshold
 
         # ── LLM client (loaded once at startup) ──────────────────────────────
         if llm is not None:
@@ -270,8 +260,7 @@ class Pipeline:
 
         Pipeline flow:
             Stage 1 — retrieval:       variants → list[str] (one context slice per variant)
-            Stage 2 — compression:     list[str] → list[str] (optional, per-slice)
-            Stage 3 — reasoning:       per slice → list[str]
+            Stage 2 — reasoning:       per slice → list[str]
             Stage 3.5 — cross_analysis: per gene with ≥2 variants → dict[gene, str]
             Stage 4 — conclusion:      per slice + reasoning + cross_analysis → list[str]
             Stage 5 — final_conclusion: all conclusions → str
@@ -307,18 +296,9 @@ class Pipeline:
             raw_rows=raw_rows,
         )
 
-        # Build process details from executor log (before any global compression)
         process_details = _build_process_details(self._executor.process_log, variants)
 
-        # ── Stage 2: Global compression (optional) ────────────────────────────
-        if self._enable_global_compression:
-            context_slices = compression.run(
-                context_slices=context_slices,
-                llm=self._llm,
-                token_threshold=self._global_compression_threshold,
-            )
-
-        # ── Stage 3: Per-variant reasoning ────────────────────────────────────
+        # ── Stage 2: Per-variant reasoning ────────────────────────────────────
         reasonings: list[str] = []
         for i, (variant_ctx, variant) in enumerate(zip(context_slices, variants)):
             gene = variant.get("Gene", "?")

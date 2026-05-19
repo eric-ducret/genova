@@ -68,8 +68,8 @@ def run_one(
     Stage 4 — Structured clinical report for one variant.
 
     Args:
-        variant_context: Per-variant context string from Stage 1/2 (retrieval/compression).
-                         Contains PATIENT DATA header + one VARIANT block.
+        variant_context: Per-variant context string from Stage 1 (retrieval).
+                         Contains PATIENT DATA header + one VARIANT block with tool outputs.
         reasoning:       Output from reasoning.run_one() for this variant.
         cross_analysis:  Gene-level cross-analysis text from cross_analysis.run(), or None
                          if this variant's gene has fewer than two variants in this run.
