@@ -20,3 +20,18 @@ Rules:
 - Make the reasoning explicit.
 - Do NOT skip steps.
 - Do NOT produce a final classification.
+- When referencing literature evidence, cite the PMID inline using [PMID:XXXXXXXX] notation exactly as it appears in the retrieved evidence.
+
+Finally, after completing all reasoning steps, output exactly this line:
+RELEVANCE: <score>
+
+Where <score> is:
+3 = strong candidate — good phenotype fit, credible molecular mechanism,
+    coherent inheritance, meaningful evidence
+2 = uncertain — partial phenotype fit, weak or conflicting evidence,
+    or insufficient data to decide
+1 = unlikely — poor phenotype fit, clearly benign molecular effect,
+    or strong evidence against causality
+
+Output the RELEVANCE line as the very last line of your response.
+Do not explain the score.
