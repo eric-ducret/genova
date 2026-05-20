@@ -18,6 +18,8 @@ Startup:
 
 import os
 import logging
+from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 # Override with LLM_BACKEND=hf for local dev (no vLLM needed).
 # In production on the A100 node, LLM_BACKEND defaults to vllm.
 _LLM_BACKEND   = os.environ.get("LLM_BACKEND", "vllm")
+_RESULTS_DIR   = Path(__file__).parent / "results"
 _VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8001")
 _USE_4BIT      = os.environ.get("USE_4BIT", "0") == "1"
 
@@ -106,6 +109,17 @@ async def analyze(
         raw_rows=raw_rows,
         # genome_build uses DEFAULT_GENOME_BUILD — auto-detection comes later
     )
+
+    stem = Path(csv_file.filename or "upload").stem
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = _RESULTS_DIR / f"{stem}_{timestamp}"
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "report.txt").write_text(result, encoding="utf-8")
+        logger.info("[Server] Result saved to %s", run_dir)
+    except Exception as e:
+        logger.warning("[Server] Could not save result to disk: %s", e)
+
     return PlainTextResponse(content=result)
 
 

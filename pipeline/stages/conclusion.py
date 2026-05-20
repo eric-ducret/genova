@@ -33,20 +33,35 @@ _PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "conclusion.txt
 MAX_NEW_TOKENS_REPORT = 800
 
 
-def _extract_pmids(text: str) -> list[str]:
-    """Return deduplicated PMID:XXXXXXXX strings found in text, in order of first appearance."""
-    hits = re.findall(r"PMID:(\d+)", text)
-    return list(dict.fromkeys(f"PMID:{h}" for h in hits))
-
-
-def _extract_urls(text: str) -> list[str]:
-    """Return deduplicated http/https URLs found in text, in order of first appearance.
-
-    Trailing punctuation common in prose (., ; : ) ] > " ') is stripped.
+def _validate_citations(result: str, context: str) -> str:
     """
-    raw = re.findall(r"https?://\S+", text)
-    cleaned = [u.rstrip(".,;:)>]\"'\\") for u in raw]
-    return list(dict.fromkeys(u for u in cleaned if u))
+    Strip inline citations from the model output that have no grounding in context.
+
+    Two citation forms are checked:
+      (PMID:12345678)  — removed if that PMID number does not appear anywhere in context.
+      (https://...)    — removed if that URL does not appear as a substring in context.
+
+    After removals, stray spaces before punctuation and double spaces are collapsed.
+    """
+    valid_pmids = set(re.findall(r"PMID:(\d+)", context))
+
+    def _keep_pmid(m: re.Match) -> str:
+        if m.group(1) in valid_pmids:
+            return m.group(0)
+        logger.warning("[Conclusion] Removed hallucinated citation: %s", m.group(0))
+        return ""
+
+    def _keep_url(m: re.Match) -> str:
+        if m.group(1) in context:
+            return m.group(0)
+        logger.warning("[Conclusion] Removed hallucinated citation: %s", m.group(0))
+        return ""
+
+    result = re.sub(r"\(PMID:(\d+)\)", _keep_pmid, result)
+    result = re.sub(r"\((https?://[^)\s]+)\)", _keep_url, result)
+    result = re.sub(r" +([.,;:])", r"\1", result)
+    result = re.sub(r"  +", " ", result)
+    return result
 
 
 def _load_prompt() -> str:
@@ -87,11 +102,6 @@ def run_one(
     """
     logger.info("[Conclusion] Generating structured report for variant...")
 
-    # Extract references deterministically from the evidence context before the SLM call
-    # so they are appended as a Python-built block rather than relying on prompt instruction.
-    pmids = _extract_pmids(variant_context)
-    urls  = _extract_urls(variant_context)
-
     template = _load_prompt()
 
     cross_analysis_block = (
@@ -109,9 +119,4 @@ def run_one(
         user=user_prompt,
         max_tokens=MAX_NEW_TOKENS_REPORT,
     )
-
-    refs = pmids + urls
-    if refs:
-        result = result.rstrip() + "\n**References:** " + ", ".join(refs)
-
-    return result
+    return _validate_citations(result, variant_context)
