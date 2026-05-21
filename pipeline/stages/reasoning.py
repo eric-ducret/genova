@@ -51,7 +51,10 @@ def parse_relevance_score(reasoning_text: str) -> int:
     m = _RELEVANCE_RE.search(reasoning_text)
     if m:
         return int(m.group(1))
-    logger.warning("[Reasoning] Could not parse RELEVANCE score — defaulting to 2")
+    logger.error(
+        "[Reasoning] Could not parse RELEVANCE score — defaulting to 2. Raw tail: %r",
+        reasoning_text[-200:],
+    )
     return 2
 
 

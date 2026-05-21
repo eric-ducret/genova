@@ -171,6 +171,14 @@ def _parse_autopvs1_html(html: str) -> dict:
     data["pli"]                = get_field("pLI:")
     data["haploinsufficiency"] = get_field("Haploinsufficiency:")
 
+    _key_fields = ("gene", "chgvs", "phgvs", "pli", "haploinsufficiency")
+    _none_count = sum(1 for f in _key_fields if data.get(f) is None)
+    if _none_count > 2:
+        logger.warning(
+            "[AutoPVS1] %d/%d key fields are None — HTML structure may have changed",
+            _none_count, len(_key_fields),
+        )
+
     for btn in soup.select("a.btn-primary"):
         label = btn.get_text(strip=True)
         href  = btn.get("href", "")
