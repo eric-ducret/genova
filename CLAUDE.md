@@ -34,7 +34,9 @@ variant-pipeline/
 ├── README.md                        ← user-facing quickstart and architecture
 ├── TOOL_DEVELOPMENT.md              ← guide for writing new tools
 ├── launch.sh                        ← SLURM sbatch script
+├── batch.sh                         ← SLURM sbatch script for batch folder processing
 ├── client.py                        ← CLI client for submitting jobs from login node
+├── batch.py                         ← batch runner: process a folder of variant files
 ├── server.py                        ← FastAPI entry point (thin, no business logic)
 │
 ├── pipeline/
@@ -60,9 +62,11 @@ variant-pipeline/
 │   ├── stages/
 │   │   ├── __init__.py
 │   │   ├── retrieval.py             ← per-variant tool fan-out stage
-│   │   ├── compression.py           ← context compression stage
-│   │   ├── reasoning.py             ← SLM step-by-step reasoning stage
-│   │   └── conclusion.py            ← SLM structured report stage
+│   │   ├── triage.py                ← fast SLM keep/discard decision per variant
+│   │   ├── reasoning.py             ← SLM step-by-step reasoning + RELEVANCE scoring
+│   │   ├── cross_analysis.py        ← gene-level compound-het / interaction analysis
+│   │   ├── conclusion.py            ← per-variant structured report (Tier 1 only)
+│   │   └── final_conclusion.py      ← overall clinical conclusion paragraph
 │   │
 │   ├── tools/
 │   │   ├── __init__.py
@@ -70,9 +74,9 @@ variant-pipeline/
 │   │   ├── litvar2.py               ← LitVar2 literature search (rsID + gene fallback)
 │   │   ├── autopvs1.py              ← AutoPVS1 PVS1 criterion evaluation (LoF variants)
 │   │   ├── spliceai.py              ← SpliceAI splice impact delta scores (Broad API)
-│   │   ├── websearch.py
-│   │   ├── websearch_agent.py
-│   │   └── ncbi.py
+│   │   ├── websearch.py             ← WebSearchTool + WebFetchTool (sub-tools for ReAct agent)
+│   │   ├── websearch_agent.py       ← WebSearchAgentTool: full ReAct web-search loop
+│   │   └── ncbi.py                  ← NCBIFetchTool (sub-tool for ReAct agent)
 │   │
 │   └── manifests/
 │       ├── litvar2.yaml
@@ -84,7 +88,9 @@ variant-pipeline/
     ├── retrieval.txt
     ├── compression.txt
     ├── reasoning.txt
-    └── conclusion.txt
+    ├── conclusion.txt
+    ├── cross_analysis.txt
+    └── final_conclusion.txt
 ```
 
 ---
@@ -457,9 +463,11 @@ Switching between modes requires no changes to tool code.
 
 ## Pipeline Stages
 
+The full flow is: retrieval → triage → reasoning → tier selection → cross-analysis → conclusion → final conclusion.
+
 ### Stage 1 — Retrieval (`stages/retrieval.py`)
 
-For each variant, calls `executor.run_variant()` and collects the returned mini-doc.
+For each variant, calls `executor.run_variant()` and collects the returned context slice.
 `retrieval.py` is a thin loop — manifest loading, gate evaluation, tool ordering,
 execution, and per-tool compression all happen inside the Executor.
 
@@ -470,30 +478,60 @@ retrieval.py (per variant)
           → tool.run(variant, context)
           → compression (if configured and threshold met)
           → append to mini-doc
-    ← mini-doc string
+    ← context slice string
 ```
 
-All mini-docs are concatenated into the augmented context document passed to Stage 2.
+All context slices are kept independently (one per variant) for downstream stages.
 
-### Stage 2 — Compression (`stages/compression.py`)
+### Triage (`stages/triage.py`)
 
-Optional global compression stage. Runs after all per-variant mini-docs are assembled.
-Triggered when total assembled context exceeds a token threshold (configurable).
-Summarizes each mini-doc independently to fit within the SLM context window.
+One small SLM call per variant immediately after retrieval. Decides whether a variant
+can be discarded with high confidence given the patient phenotype.
 
-This is separate from per-tool compression (which compresses individual tool outputs).
-Global compression compresses entire per-variant sections.
+Only runs when `n > TRIAGE_ENABLED_THRESHOLD` (configured in `pipeline/config.py`).
+When skipped, all variants are implicitly KEEP.
 
-### Stage 3 — Reasoning (`stages/reasoning.py`)
+Compound heterozygous candidates (two or more variants in the same gene) are
+automatically exempted from DISCARD — a DISCARD decision on any such variant is
+overridden to KEEP.
 
-Single SLM call. Takes the full augmented context and produces step-by-step
-clinical reasoning for each variant. Does not produce a classification.
+Results:
+- **KEEP** variants proceed to reasoning.
+- **DISCARD** variants are excluded from all subsequent stages and appear in the
+  appendix of the final report with their justification.
+
+### Stage 2 — Reasoning (`stages/reasoning.py`)
+
+One SLM call per kept variant. Produces step-by-step clinical reasoning and assigns
+a `RELEVANCE` score (1–3) indicating how likely the variant is to explain the phenotype.
 Prompt loaded from `prompts/reasoning.txt`.
+
+### Tier Selection
+
+After reasoning, variants are split into tiers using `_select_tier1_indices()`:
+
+- **Tier 1** — variants that proceed to conclusion. Score-3 variants are always
+  included. Score-2 variants backfill up to `MIN_CONCLUSION_VARIANTS`. Hard cap at
+  `MAX_CONCLUSION_VARIANTS`. Same-gene groups are kept atomic (whole group in or out).
+- **Tier 2** — kept variants that did not make Tier 1. Reasoning is available in the
+  output but no structured conclusion is generated.
+
+Both thresholds are configured in `pipeline/config.py`.
+
+### Stage 3 — Cross-analysis (`stages/cross_analysis.py`)
+
+Runs after reasoning, for each gene that has two or more Tier 1 variants. Presents the
+per-variant contexts and reasonings to the SLM and asks it to evaluate potential
+compound heterozygous or other gene-level interactions.
+Prompt loaded from `prompts/cross_analysis.txt`.
+
+The cross-analysis output is passed into `conclusion.run_one()` for the relevant variants.
 
 ### Stage 4 — Conclusion (`stages/conclusion.py`)
 
-Single SLM call. Takes augmented context + reasoning output and produces the
-structured clinical report. Prompt loaded from `prompts/conclusion.txt`.
+One SLM call per Tier 1 variant. Takes the variant context slice, its reasoning block,
+and (if available) the cross-analysis for its gene. Produces the structured variant
+report block. Prompt loaded from `prompts/conclusion.txt`.
 
 Output format per variant:
 ```
@@ -506,7 +544,15 @@ Output format per variant:
 **Comment:** ...
 ```
 
-Followed by a `# Clinical Conclusion` section.
+### Stage 5 — Final Conclusion (`stages/final_conclusion.py`)
+
+Single SLM call. Takes all Tier 1 conclusion blocks and the patient phenotype and
+produces the overall `# Clinical Conclusion` paragraph (2–3 sentences).
+Prompt loaded from `prompts/final_conclusion.txt`.
+
+This stage is separate from Stage 4 so that each variant's block can be generated
+individually (reducing SLM memory pressure) while the overall summary still has
+visibility across all variants.
 
 ---
 

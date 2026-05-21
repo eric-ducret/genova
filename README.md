@@ -19,33 +19,46 @@ CSV / Excel  ──►  normalize_upload()
              Pipeline.run(variants, phenotype)
                         │
         ┌─────────────────────────────────────────┐
-        │           order 1 — parallel             │
-        │   LitVar2SummaryTool    SpliceAITool     │
+        │  Stage 1 — Retrieval (all variants)      │
+        │                                          │
+        │  order 1 parallel: LitVar2  SpliceAI     │
+        │  order 2 parallel: AutoPVS1              │
+        │  order 3 serial:   WebSearchAgentTool    │
         └──────────────┬──────────────────────────┘
-                       │  per-variant outputs
-        ┌──────────────┴──────────────────────────┐
-        │           order 2 — parallel             │
-        │              AutoPVS1Tool                │
-        └──────────────┬──────────────────────────┘
-                       │  per-variant outputs
-        ┌──────────────┴──────────────────────────┐
-        │           order 3 — serial               │
-        │          WebSearchAgentTool              │
-        │   (receives all outputs for this         │
-        │    variant — searches only if needed)    │
+                       │  one context slice per variant
+                       ▼
+              Triage  (if n > threshold)
+              KEEP / DISCARD per variant
+              (compound-het candidates always KEEP)
+                       │  kept variants only
+                       ▼
+        ┌─────────────────────────────────────────┐
+        │  Stage 2 — Reasoning                     │
+        │  one SLM call per kept variant           │
+        │  → step-by-step reasoning                │
+        │  → RELEVANCE score 1–3                   │
         └──────────────┬──────────────────────────┘
                        │
-                  mini-doc for
-                  this variant
-                        │ mini-docs
-                        ▼
-              [Stage 2 — optional compression]
-                        │
-                        ▼
-              Stage 3 — step-by-step reasoning
-                        │
-                        ▼
-              Stage 4 — structured report
+              Tier selection
+              Tier 1: score-3 first, backfill score-2
+              Tier 2: kept but not Tier 1
+                       │  Tier 1 only below
+                       ▼
+        ┌─────────────────────────────────────────┐
+        │  Stage 3 — Cross-analysis                │
+        │  (genes with ≥ 2 Tier 1 variants)        │
+        │  compound-het / interaction assessment   │
+        └──────────────┬──────────────────────────┘
+                       │
+                       ▼
+        ┌─────────────────────────────────────────┐
+        │  Stage 4 — Per-variant Conclusion        │
+        │  one SLM call per Tier 1 variant         │
+        └──────────────┬──────────────────────────┘
+                       │
+                       ▼
+              Stage 5 — Final Conclusion
+              one SLM call across all Tier 1 blocks
 ```
 
 ---
@@ -184,14 +197,16 @@ FINAL REPORT
 and its metadata: LitVar2 keeps article titles and PMIDs; WebSearchAgent records the
 full ReAct trace; all tools append their raw string output.
 
-**AUGMENTED CONTEXT** is the evidence document assembled by Stage 1 (and optionally
-compressed by Stage 2) that is fed to the SLM reasoning and conclusion stages.
+**AUGMENTED CONTEXT** is the raw evidence document assembled by Stage 1 (retrieval).
+It covers all variants and is passed as-is to the SLM reasoning and conclusion stages.
 
-**REASONING** is the free-form step-by-step output of Stage 3 (not shown in the final
-clinical report — used only as input to Stage 4).
+**REASONING** is the per-variant step-by-step output of Stage 2. Covers all kept
+(non-discarded) variants; each block is tagged `[TIER 1]` or `[TIER 2]`. Not shown
+in the clinical report — used only as input to Stage 4.
 
-**FINAL REPORT** is the structured Stage 4 output: one block per variant followed by
-a `# Clinical Conclusion` paragraph.
+**FINAL REPORT** contains Tier 1 structured blocks (Stage 4), the overall
+`# Clinical Conclusion` paragraph (Stage 5), and — when triage ran — an appendix
+listing Tier 2 variants (reasoning available) and Tier 3 variants (discarded at triage).
 
 ---
 
