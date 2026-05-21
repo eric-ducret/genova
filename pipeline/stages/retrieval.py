@@ -47,7 +47,7 @@ def run(
     variants: list[dict],
     patient_phenotype: str,
     executor: "Executor",
-    genome_build: str = "hg19",
+    genome_build: str = "DEFAULT_GENOME_BUILD",
     raw_rows: list[dict] | None = None,
 ) -> list[str]:
     """
