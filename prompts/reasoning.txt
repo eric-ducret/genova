@@ -20,8 +20,6 @@ Rules:
 - Make the reasoning explicit.
 - Do NOT skip steps.
 - Do NOT produce a final classification.
-- When referencing literature evidence, cite the PMID inline using [PMID:XXXXXXXX] notation exactly as it appears in the retrieved evidence.
-- When referencing web sources, cite the URL inline using [Source: <url>] notation exactly as it appears in the retrieved evidence.
 
 Finally, after completing all reasoning steps, output exactly this line:
 RELEVANCE: <score>

@@ -435,6 +435,43 @@ class WebSearchAgentTool(ReActTool):
     description = "ReAct agent that searches the web and NCBI for variant-phenotype evidence."
     _last_trace: list[str] | None = None
 
+    def gate(self, variant: dict, context: "ToolContext") -> bool:
+        """
+        Skip websearch entirely if prior tool evidence is already sufficient
+        to discard this variant with high confidence.
+
+        Triage runs against the accumulated outputs from LitVar2, SpliceAI, and
+        AutoPVS1. It defaults to KEEP on any uncertainty or parse failure, so
+        false discards are rare. The post-retrieval pipeline triage still runs
+        afterwards for variants that do pass this gate.
+        """
+        from pipeline.stages import triage as triage_stage
+
+        prefetched_parts = [
+            f"{name.upper().replace('_', ' ')} EVIDENCE:\n{output}"
+            for name, output in context.all_outputs.items()
+            if output
+        ]
+        if not prefetched_parts:
+            return True
+
+        evidence = "\n\n".join(prefetched_parts)
+        decision, justification = triage_stage.run_one(
+            variant_context=evidence,
+            patient_phenotype=context.patient_phenotype,
+            llm=context.llm,
+        )
+
+        if decision == "DISCARD":
+            import logging
+            logging.getLogger(__name__).info(
+                "[WebSearchAgentTool] Pre-websearch triage DISCARD — skipping websearch. "
+                "Reason: %s", justification
+            )
+            return False
+
+        return True
+
     def run(self, variant: dict, context: ToolContext) -> str | None:
         """
         Instantiate ReActAgent with context.llm (wrapped in _LLMAdapter) and
