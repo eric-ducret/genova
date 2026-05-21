@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from pipeline.config import DEFAULT_GENOME_BUILD
 from pipeline.core.normalizer import TARGET_COLUMNS
 
 if TYPE_CHECKING:
@@ -47,7 +48,7 @@ def run(
     variants: list[dict],
     patient_phenotype: str,
     executor: "Executor",
-    genome_build: str = "DEFAULT_GENOME_BUILD",
+    genome_build: str = DEFAULT_GENOME_BUILD,
     raw_rows: list[dict] | None = None,
 ) -> list[str]:
     """

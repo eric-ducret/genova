@@ -120,8 +120,15 @@ def parse_variant_coords(
 # AutoPVS1 fetch + HTML parse
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def fetch_variant_data(variant_id: str) -> dict | None:
-    url = f"https://autopvs1.bgi.com/variant/hg19/{variant_id}"
+def _norm_build(build: str) -> str:
+    """Normalise any genome build alias to the two tokens AutoPVS1 accepts in its URL."""
+    if build in ("hg19", "19", "37", "GRCh37", "b37"):
+        return "hg19"
+    return "hg38"
+
+
+def fetch_variant_data(variant_id: str, hg: str = "hg19") -> dict | None:
+    url = f"https://autopvs1.bgi.com/variant/{_norm_build(hg)}/{variant_id}"
     headers = {
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
         "User-Agent": "Mozilla/5.0 (compatible; PythonScript/1.0)",
@@ -236,6 +243,7 @@ def fetch_and_format_autopvs1(
     ref:   str,
     alt:   str,
     hgvs:  str = "",   # optional — used only as a label in the output block
+    hg:    str = "hg19",
 ) -> str | None:
     """
     Full pipeline: VCF coords → AutoPVS1 ID → fetch → formatted evidence block.
@@ -253,7 +261,7 @@ def fetch_and_format_autopvs1(
     variant_id = vcf_to_autopvs1_id(chrom, pos, ref, alt)
     print(f"[AutoPVS1] ID: {variant_id}")
 
-    d = fetch_variant_data(variant_id)
+    d = fetch_variant_data(variant_id, hg=hg)
     if d is None:
         return None
 
@@ -330,11 +338,6 @@ class AutoPVS1Tool(NetworkTool):
 
         Uses Type field first, then HGVS clues, then LLM.
         """
-        # AutoPVS1 web service is hg19 only
-        if context.genome_build not in ("hg19", "37", "GRCh37", "b37"):
-            print(f"[PVS1 gate] SKIP — AutoPVS1 is hg19 only, build={context.genome_build!r}")
-            return False
-
         type_val = variant.get("Type", "").lower()
         hgvs_val = variant.get("HGVS", "").lower()
 
@@ -414,6 +417,7 @@ class AutoPVS1Tool(NetworkTool):
             result = fetch_and_format_autopvs1(
                 chrom, pos, ref, alt,
                 hgvs=variant.get("HGVS", ""),
+                hg=context.genome_build,
             )
         except requests.exceptions.RequestException as e:
             raise ToolFetchError(
