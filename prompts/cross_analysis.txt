@@ -1,6 +1,4 @@
 
-You are an expert clinical geneticist.
-
 Gene: {gene}
 
 Two or more variants affect the same gene. Below are the individual variant contexts and per-variant reasonings.

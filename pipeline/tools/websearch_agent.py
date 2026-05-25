@@ -445,7 +445,7 @@ class WebSearchAgentTool(ReActTool):
         false discards are rare. The post-retrieval pipeline triage still runs
         afterwards for variants that do pass this gate.
         """
-        from pipeline.stages import triage as triage_stage
+        from pipeline.stages import first_triage as triage_stage
 
         prefetched_parts = [
             f"{name.upper().replace('_', ' ')} EVIDENCE:\n{output}"

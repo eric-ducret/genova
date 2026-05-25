@@ -6,7 +6,7 @@ Wires together:
   - Tool instances
   - Manifest loader
   - Executor
-  - Stage functions (retrieval → triage → reasoning → cross_analysis → conclusion → final_conclusion)
+  - Stage functions (retrieval → first_triage → reasoning → cross_analysis → conclusion → final_conclusion)
 
 Design rule: server.py calls pipeline.run() and knows nothing about variants.
 All logic lives here and in the stages/tools/core modules.
@@ -18,7 +18,7 @@ Public API:
 Per-variant flow:
 
   retrieval:         variants → list[str]  (one context slice per variant)
-  triage:            per slice → KEEP/DISCARD  (skipped if n <= TRIAGE_ENABLED_THRESHOLD)
+  first_triage:      per slice → KEEP/DISCARD  (skipped if n <= TRIAGE_ENABLED_THRESHOLD)
   reasoning:         kept slices → dict[int, str]  (one reasoning block per kept variant)
   cross_analysis:    per gene with ≥2 tier-1 variants → dict[gene, str]
   conclusion:        tier-1 slices + reasoning + cross_analysis → dict[int, str]
@@ -34,8 +34,6 @@ from typing import Optional
 
 from pipeline.config          import (
     DEFAULT_GENOME_BUILD,
-    MAX_CONCLUSION_VARIANTS,
-    MIN_CONCLUSION_VARIANTS,
     TRIAGE_ENABLED_THRESHOLD,
 )
 from pipeline.core.manifest  import ManifestLoader
@@ -43,7 +41,7 @@ from pipeline.core.executor  import Executor
 from pipeline.core.normalizer import TARGET_COLUMNS
 from pipeline.llm.registry   import get_client
 from pipeline.tools          import AutoPVS1Tool, LitVar2SummaryTool, SpliceAITool, WebSearchAgentTool
-from pipeline.stages         import retrieval, reasoning, conclusion, cross_analysis, final_conclusion, triage
+from pipeline.stages         import retrieval, reasoning, conclusion, cross_analysis, final_conclusion, first_triage
 
 logger = logging.getLogger(__name__)
 
@@ -195,78 +193,6 @@ def _build_process_details(
     return "\n".join(lines)
 
 
-def _select_tier1_indices(
-    kept_indices: list[int],
-    relevance_scores: dict[int, int],
-    gene_groups: dict[str, list[int]],
-    max_variants: int,
-    min_variants: int,
-) -> list[int]:
-    """
-    Select which kept variants go to Tier 1 (conclusion).
-
-    Rules:
-    - Same-gene groups are atomic: the group score = max score of its members.
-      The whole group moves together.
-    - Take all groups with score == 3 first.
-    - If total variants selected < min_variants, backfill with score == 2 groups.
-    - Hard cap at max_variants total variants selected.
-    - Singletons (no gene partner among kept variants) are treated as
-      single-member groups.
-
-    Returns list of 0-based variant indices that are Tier 1.
-    """
-    kept_set = set(kept_indices)
-
-    # Build index → gene group members (only among kept_indices)
-    # A variant whose gene appears only once among kept_indices is its own group.
-    index_to_group: dict[int, frozenset[int]] = {}
-    for gene, idxs in gene_groups.items():
-        members = frozenset(i for i in idxs if i in kept_set)
-        if members:
-            for i in members:
-                index_to_group[i] = members
-
-    # Singletons: kept variants not covered by any gene group entry
-    for i in kept_indices:
-        if i not in index_to_group:
-            index_to_group[i] = frozenset([i])
-
-    # Deduplicate groups
-    seen_groups: set[frozenset[int]] = set()
-    unique_groups: list[frozenset[int]] = []
-    for i in kept_indices:
-        grp = index_to_group[i]
-        if grp not in seen_groups:
-            seen_groups.add(grp)
-            unique_groups.append(grp)
-
-    # Assign each group a score = max relevance score among its members
-    def group_score(grp: frozenset[int]) -> int:
-        return max(relevance_scores.get(i, 2) for i in grp)
-
-    # Sort: score=3 first, then score=2, then score=1
-    unique_groups.sort(key=group_score, reverse=True)
-
-    # Greedily select groups
-    selected: list[int] = []
-    for grp in unique_groups:
-        score = group_score(grp)
-        if len(selected) >= max_variants:
-            break
-        # Always take score-3; backfill score-2 if below min_variants
-        if score == 3 or (score == 2 and len(selected) < min_variants):
-            new_members = sorted(grp)
-            if len(selected) + len(new_members) <= max_variants:
-                selected.extend(new_members)
-            else:
-                # Partial group addition would break atomicity — skip this group
-                remaining = max_variants - len(selected)
-                if remaining >= len(new_members):
-                    selected.extend(new_members)
-                # else: skip the whole group to preserve atomicity
-
-    return sorted(set(selected))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -342,7 +268,7 @@ class Pipeline:
             Stage 1   — retrieval:        variants → list[str] (one context slice per variant)
             Triage    — (if n > threshold) kept/discarded per variant
             Stage 2   — reasoning:        kept slices → dict[int, str]
-            Tier select — parse RELEVANCE scores, pick Tier 1 via _select_tier1_indices
+            Tier select — split kept variants into included/excluded via inclusion_decisions
             Stage 3.5 — cross_analysis:   per gene with ≥2 tier-1 variants → dict[gene, str]
             Stage 4   — conclusion:        tier-1 variants → dict[int, str]
             Stage 5   — final_conclusion:  tier-1 conclusions → str
@@ -403,7 +329,7 @@ class Pipeline:
                 logger.info(
                     "[Pipeline] Triage %d/%d — %s %s...", i + 1, n, gene, hgvs
                 )
-                decision, justification = triage.run_one(
+                decision, justification = first_triage.run_one(
                     variant_context=variant_ctx,
                     patient_phenotype=patient_phenotype,
                     llm=self._llm,
@@ -434,7 +360,7 @@ class Pipeline:
 
         # ── Stage 2: Reasoning (only on kept variants) ───────────────────────
         reasonings: dict[int, str] = {}
-        relevance_scores: dict[int, int] = {}
+        inclusion_decisions: dict[int, str] = {}
 
         for pos, i in enumerate(kept_indices):
             variant = variants[i]
@@ -444,41 +370,30 @@ class Pipeline:
                 pos + 1, len(kept_indices), i, gene,
             )
             r = reasoning.run_one(variant_context=context_slices[i], llm=self._llm)
-            reasonings[i]       = r
-            relevance_scores[i] = reasoning.parse_relevance_score(r)
+            reasonings[i]          = r
+            inclusion_decisions[i] = reasoning.parse_inclusion_decision(r)
+            logger.info(
+                "[Pipeline] Variant %d decision: %s", i + 1, inclusion_decisions[i]
+            )
 
-        # ── Tier 1 selection ──────────────────────────────────────────────────
-        # Build gene groups restricted to kept variants, using original indices
-        gene_groups_kept_orig: dict[str, list[int]] = defaultdict(list)
-        for i in kept_indices:
-            gene = variants[i].get("Gene", "NA")
-            if gene and gene != "NA":
-                gene_groups_kept_orig[gene].append(i)
-
-        tier1_indices = _select_tier1_indices(
-            kept_indices=kept_indices,
-            relevance_scores=relevance_scores,
-            gene_groups=dict(gene_groups_kept_orig),
-            max_variants=MAX_CONCLUSION_VARIANTS,
-            min_variants=MIN_CONCLUSION_VARIANTS,
-        )
-        tier1_set    = set(tier1_indices)
-        tier2_indices = [i for i in kept_indices if i not in tier1_set]
+        # ── Inclusion split (direct from second_triage decisions) ────────────
+        include_indices = [i for i in kept_indices if inclusion_decisions.get(i) == "INCLUDE"]
+        exclude_indices = [i for i in kept_indices if inclusion_decisions.get(i) == "EXCLUDE"]
 
         logger.info(
-            "[Pipeline] Tier split: %d Tier 1, %d Tier 2.",
-            len(tier1_indices), len(tier2_indices),
+            "[Pipeline] Second triage: %d included, %d excluded.",
+            len(include_indices), len(exclude_indices),
         )
 
-        # ── Stage 3.5: Gene-level cross-analysis (Tier 1 only) ───────────────
-        gene_groups_tier1: dict[str, list[int]] = defaultdict(list)
-        for i in tier1_indices:
+        # ── Stage 3.5: Gene-level cross-analysis (included variants only) ──────
+        gene_groups_included: dict[str, list[int]] = defaultdict(list)
+        for i in include_indices:
             gene = variants[i].get("Gene", "NA")
             if gene and gene != "NA":
-                gene_groups_tier1[gene].append(i)
+                gene_groups_included[gene].append(i)
 
         cross_analyses: dict[str, str] = {}
-        for gene, indices in gene_groups_tier1.items():
+        for gene, indices in gene_groups_included.items():
             if len(indices) >= 2:
                 logger.info(
                     "[Pipeline] Cross-analysis for gene %s (%d variants)...",
@@ -491,15 +406,15 @@ class Pipeline:
                     llm=self._llm,
                 )
 
-        # ── Stage 4: Per-variant conclusion (Tier 1 only) ────────────────────
+        # ── Stage 4: Per-variant conclusion (included variants only) ─────────
         conclusions: dict[int, str] = {}
-        for pos, i in enumerate(tier1_indices):
+        for pos, i in enumerate(include_indices):
             variant = variants[i]
             gene    = variant.get("Gene", "NA")
             ca      = cross_analyses.get(gene) if gene != "NA" else None
             logger.info(
                 "[Pipeline] Conclusion %d/%d (variant idx %d) — %s...",
-                pos + 1, len(tier1_indices), i, gene,
+                pos + 1, len(include_indices), i, gene,
             )
             conclusions[i] = conclusion.run_one(
                 variant_context=context_slices[i],
@@ -511,7 +426,7 @@ class Pipeline:
         # ── Stage 5: Final clinical conclusion (Tier 1 only) ─────────────────
         logger.info("[Pipeline] Generating final clinical conclusion...")
         final_summary = final_conclusion.run(
-            conclusions=[conclusions[i] for i in tier1_indices],
+            conclusions=[conclusions[i] for i in include_indices],
             patient_phenotype=patient_phenotype,
             llm=self._llm,
         )
@@ -523,8 +438,8 @@ class Pipeline:
             n=n,
             kept_indices=kept_indices,
             discarded_indices=discarded_indices,
-            tier1_indices=tier1_indices,
-            tier2_indices=tier2_indices,
+            include_indices=include_indices,
+            exclude_indices=exclude_indices,
             triage_results=triage_results,
             variants=variants,
             triage_ran=triage_ran,
@@ -534,29 +449,32 @@ class Pipeline:
         # AUGMENTED CONTEXT — all variants (unchanged)
         full_context_display = _reconstruct_full_context(context_slices)
 
-        # REASONING — Tier 1 + Tier 2 only, in original variant order
+        # REASONING — all kept variants, in original variant order
         reasoning_parts = []
         for i in kept_indices:
-            variant = variants[i]
-            gene    = variant.get("Gene", "?")
-            hgvs    = variant.get("HGVS", variant.get("Variant", "?"))
-            tier_tag = "[TIER 1]" if i in tier1_set else "[TIER 2]"
+            variant  = variants[i]
+            gene     = variant.get("Gene", "?")
+            hgvs     = variant.get("HGVS", variant.get("Variant", "?"))
+            decision = inclusion_decisions.get(i, "INCLUDE")
+            tier_tag = f"[{decision}]"
             reasoning_parts.append(
                 f"{SEP_VARIANT}\nVARIANT {i + 1} — {gene}  {hgvs}  {tier_tag}\n"
                 f"{SEP_VARIANT}\n{reasonings[i]}"
             )
         reasoning_display = "\n\n".join(reasoning_parts)
 
-        # FINAL REPORT — Tier 1 conclusions + final paragraph + appendix
-        tier1_report_blocks = [conclusions[i] for i in tier1_indices]
-        final_report = "\n\n---\n\n".join(tier1_report_blocks) + "\n\n---\n\n" + final_summary
+        # FINAL REPORT — included conclusions + final paragraph + appendix
+        included_report_blocks = [conclusions[i] for i in include_indices]
+        if included_report_blocks:
+            final_report = "\n\n---\n\n".join(included_report_blocks) + "\n\n---\n\n" + final_summary
+        else:
+            final_report = final_summary
 
-        if triage_ran and (tier2_indices or discarded_indices):
+        if triage_ran and (exclude_indices or discarded_indices):
             final_report += _build_report_appendix(
-                tier2_indices=tier2_indices,
+                exclude_indices=exclude_indices,
                 discarded_indices=discarded_indices,
                 triage_results=triage_results,
-                relevance_scores=relevance_scores,
                 variants=variants,
             )
 
@@ -581,8 +499,8 @@ def _build_triage_summary(
     n: int,
     kept_indices: list[int],
     discarded_indices: list[int],
-    tier1_indices: list[int],
-    tier2_indices: list[int],
+    include_indices: list[int],
+    exclude_indices: list[int],
     triage_results: dict[int, tuple[str, str]],
     variants: list[dict],
     triage_ran: bool,
@@ -622,34 +540,32 @@ def _build_triage_summary(
             hgvs    = variant.get("HGVS", variant.get("Variant", "?"))
             lines.append(f"  Variant {i + 1} — {gene} ({hgvs})")
 
-    tier1_labels = ", ".join(f"Variant {i + 1}" for i in tier1_indices) or "(none)"
-    tier2_labels = ", ".join(f"Variant {i + 1}" for i in tier2_indices) or "(none)"
-    lines.append(f"\nTier 1 (→ conclusion): {tier1_labels}")
-    lines.append(f"Tier 2 (→ reasoning only): {tier2_labels}")
+    include_labels = ", ".join(f"Variant {i + 1}" for i in include_indices) or "(none)"
+    exclude_labels = ", ".join(f"Variant {i + 1}" for i in exclude_indices) or "(none)"
+    lines.append(f"\nIncluded (→ conclusion): {include_labels}")
+    lines.append(f"Excluded (→ reasoning only): {exclude_labels}")
 
     return "\n".join(lines)
 
 
 def _build_report_appendix(
-    tier2_indices: list[int],
+    exclude_indices: list[int],
     discarded_indices: list[int],
     triage_results: dict[int, tuple[str, str]],
-    relevance_scores: dict[int, int],
     variants: list[dict],
 ) -> str:
     lines = ["\n\n---\n\n## Variants not included in conclusion"]
 
-    if tier2_indices:
-        lines.append("\n### Tier 2 — Reasoning available (see REASONING section)")
-        for i in tier2_indices:
+    if exclude_indices:
+        lines.append("\n### Excluded — Reasoning available (see REASONING section)")
+        for i in exclude_indices:
             variant = variants[i]
             gene    = variant.get("Gene", "?")
             hgvs    = variant.get("HGVS", variant.get("Variant", "?"))
-            score   = relevance_scores.get(i, 2)
-            lines.append(f"- Variant {i + 1} — {gene} ({hgvs})  [RELEVANCE: {score}]")
+            lines.append(f"- Variant {i + 1} — {gene} ({hgvs})")
 
     if discarded_indices:
-        lines.append("\n### Tier 3 — Discarded at triage")
+        lines.append("\n### Discarded at first triage")
         for i in discarded_indices:
             variant = variants[i]
             gene    = variant.get("Gene", "?")

@@ -1,36 +1,40 @@
 
-You are an expert clinical geneticist.
-
 Patient phenotype and augmented evidence for this variant:
 {augmented_context}
 
 TASK — DETAILED REASONING:
 
-Reason step by step using ONLY the provided evidence. Be explicit. Do NOT produce a final classification.
+Reason step by step using ONLY the provided evidence. Every factual claim must be
+traceable to a specific reference present in the evidence above (e.g. PMID, URL,
+database record, or tool output). If no supporting reference is available for a
+claim, explicitly state what is missing rather than inferring from prior knowledge.
 
 Reasoning steps:
 
-1. Take the genetic variant name and explain each part of it.
-2. Molecular mechanism: Describe what the variant does at the protein or RNA level. Reflect on whether this effect could plausibly impact the patient phenotype.
-3. Phenotype fit: Assess whether the gene-disease relationship matches the patient's clinical features, citing context evidence. Reflect on the relevance to the patient's phenotype.
-4. Inheritance coherence: Evaluate whether the observed zygosity aligns with the gene's known inheritance mode. Reflect on whether the inheritance pattern supports a causative role.
-5. Flags/uncertainties: Note any contradictions or missing information. Reflect on whether these uncertainties reduce the likelihood that the variant is causative.
+1. Variant description: Explain each component of the variant notation (chromosome,
+   position, nucleotide change, HGVS consequence, zygosity).
+
+2. Molecular mechanism: Describe what the variant does at the protein or RNA level.
+   Cite the specific evidence (tool output, PMID, etc.) that supports this description.
+   If no mechanistic evidence is present in the context, state: "No mechanistic evidence
+   available in the retrieved data."
+
+3. Phenotype fit: Assess whether the gene–disease relationship matches the patient's
+   clinical features. Quote or cite the relevant context passage (e.g. "LitVar2 reports
+   [PMID:XXXXX]…", "AutoPVS1 output states…"). Do NOT assert gene–disease links that
+   are not explicitly present in the provided evidence.
+
+4. Inheritance coherence: Evaluate whether the observed zygosity is consistent with
+   the gene's known inheritance mode. Use only the inheritance data present in the
+   context (variant fields or retrieved evidence).
+
+5. Flags and uncertainties: Note any contradictions, gaps, or missing evidence
+   (e.g. no population frequency data, no literature hits, failed tool). Be explicit
+   about what information is absent and how that affects confidence.
 
 Rules:
-- Make the reasoning explicit.
-- Do NOT skip steps.
-- Do NOT produce a final classification.
-
-Finally, after completing all reasoning steps, output exactly this line:
-RELEVANCE: <score>
-
-Where <score> is:
-3 = strong candidate — good phenotype fit, credible molecular mechanism,
-    coherent inheritance, meaningful evidence
-2 = uncertain — partial phenotype fit, weak or conflicting evidence,
-    or insufficient data to decide
-1 = unlikely — poor phenotype fit, clearly benign molecular effect,
-    or strong evidence against causality
-
-Output the RELEVANCE line as the very last line of your response.
-Do not explain the score.
+- Make the reasoning explicit and step-by-step.
+- Do NOT skip any step.
+- Do NOT produce a final classification or score.
+- Do NOT introduce external knowledge without a citation from the provided evidence.
+  If you are uncertain whether a fact is in the evidence, omit it or flag it as uncertain.

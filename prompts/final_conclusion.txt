@@ -1,6 +1,4 @@
 
-You are an expert clinical geneticist.
-
 Patient phenotype: {patient_phenotype}
 
 Per-variant conclusions:

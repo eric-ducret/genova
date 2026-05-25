@@ -17,8 +17,11 @@ Pipeline class:
 """
 
 import re
+import logging
 import requests
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
 
 from pipeline.tools.base import NetworkTool
 from pipeline.core.context import ToolContext
