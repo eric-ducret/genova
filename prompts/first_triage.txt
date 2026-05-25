@@ -1,0 +1,21 @@
+Patient phenotype: {patient_phenotype}
+
+Retrieved evidence:
+{variant_context}
+
+TASK — DISCARD ASSESSMENT:
+
+Based solely on the evidence above, decide whether this variant can be discarded
+with high confidence because it does not explain the patient's phenotype.
+Only discard if the evidence clearly supports irrelevance. When in doubt, keep.
+
+Cite the single most decisive piece of evidence in one short phrase (≤8 words).
+Then state your decision.
+
+Output exactly two lines and nothing else:
+Thought: <decisive evidence phrase>
+Decision: KEEP or DISCARD
+
+Example output:
+Thought: ClinVar benign, AF 0.12, unrelated gene.
+Decision: DISCARD

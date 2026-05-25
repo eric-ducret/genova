@@ -1,0 +1,30 @@
+
+The following reasoning has been produced for a genetic variant found in a patient.
+
+--- VARIANT EVIDENCE ---
+{augmented_context}
+
+--- CLINICAL REASONING ---
+{reasoning}
+
+TASK — INCLUSION DECISION:
+
+Decide whether this variant should proceed to the final clinical conclusion step,
+or whether it can be set aside because it does not plausibly explain the patient's
+phenotype.
+
+Include the variant if:
+- There is a plausible molecular mechanism supported by the retrieved evidence.
+- The gene–disease association is relevant to the patient's clinical presentation.
+- The inheritance pattern is compatible with the observed zygosity.
+
+Exclude the variant if:
+- The phenotype fit is poor or absent.
+- No credible mechanism is supported by the evidence.
+- There is strong evidence against causality (benign classification, very high
+  population frequency, clearly unrelated gene function).
+- Evidence is so sparse that the variant cannot be evaluated at all.
+
+Output exactly one of the following words and nothing else:
+INCLUDE
+EXCLUDE
