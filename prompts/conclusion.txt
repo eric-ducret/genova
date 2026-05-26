@@ -20,5 +20,5 @@ Use exactly this format:
 **Phenotype fit:** [match / mismatch / uncertain] — [one sentence justification]
 **Inheritance check:** [consistent / inconsistent / insufficient data]
 **Evidence strength:** [strong / moderate / weak / absent]
-**ACMG criteria**: [cite only if a tool explicitly supports it — justification & source, then criterion]
+**ACMG criteria**: [criteria with justification]
 **Comment:** [2–3 sentences]
