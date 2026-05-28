@@ -62,16 +62,16 @@ variant-pipeline/
 │   ├── stages/
 │   │   ├── __init__.py
 │   │   ├── retrieval.py             ← per-variant tool fan-out stage
-│   │   ├── triage.py                ← fast SLM keep/discard decision per variant
-│   │   ├── reasoning.py             ← SLM step-by-step reasoning + RELEVANCE scoring
+│   │   ├── first_triage.py          ← fast SLM keep/discard decision per variant
+│   │   ├── reasoning.py             ← two-call SLM: step-by-step reasoning + second triage (INCLUDE/EXCLUDE)
 │   │   ├── cross_analysis.py        ← gene-level compound-het / interaction analysis
-│   │   ├── conclusion.py            ← per-variant structured report (Tier 1 only)
+│   │   ├── conclusion.py            ← per-variant structured report (included variants only)
 │   │   └── final_conclusion.py      ← overall clinical conclusion paragraph
 │   │
 │   ├── tools/
 │   │   ├── __init__.py
 │   │   ├── base.py                  ← Tool, NetworkTool, SLMTool, RAGTool, BotTool
-│   │   ├── litvar2.py               ← LitVar2 literature search (rsID + gene fallback)
+│   │   ├── litvar2.py               ← literature search: gene-first PubMed + LitVar2 rsID supplement
 │   │   ├── autopvs1.py              ← AutoPVS1 PVS1 criterion evaluation (LoF variants)
 │   │   ├── spliceai.py              ← SpliceAI splice impact delta scores (Broad API)
 │   │   ├── websearch.py             ← WebSearchTool + WebFetchTool (sub-tools for ReAct agent)
@@ -87,7 +87,9 @@ variant-pipeline/
 └── prompts/
     ├── retrieval.txt
     ├── compression.txt
+    ├── first_triage.txt
     ├── reasoning.txt
+    ├── second_triage.txt
     ├── conclusion.txt
     ├── cross_analysis.txt
     └── final_conclusion.txt
@@ -381,11 +383,14 @@ note the missing evidence in the report rather than reasoning from a gap.
 | `autopvs1` | `NetworkTool` | 2 (parallel) | Python gate — LoF/frameshift/splice variants only |
 | `websearch_agent` | `ReActTool` | 3 (serial) | None — internal pre-loop checkpoint decides whether to search |
 
-**`litvar2_summary`** runs two paths depending on what variant fields are available:
-- **rsID present and valid** (`rs\d+`) — variant-level search via the LitVar2 publications endpoint; fetches PMIDs, filters titles with the SLM using the resolved disease query, fetches abstracts, and returns a summary with inline PMID citations prefixed `LitVar2 evidence summary for {rsid}:`.
-- **rsID absent, Gene present** — gene-level fallback via `GET /variant/search/gene/{gene}`; collects and deduplicates PMIDs across the first 10 variants returned for that gene, then runs the same filter → abstracts → summary pipeline. Output is prefixed `LitVar2 gene-level evidence for {gene} (no rsID):` so downstream reasoning stages can distinguish the two.
+**`litvar2_summary`** runs a gene-first dual-track search:
 
-`_disease_query` is resolved once per pipeline run via a single SLM call (`_resolve_disease_query`), cached as an instance attribute, and reused for all subsequent variants. Both paths use this resolved query for title filtering; the full `patient_phenotype` string is passed to the final summarisation step for richer output. `_gene_fallback` resolves `_disease_query` itself if called directly (e.g. from a unit test) without requiring `run()` to have been called first.
+- **Gene-level search (primary — always runs when Gene is present)** — queries PubMed `esearch` with `({gene}[tiab] OR {gene}[Gene]) AND {disease_query}`. If no disease co-occurrence is found, retries with gene-only to distinguish "no literature at all" from "gene unrelated to disease". Returns an explicit `"NO DISEASE LINK"` message on zero relevant hits — providing a clear negative signal for triage. Output header includes PubMed's `querytranslation` and pool counts for downstream traceability.
+- **rsID search (supplemental — runs when RS_ID is valid)** — queries the LitVar2 variant publications endpoint for variant-specific literature. Omitted from output if no relevant papers are found. Output header identifies LitVar2 as source, distinguished from the gene-level PubMed block.
+
+When both searches yield results they are combined in the output separated by `---`. `_disease_query` is resolved once per pipeline run via a single SLM call (`_resolve_disease_query`), cached as an instance attribute, and reused for all variants. The resolver prefers broad MeSH disease category terms so PubMed's automatic term mapping indexes correctly.
+
+**`autopvs1`** uses a HGVS-first query strategy: when a valid transcript HGVS is available (`NM_xxx:c.xxx`), it queries AutoPVS1 via `/search?q={hgvs}` so AutoPVS1 resolves coordinates internally — immune to stale CSV coords. Falls back to VCF-style coords (`/variant/{build}/{chrom}-{pos}-{ref}-{alt}`) when HGVS is absent or the search path fails. Results are discarded when AutoPVS1 returns `variant_type="Intergenic"` or the returned gene does not match the expected gene. `pvs1_applicable` is `True` only when a flowchart is present in the response and no "incompatible with recommendations" message is found.
 
 **`spliceai`** queries the Broad Institute SpliceAI API and returns delta scores
 (DS_AG, DS_AL, DS_DG, DS_DL) for acceptor/donor gain and loss, along with the
@@ -463,7 +468,7 @@ Switching between modes requires no changes to tool code.
 
 ## Pipeline Stages
 
-The full flow is: retrieval → triage → reasoning → tier selection → cross-analysis → conclusion → final conclusion.
+The full flow is: retrieval → first triage → reasoning + second triage → cross-analysis → conclusion → final conclusion.
 
 ### Stage 1 — Retrieval (`stages/retrieval.py`)
 
@@ -483,10 +488,11 @@ retrieval.py (per variant)
 
 All context slices are kept independently (one per variant) for downstream stages.
 
-### Triage (`stages/triage.py`)
+### First Triage (`stages/first_triage.py`)
 
 One small SLM call per variant immediately after retrieval. Decides whether a variant
 can be discarded with high confidence given the patient phenotype.
+Prompt loaded from `prompts/first_triage.txt`.
 
 Only runs when `n > TRIAGE_ENABLED_THRESHOLD` (configured in `pipeline/config.py`).
 When skipped, all variants are implicitly KEEP.
@@ -495,32 +501,51 @@ Compound heterozygous candidates (two or more variants in the same gene) are
 automatically exempted from DISCARD — a DISCARD decision on any such variant is
 overridden to KEEP.
 
+SLM output format:
+```
+Keep-case: <strongest reason to keep, ≤10 words>
+Discard-case: <strongest reason to discard, ≤10 words>
+Decision: KEEP or DISCARD
+```
+
 Results:
 - **KEEP** variants proceed to reasoning.
 - **DISCARD** variants are excluded from all subsequent stages and appear in the
   appendix of the final report with their justification.
 
-### Stage 2 — Reasoning (`stages/reasoning.py`)
+### Stage 2 — Reasoning + Second Triage (`stages/reasoning.py`)
 
-One SLM call per kept variant. Produces step-by-step clinical reasoning and assigns
-a `RELEVANCE` score (1–3) indicating how likely the variant is to explain the phenotype.
-Prompt loaded from `prompts/reasoning.txt`.
+Two SLM calls per kept variant, executed sequentially:
 
-### Tier Selection
+**Call 1 — reasoning** (`prompts/reasoning.txt`): produces step-by-step clinical
+reasoning grounded in cited evidence only. The model is explicitly instructed not
+to produce a score or classification and not to introduce external knowledge without
+a reference in the provided context. Steps: phenotype fit → variant description →
+molecular mechanism → inheritance coherence → flags and uncertainties.
 
-After reasoning, variants are split into tiers using `_select_tier1_indices()`:
+**Call 2 — second triage** (`prompts/second_triage.txt`): takes the variant context
+and the reasoning from call 1 and emits a structured inclusion decision. Decoupling
+the decision from the narrative prevents the model from forcing a favourable outcome
+to justify speculative reasoning.
 
-- **Tier 1** — variants that proceed to conclusion. Score-3 variants are always
-  included. Score-2 variants backfill up to `MIN_CONCLUSION_VARIANTS`. Hard cap at
-  `MAX_CONCLUSION_VARIANTS`. Same-gene groups are kept atomic (whole group in or out).
-- **Tier 2** — kept variants that did not make Tier 1. Reasoning is available in the
-  output but no structured conclusion is generated.
+SLM output format for second triage:
+```
+Include-case: <strongest reason to include, ≤15 words>
+Exclude-case: <strongest reason to exclude, ≤15 words>
+Decision: INCLUDE or EXCLUDE
+```
 
-Both thresholds are configured in `pipeline/config.py`.
+The two outputs are concatenated (separated by `SECOND TRIAGE:`) before being stored,
+so the REASONING display section in the final output is self-contained.
+
+Results:
+- **INCLUDE** variants proceed to cross-analysis and conclusion.
+- **EXCLUDE** variants are listed in the report appendix with their reasoning available
+  in the REASONING section.
 
 ### Stage 3 — Cross-analysis (`stages/cross_analysis.py`)
 
-Runs after reasoning, for each gene that has two or more Tier 1 variants. Presents the
+Runs after reasoning, for each gene that has two or more included variants. Presents the
 per-variant contexts and reasonings to the SLM and asks it to evaluate potential
 compound heterozygous or other gene-level interactions.
 Prompt loaded from `prompts/cross_analysis.txt`.
@@ -529,7 +554,7 @@ The cross-analysis output is passed into `conclusion.run_one()` for the relevant
 
 ### Stage 4 — Conclusion (`stages/conclusion.py`)
 
-One SLM call per Tier 1 variant. Takes the variant context slice, its reasoning block,
+One SLM call per included variant. Takes the variant context slice, its reasoning block,
 and (if available) the cross-analysis for its gene. Produces the structured variant
 report block. Prompt loaded from `prompts/conclusion.txt`.
 
@@ -546,8 +571,8 @@ Output format per variant:
 
 ### Stage 5 — Final Conclusion (`stages/final_conclusion.py`)
 
-Single SLM call. Takes all Tier 1 conclusion blocks and the patient phenotype and
-produces the overall `# Clinical Conclusion` paragraph (2–3 sentences).
+Single SLM call. Takes all included variants' conclusion blocks and the patient phenotype
+and produces the overall `# Clinical Conclusion` paragraph (2–3 sentences).
 Prompt loaded from `prompts/final_conclusion.txt`.
 
 This stage is separate from Stage 4 so that each variant's block can be generated
@@ -765,7 +790,7 @@ These rules must be respected in all new code:
    No tool or stage should pass `enable_thinking=True`.
 
 8. **Output is free-form string or None.** Tools do not need to produce structured
-   output. The SLM in stages 3 and 4 handles synthesis.
+   output. The SLM in the reasoning and conclusion stages handles synthesis.
 
 9. **Compression is the executor's job.** Tools return their full output.
    The executor applies compression based on the manifest config.

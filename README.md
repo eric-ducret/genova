@@ -27,38 +27,34 @@ CSV / Excel  ──►  normalize_upload()
         └──────────────┬──────────────────────────┘
                        │  one context slice per variant
                        ▼
-              Triage  (if n > threshold)
+              First Triage  (if n > threshold)
               KEEP / DISCARD per variant
               (compound-het candidates always KEEP)
                        │  kept variants only
                        ▼
         ┌─────────────────────────────────────────┐
-        │  Stage 2 — Reasoning                     │
-        │  one SLM call per kept variant           │
-        │  → step-by-step reasoning                │
-        │  → RELEVANCE score 1–3                   │
+        │  Stage 2 — Reasoning + Second Triage     │
+        │  per kept variant:                       │
+        │   call 1 → step-by-step reasoning        │
+        │   call 2 → INCLUDE / EXCLUDE decision    │
         └──────────────┬──────────────────────────┘
-                       │
-              Tier selection
-              Tier 1: score-3 first, backfill score-2
-              Tier 2: kept but not Tier 1
-                       │  Tier 1 only below
+                       │  included variants only
                        ▼
         ┌─────────────────────────────────────────┐
         │  Stage 3 — Cross-analysis                │
-        │  (genes with ≥ 2 Tier 1 variants)        │
+        │  (genes with ≥ 2 included variants)      │
         │  compound-het / interaction assessment   │
         └──────────────┬──────────────────────────┘
                        │
                        ▼
         ┌─────────────────────────────────────────┐
         │  Stage 4 — Per-variant Conclusion        │
-        │  one SLM call per Tier 1 variant         │
+        │  one SLM call per included variant       │
         └──────────────┬──────────────────────────┘
                        │
                        ▼
               Stage 5 — Final Conclusion
-              one SLM call across all Tier 1 blocks
+              one SLM call across all included blocks
 ```
 
 ---
@@ -201,12 +197,13 @@ full ReAct trace; all tools append their raw string output.
 It covers all variants and is passed as-is to the SLM reasoning and conclusion stages.
 
 **REASONING** is the per-variant step-by-step output of Stage 2. Covers all kept
-(non-discarded) variants; each block is tagged `[TIER 1]` or `[TIER 2]`. Not shown
-in the clinical report — used only as input to Stage 4.
+(non-discarded) variants; each block is tagged `[INCLUDE]` or `[EXCLUDE]` based on the
+second triage decision. Not shown in the clinical report — used only as input to Stage 4.
 
-**FINAL REPORT** contains Tier 1 structured blocks (Stage 4), the overall
-`# Clinical Conclusion` paragraph (Stage 5), and — when triage ran — an appendix
-listing Tier 2 variants (reasoning available) and Tier 3 variants (discarded at triage).
+**FINAL REPORT** contains structured conclusion blocks for included variants (Stage 4),
+the overall `# Clinical Conclusion` paragraph (Stage 5), and — when triage ran — an
+appendix listing excluded variants (reasoning available in REASONING section) and
+variants discarded at first triage.
 
 ---
 
