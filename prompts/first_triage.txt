@@ -5,17 +5,27 @@ Retrieved evidence:
 
 TASK — DISCARD ASSESSMENT:
 
-Based solely on the evidence above, decide whether this variant can be discarded
-with high confidence because it does not explain the patient's phenotype.
-Only discard if the evidence clearly supports irrelevance. When in doubt, keep.
+Decide whether this variant can be discarded with high confidence because it
+does not explain the patient's phenotype. Discard ONLY when the case against
+relevance clearly outweighs the case for it. When the two are balanced or
+uncertain, KEEP.
 
-Cite the single most decisive piece of evidence in one short phrase (≤8 words).
-Then state your decision.
+Base your assessment solely on the evidence above.
 
-Output exactly two lines and nothing else:
-Thought: <decisive evidence phrase>
+Weight the retrieved evidence as follows:
+- "PubMed gene-disease evidence" → strong reason to keep (gene linked to phenotype).
+- "NO DISEASE LINK" → reason to discard (gene unrelated to phenotype).
+- "LitVar2 variant-specific evidence" present → strong reason to keep (this exact variant is studied).
+- ClinVar Benign or Likely benign with no conflict → reason to discard.
+- VUS, missing, or conflicting evidence → keep.
+- Mechanistic, pathway, or functional relevance (no gene–disease link) → weak reason to keep.
+
+Output exactly three lines and nothing else:
+Keep-case: <strongest reason to keep, ≤15 words>
+Discard-case: <strongest reason to discard, ≤15 words>
 Decision: KEEP or DISCARD
 
 Example output:
-Thought: ClinVar benign, AF 0.12, unrelated gene.
+Keep-case: gene linked to phenotype, variant rare
+Discard-case: ClinVar benign, AF 0.12
 Decision: DISCARD

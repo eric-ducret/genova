@@ -361,6 +361,7 @@ class Pipeline:
         # ── Stage 2: Reasoning (only on kept variants) ───────────────────────
         reasonings: dict[int, str] = {}
         inclusion_decisions: dict[int, str] = {}
+        second_triage_justifications: dict[int, str] = {}
 
         for pos, i in enumerate(kept_indices):
             variant = variants[i]
@@ -370,10 +371,12 @@ class Pipeline:
                 pos + 1, len(kept_indices), i, gene,
             )
             r = reasoning.run_one(variant_context=context_slices[i], llm=self._llm)
-            reasonings[i]          = r
-            inclusion_decisions[i] = reasoning.parse_inclusion_decision(r)
+            reasonings[i] = r
+            decision, justification = reasoning.parse_inclusion_decision(r)
+            inclusion_decisions[i] = decision
+            second_triage_justifications[i] = justification
             logger.info(
-                "[Pipeline] Variant %d decision: %s", i + 1, inclusion_decisions[i]
+                "[Pipeline] Variant %d (%s) second triage → %s", i + 1, gene, decision
             )
 
         # ── Inclusion split (direct from second_triage decisions) ────────────
@@ -433,7 +436,7 @@ class Pipeline:
 
         # ── Assemble final output ─────────────────────────────────────────────
 
-        # PROCESS DETAILS — all variants + triage summary block
+        # PROCESS DETAILS — all variants + triage summary + second triage summary
         triage_summary = _build_triage_summary(
             n=n,
             kept_indices=kept_indices,
@@ -444,7 +447,17 @@ class Pipeline:
             variants=variants,
             triage_ran=triage_ran,
         )
-        process_section = process_details + "\n\n" + triage_summary
+        second_triage_summary = _build_second_triage_summary(
+            kept_indices=kept_indices,
+            inclusion_decisions=inclusion_decisions,
+            second_triage_justifications=second_triage_justifications,
+            variants=variants,
+        )
+        process_parts = [process_details]
+        if triage_summary:
+            process_parts.append(triage_summary)
+        process_parts.append(second_triage_summary)
+        process_section = "\n\n".join(process_parts)
 
         # AUGMENTED CONTEXT — all variants (unchanged)
         full_context_display = _reconstruct_full_context(context_slices)
@@ -545,6 +558,36 @@ def _build_triage_summary(
     lines.append(f"\nIncluded (→ conclusion): {include_labels}")
     lines.append(f"Excluded (→ reasoning only): {exclude_labels}")
 
+    return "\n".join(lines)
+
+
+def _build_second_triage_summary(
+    kept_indices: list[int],
+    inclusion_decisions: dict[int, str],
+    second_triage_justifications: dict[int, str],
+    variants: list[dict],
+) -> str:
+    SEP = "─" * 56
+    n_included = sum(1 for i in kept_indices if inclusion_decisions.get(i) == "INCLUDE")
+    n_excluded  = sum(1 for i in kept_indices if inclusion_decisions.get(i) == "EXCLUDE")
+    lines = [
+        f"\n{SEP}",
+        "SECOND TRIAGE (INCLUSION DECISIONS)",
+        SEP,
+        f"Evaluated : {len(kept_indices)}",
+        f"Included  : {n_included}",
+        f"Excluded  : {n_excluded}",
+        "",
+    ]
+    for i in kept_indices:
+        variant  = variants[i]
+        gene     = variant.get("Gene", "?")
+        hgvs     = variant.get("HGVS", variant.get("Variant", "?"))
+        decision = inclusion_decisions.get(i, "INCLUDE")
+        just     = second_triage_justifications.get(i, "")
+        lines.append(f"  Variant {i + 1} — {gene}  {hgvs}  [{decision}]")
+        if just:
+            lines.append(f"    {just}")
     return "\n".join(lines)
 
 

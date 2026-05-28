@@ -1,30 +1,24 @@
 """
 pipeline/tools/litvar2.py — LitVar2-powered literature summarisation tool.
 
-Pipeline for a given rsID:
-  1. Fetch all PMIDs from LitVar2 API           (max max_pmids)
-  2. Fetch PubMed titles for every PMID
-  3. Ask the SLM to keep only the N most relevant titles given the patient phenotype
-  4. Fetch full abstracts for the selected PMIDs (via NCBI E-utilities)
-  5. Ask the SLM to produce a concise evidence summary from those abstracts
+Search strategy (gene-first):
 
-Gene-level fallback (when rsID is absent but Gene is present):
-  1. Fetch all variants for the gene from LitVar2
-  2. Collect PMIDs across the first 10 variants
-  3–5. Same filtering and summarisation pipeline, using resolved disease query
+  1. Gene-level search (primary — always runs when Gene is present)
+       Uses PubMed esearch with "{gene}[Gene] AND {disease_query}" to retrieve papers
+       co-mentioning the gene and the patient's disease. One API call, no LitVar2 loop.
+       - Zero hits  → explicit "not linked to disease" string (negative signal for triage)
+       - Non-zero   → titles → SLM filter → abstracts → SLM summary
 
-Changes from litvar2_tool.py:
-  - LitVar2SummaryTool inherits from SLMTool instead of Tool (retrieval_agent)
-  - __init__ initialises _disease_query as an instance attribute (thread-safe across runs)
-  - max_pmids, top_n, max_chars, timeout are class-level attributes with defaults
-  - _select_relevant_pmids and _summarise now accept context and use context.llm.generate()
-  - run() signature changed to run(variant, context) per pipeline contract
-  - gate() returns True when RS_ID is valid OR Gene is non-empty
-  - _disease_query cached on first run via _resolve_disease_query()
-  - _gene_fallback() handles variants with no rsID
+  2. Variant-level search (supplemental — runs when RS_ID is valid)
+       Uses LitVar2 variant publications endpoint (purpose-built for rsID-level tracking).
+       - No relevant papers → omitted from output
+       - Papers found       → titles → SLM filter → abstracts → SLM summary
+
+  Both sections are included in the output when both searches yield evidence, separated by
+  a divider. Section headers identify the source and the exact query used so downstream
+  reasoning stages can interpret provenance without ambiguity.
 """
 
-import ast
 import re
 import json
 import time
@@ -69,13 +63,13 @@ def _clean_xml_text(raw: str) -> str:
 
 class LitVar2SummaryTool(SLMTool):
     """
-    Retrieves variant-specific literature via LitVar2, filters it with an SLM,
-    then returns a concise evidence summary grounded in PubMed abstracts.
+    Retrieves gene- and variant-level literature via PubMed and LitVar2.
 
     gate():  runs when RS_ID is valid OR Gene is non-empty
-    run():   resolves disease query once, then either:
-             - rsID path: fetches PMIDs → titles → SLM filter → abstracts → SLM summary
-             - gene fallback: gene → variants → PMIDs → titles → SLM filter → abstracts → SLM summary
+    run():   gene-level PubMed search always runs first (primary); LitVar2 rsID search
+             runs second as supplemental variant-specific evidence when available.
+             Both outputs are combined; section headers embed source and query so
+             downstream reasoning stages can interpret provenance unambiguously.
     """
 
     name        = "litvar2_summary"
@@ -94,9 +88,6 @@ class LitVar2SummaryTool(SLMTool):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._disease_query: str | None = None
-        self._last_query: str | None = None
-        self._last_n_found: int = 0
-        self._last_kept: list[dict] | None = None
 
     # ── gate ──────────────────────────────────────────────────────────────────
 
@@ -112,17 +103,22 @@ class LitVar2SummaryTool(SLMTool):
 
     def _resolve_disease_query(self, context: ToolContext) -> str:
         """
-        Ask the SLM once to produce a compact search string (2-4 words) from the
-        patient phenotype. Used as a PubMed title keyword filter.
+        Ask the SLM once to produce a PubMed-compatible disease search term from the
+        patient phenotype. Prefers official MeSH disease/syndrome names so PubMed's
+        automatic term mapping maps correctly to indexed MeSH headings. Cached and
+        reused across all variants in the run.
         """
         system = (
-            "Return only the shortest possible disease search string (2-4 words max) "
-            "suitable for a PubMed title keyword filter. "
-            "Lowercase only, no punctuation, no explanation."
+            "Given a patient phenotype, return one broad disease term for a PubMed search. "
+            "Prefer the general disease category over a specific syndrome subtype "
+            "(e.g. 'epilepsy' not 'benign familial neonatal seizures type 1'; "
+            "'cardiomyopathy' not 'CMH4'). "
+            "Lowercase, no punctuation, no explanation."
         )
         return " ".join(
-            context.llm.generate(system=system, user=context.patient_phenotype, max_tokens=20)
-            .strip().lower().split()[:4]
+            context.llm.generate(
+                system=system, user=context.patient_phenotype, max_tokens=20
+            ).strip().lower().split()[:4]
         )
 
     # ── step 1: LitVar2 → PMIDs (rsID path) ──────────────────────────────────
@@ -186,8 +182,7 @@ class LitVar2SummaryTool(SLMTool):
 
         system = (
             "You are a biomedical literature relevance filter. "
-            f"Given a list of paper titles and a research question, select the {self.top_n} "
-            "most relevant papers. "
+            f"Select up to {self.top_n} papers whose titles are clearly relevant to the research question. Skip tangential ones. "
             "Output ONLY a JSON array of PMID strings, e.g. [\"12345678\", \"87654321\"]. "
             "No explanation, no markdown, no extra text."
         )
@@ -292,92 +287,163 @@ class LitVar2SummaryTool(SLMTool):
 
         return context.llm.generate(system=system, user=user, max_tokens=512).strip()
 
-    # ── gene-level fallback ───────────────────────────────────────────────────
+    # ── primary: gene-level PubMed search ────────────────────────────────────
 
-    def _gene_fallback(self, gene: str, context: ToolContext) -> str | None:
+    def _esearch_gene(
+        self, gene: str, disease_query: str | None = None
+    ) -> tuple[list[str], int, str]:
         """
-        Fetch gene-level literature when no rsID is available.
+        Query PubMed esearch for the gene, optionally filtered by disease term.
 
-        Steps:
-          1. Fetch all LitVar2 variants for the gene
-          2. Collect and deduplicate PMIDs across the first 10 variants
-          3–5. Reuse _fetch_titles, _select_relevant_pmids, _fetch_abstracts, _summarise
+        Gene match uses ({gene}[tiab] OR {gene}[Gene]) so papers that mention the gene
+        in title/abstract are included even when the gene is not formally MeSH-indexed.
+
+        When disease_query is None the search is gene-only — used as a fallback to
+        distinguish "gene has no literature at all" from "gene-disease co-occurrence
+        not found."
+
+        Primary call uses relevance sort. If total results exceed max_pmids a second
+        call sorted by publication date adds recent papers not in the relevance window.
+
+        Returns:
+            pmids             — deduplicated list, relevance-ranked first then recency
+            total_count       — total PubMed hits (may exceed len(pmids))
+            query_translation — PubMed's MeSH expansion of the submitted term
         """
-        if self._disease_query is None:
-            self._disease_query = self._resolve_disease_query(context)
+        gene_clause = f"({gene}[tiab] OR {gene}[Gene])"
+        term = f"{gene_clause} AND {disease_query}" if disease_query else gene_clause
 
-        # Step 1: gene → variants
-        url = f"{LITVAR2_BASE}/variant/search/gene/{gene}"
+        # ── primary call: relevance sort ──────────────────────────────────────
         try:
-            resp = requests.get(url, timeout=self.timeout)
-            resp.raise_for_status()
+            data = _ncbi_get(
+                "esearch.fcgi",
+                {"db": "pubmed", "term": term, "retmax": self.max_pmids,
+                 "retmode": "json", "sort": "relevance"},
+                self.timeout,
+            ).json()
         except Exception as e:
-            raise ToolFetchError(f"LitVar2 gene search failed for {gene}: {e}") from e
+            raise ToolFetchError(f"PubMed esearch failed for gene={gene}: {e}") from e
 
         try:
-            all_variants = []
-            for line in resp.text.strip().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    parsed = json.loads(line)
-                except json.JSONDecodeError:
-                    try:
-                        parsed = ast.literal_eval(line)
-                    except Exception:
-                        continue
-                all_variants.append(parsed)
-        except Exception as e:
-            raise ToolParseError(f"Failed to parse gene variant list for {gene}: {e}") from e
+            result       = data["esearchresult"]
+            pmids        = [str(p) for p in result["idlist"] if str(p).isdigit()]
+            total_count  = int(result.get("count", len(pmids)))
+            query_translation = result.get("querytranslation", term)
+        except (KeyError, TypeError, ValueError) as e:
+            raise ToolParseError(
+                f"Failed to parse PubMed esearch response for {gene}: {e}"
+            ) from e
 
-        variants = all_variants[:10]
-        if not variants:
-            return None
+        logger.debug(
+            "PubMed esearch (relevance): %d/%d PMIDs for gene=%s",
+            len(pmids), total_count, gene,
+        )
 
-        # Step 2: variants → deduplicated PMIDs
-        pmid_set: set[str] = set()
-        for v in variants:
-            variant_id = v.get("_id")
-            if not variant_id:
-                continue
+        # ── conditional second call: recency sort ─────────────────────────────
+        # Only fires when total results exceed what the first call retrieved,
+        # i.e. when there are papers outside the relevance-ranked window.
+        if total_count > self.max_pmids:
             try:
-                time.sleep(0.2)
-                encoded = variant_id.replace("#", "%23")
-                pub_url = f"{LITVAR2_BASE}/variant/get/{encoded}/publications"
-                pub_resp = requests.get(pub_url, timeout=self.timeout)
-                pub_resp.raise_for_status()
-                data = pub_resp.json()
-                for p in data.get("pmids", []):
-                    if str(p).isdigit():
-                        pmid_set.add(str(p))
+                data2 = _ncbi_get(
+                    "esearch.fcgi",
+                    {"db": "pubmed", "term": term, "retmax": self.max_pmids // 2,
+                     "retmode": "json", "sort": "pub_date"},
+                    self.timeout,
+                ).json()
+                recent = [
+                    str(p) for p in data2["esearchresult"]["idlist"]
+                    if str(p).isdigit() and str(p) not in set(pmids)
+                ]
+                pmids = pmids + recent
+                logger.debug(
+                    "PubMed esearch (pub_date): added %d recent PMIDs for gene=%s",
+                    len(recent), gene,
+                )
             except Exception as e:
-                logger.warning("LitVar2 gene fallback: could not fetch publications for %s: %s", variant_id, e)
-                continue
+                logger.warning(
+                    "PubMed esearch recency call failed for gene=%s (%s) — using relevance only",
+                    gene, e,
+                )
 
-        all_pmids = list(pmid_set)[: self.max_pmids]
-        if not all_pmids:
-            return None
+        return pmids, total_count, query_translation
 
-        # Steps 3–5: reuse existing methods
-        titles = self._fetch_titles(all_pmids)
+    def _gene_search(self, gene: str, context: ToolContext) -> str:
+        """
+        Primary gene-level search via PubMed esearch.
+
+        Returns a positive evidence block when disease-relevant papers are found,
+        or an explicit "not linked" message when none are — providing a clear
+        negative signal for downstream reasoning and triage stages.
+
+        Output header shows PubMed's own querytranslation (the MeSH-expanded form of
+        the query) and pool counts so downstream stages can audit what was searched.
+        """
+        pmids, total_count, query_translation = self._esearch_gene(gene, self._disease_query)
+
+        # Header line shared by all output branches
+        def _header(extra: str = "") -> str:
+            pool_note = (
+                f"{len(pmids)} retrieved (relevance + recency)"
+                if total_count > self.max_pmids
+                else f"{total_count} total"
+            )
+            base = (
+                f"PubMed gene-disease search for {gene}\n"
+                f"[PubMed query: {query_translation} | {pool_note}{extra}]"
+            )
+            return base
+
+        if not pmids:
+            # Retry with gene alone to distinguish "no literature at all" from
+            # "literature exists but disease term yielded no co-occurrences."
+            pmids_gene_only, total_count_gene_only, _ = self._esearch_gene(gene, None)
+            if not pmids_gene_only:
+                return (
+                    f"{_header()}\n"
+                    f"NO DISEASE LINK — PubMed contains no publications mentioning {gene} "
+                    f"at all. This gene does not appear associated with the patient's phenotype."
+                )
+            # Gene has literature but not matching this disease query — proceed through
+            # normal pipeline using the gene-only pool, with a header that signals the
+            # disease term was dropped so downstream reasoning interprets accordingly.
+            pmids = pmids_gene_only
+            total_count = total_count_gene_only
+            query_translation = f"{gene} (disease term '{self._disease_query}' yielded no hits — gene-only search)"
+
+            def _header(extra: str = "") -> str:  # noqa: F811 — shadow outer _header
+                pool_note = (
+                    f"{len(pmids)} retrieved (relevance + recency)"
+                    if total_count > self.max_pmids
+                    else f"{total_count} total"
+                )
+                return (
+                    f"PubMed gene-only evidence for {gene}\n"
+                    f"[PubMed query: {query_translation} | {pool_note}{extra}]"
+                )
+
+        titles = self._fetch_titles(pmids)
         if not titles:
-            return None
+            return (
+                f"{_header()}\n"
+                f"Gene-disease association could not be assessed (title fetch failed)."
+            )
 
         selected_pmids = self._select_relevant_pmids(titles, self._disease_query, context)
-        logger.info("Gene fallback %s: selected %d/%d papers", gene, len(selected_pmids), len(titles))
+        logger.info("Gene search %s: selected %d/%d papers", gene, len(selected_pmids), len(titles))
 
-        self._last_query   = gene
-        self._last_n_found = len(titles)
-        self._last_kept    = [
-            {"pmid": pmid, "title": titles[pmid]}
-            for pmid in selected_pmids
-            if pmid in titles
-        ]
+        if not selected_pmids:
+            return (
+                f"{_header(f', {len(titles)} screened, 0 relevant')}\n"
+                f"NO DISEASE LINK — No publications relevant to the patient's phenotype were found "
+                f"for {gene}. This gene does not appear associated with the patient's condition."
+            )
 
         papers = self._fetch_abstracts(selected_pmids)
         if not papers:
-            return None
+            return (
+                f"{_header(f', abstract fetch failed after selecting {len(selected_pmids)}')}\n"
+                f"Gene-disease association could not be assessed."
+            )
 
         summary = self._summarise(papers, context.patient_phenotype, gene, context)
 
@@ -386,84 +452,93 @@ class LitVar2SummaryTool(SLMTool):
             for pmid, p in papers.items()
         )
         return (
-            f"LitVar2 gene-level evidence for {gene} (no rsID):\n\n"
+            f"PubMed gene-disease evidence for {gene}\n"
+            f"[PubMed query: {query_translation} | "
+            f"{len(titles)} screened, {len(papers)} selected]\n\n"
             f"{summary}\n\n"
-            f"Sources used:\n{source_lines}"
+            f"Sources:\n{source_lines}"
+        )
+
+    # ── supplemental: rsID-level LitVar2 search ──────────────────────────────
+
+    def _rsid_search(self, rsid: str, context: ToolContext) -> str | None:
+        """
+        Supplemental variant-specific search via LitVar2 rsID endpoint.
+        Returns an evidence block, or None if no relevant variant-level literature found.
+        Output header identifies LitVar2 as source so it is distinguished from the
+        gene-level PubMed block.
+        """
+        pmids = self._fetch_pmids(rsid)
+        if not pmids:
+            return None
+
+        titles = self._fetch_titles(pmids)
+        if not titles:
+            return None
+
+        selected_pmids = self._select_relevant_pmids(titles, self._disease_query, context)
+        logger.info("rsID %s: selected %d/%d papers", rsid, len(selected_pmids), len(titles))
+
+        if not selected_pmids:
+            return None
+
+        papers = self._fetch_abstracts(selected_pmids)
+        if not papers:
+            return None
+
+        summary = self._summarise(papers, context.patient_phenotype, rsid, context)
+
+        source_lines = "\n".join(
+            f"  - [PMID:{pmid}] {p['title']}  {p['url']}"
+            for pmid, p in papers.items()
+        )
+        return (
+            f"LitVar2 variant-specific evidence for {rsid}\n"
+            f"[Source: LitVar2 variant publications endpoint — "
+            f"{len(titles)} records screened, {len(papers)} selected]\n\n"
+            f"{summary}\n\n"
+            f"Sources:\n{source_lines}"
         )
 
     # ── public entry point ────────────────────────────────────────────────────
 
     def run(self, variant: dict, context: ToolContext) -> str | None:
         """
-        Fetch LitVar2 evidence for the variant.
+        Fetch literature evidence using a gene-first strategy.
 
-        - Resolves the disease query once (reused across all variants).
-        - rsID present and valid  → rsID path, SLM filter uses resolved disease query
-        - rsID absent, Gene present → gene-level fallback
-        - Both absent              → None
+        1. Gene-level (primary): PubMed esearch "{gene}[Gene] AND {disease_query}".
+           Always runs when Gene is present. Returns a positive summary or an explicit
+           "not linked" message — never silent on absence.
+        2. Variant-level (supplemental): LitVar2 rsID endpoint.
+           Runs when RS_ID is valid. Omitted from output when no relevant papers found.
+
+        Both blocks are combined when both searches yield evidence, separated by a
+        divider. Each block header embeds source and query for downstream traceability.
         """
-        self._last_query   = None
-        self._last_n_found = 0
-        self._last_kept    = None
-
         rsid = context.field("RS_ID")
         gene = context.field("Gene")
 
-        # Resolve disease query once; reused for all subsequent variants
         if self._disease_query is None:
             self._disease_query = self._resolve_disease_query(context)
 
         rsid_ok = rsid != "NA" and re.match(r"^rs\d+$", rsid, re.IGNORECASE) is not None
+        gene_ok = gene != "NA" and gene.strip() != ""
 
+        parts = []
+
+        # 1. Gene-level search (primary — always first)
+        if gene_ok:
+            logger.info("LitVar2SummaryTool: gene-level PubMed search for gene=%s", gene)
+            parts.append(self._gene_search(gene, context))
+
+        # 2. rsID search (supplemental variant-specific evidence)
         if rsid_ok:
-            logger.info("LitVar2SummaryTool: rsid=%s", rsid)
+            logger.info("LitVar2SummaryTool: rsid-level LitVar2 search for rsid=%s", rsid)
+            rsid_result = self._rsid_search(rsid, context)
+            if rsid_result:
+                parts.append(rsid_result)
 
-            # ── step 1: PMIDs ─────────────────────────────────────────────────
-            pmids = self._fetch_pmids(rsid)
-            if not pmids:
-                return None
-
-            # ── step 2: titles ────────────────────────────────────────────────
-            titles = self._fetch_titles(pmids)
-            if not titles:
-                return None
-
-            # ── step 3: SLM filter (disease query, not raw phenotype) ─────────
-            selected_pmids = self._select_relevant_pmids(titles, self._disease_query, context)
-            logger.info("Selected %d/%d papers for abstract fetch", len(selected_pmids), len(titles))
-
-            self._last_query   = rsid
-            self._last_n_found = len(titles)
-            self._last_kept    = [
-                {"pmid": pmid, "title": titles[pmid]}
-                for pmid in selected_pmids
-                if pmid in titles
-            ]
-
-            # ── step 4: abstracts ─────────────────────────────────────────────
-            papers = self._fetch_abstracts(selected_pmids)
-            if not papers:
-                return None
-
-            # ── step 5: summary (full phenotype for richer output) ────────────
-            summary = self._summarise(papers, context.patient_phenotype, rsid, context)
-
-            source_lines = "\n".join(
-                f"  - [PMID:{pmid}] {p['title']}  {p['url']}"
-                for pmid, p in papers.items()
-            )
-            return (
-                f"LitVar2 evidence summary for {rsid}:\n\n"
-                f"{summary}\n\n"
-                f"Sources used:\n{source_lines}"
-            )
-
-        elif gene != "NA" and gene.strip() != "":
-            logger.info("LitVar2SummaryTool: gene fallback for gene=%s", gene)
-            return self._gene_fallback(gene, context)
-
-        else:
-            return None
+        return "\n\n---\n\n".join(parts) if parts else None
 
 
 if __name__ == "__main__":

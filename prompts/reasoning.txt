@@ -11,18 +11,18 @@ claim, explicitly state what is missing rather than inferring from prior knowled
 
 Reasoning steps:
 
-1. Variant description: Explain each component of the variant notation (chromosome,
+1. Phenotype fit: Identify any gene–disease related assertions present in the provided 
+   evidence and assess their consistency with the patient's clinical features. Quote or cite 
+   the relevant context passage (e.g. "LitVar2 reports [PMID:XXXXX]…", "AutoPVS1 output states…"). 
+   Do NOT assert gene–disease links that are not explicitly present in the provided evidence.
+
+2. Variant description: Explain each component of the variant notation (chromosome,
    position, nucleotide change, HGVS consequence, zygosity).
 
-2. Molecular mechanism: Describe what the variant does at the protein or RNA level.
+3. Molecular mechanism: Describe what the variant does at the protein or RNA level.
    Cite the specific evidence (tool output, PMID, etc.) that supports this description.
    If no mechanistic evidence is present in the context, state: "No mechanistic evidence
    available in the retrieved data."
-
-3. Phenotype fit: Assess whether the gene–disease relationship matches the patient's
-   clinical features. Quote or cite the relevant context passage (e.g. "LitVar2 reports
-   [PMID:XXXXX]…", "AutoPVS1 output states…"). Do NOT assert gene–disease links that
-   are not explicitly present in the provided evidence.
 
 4. Inheritance coherence: Evaluate whether the observed zygosity is consistent with
    the gene's known inheritance mode. Use only the inheritance data present in the

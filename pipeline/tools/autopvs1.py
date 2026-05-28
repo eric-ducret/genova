@@ -1,15 +1,25 @@
 """
-pipeline/tools/autopvs1.py — VCF coords → AutoPVS1 lookup (hg19).
+pipeline/tools/autopvs1.py — AutoPVS1 lookup with HGVS-first query strategy.
 
-Coords are extracted directly from the canonical variant dict fields
-(Chromosome, Position, Ref_seq, Var_seq, Variant) — no Ensembl roundtrip needed.
+Query strategy (in order):
+  1. HGVS search path  — GET /search?q={hgvs}&genome_version={build}
+                         AutoPVS1 resolves the transcript to its canonical
+                         coordinates and redirects; immune to stale genomic
+                         coords in the source CSV.
+  2. VCF coords path   — GET /variant/{build}/{chrom}-{pos}-{ref}-{alt}
+                         Fallback when no valid HGVS is available.
+
+Both paths reuse the same HTML parser. Results where AutoPVS1 returns
+"Intergenic" or a mismatched gene are discarded before returning.
 
 Public functions (module-level, used internally by AutoPVS1Tool):
-  vcf_to_autopvs1_id(chrom, pos, ref, alt)  → "6-100896130-T-C"
-  parse_variant_coords(variant_str, ...)     → (chrom, pos, ref, alt) | None
-  fetch_variant_data(variant_id)             → dict | None
-  fetch_and_format_autopvs1(chrom, pos, ref, alt, hgvs="")
-                                             → formatted string block | None
+  vcf_to_autopvs1_id(chrom, pos, ref, alt)         -> "6-100896130-T-C"
+  parse_variant_coords(variant_str, ...)            -> (chrom, pos, ref, alt) | None
+  fetch_variant_data(variant_id, hg)                -> dict | None
+  fetch_variant_data_search(hgvs_str, hg)           -> (dict, resolved_id) | (None, None)
+  fetch_and_format_autopvs1(chrom, pos, ref, alt,
+                             hgvs="", hg="hg19",
+                             expected_gene="")       -> formatted string block | None
 
 Pipeline class:
   AutoPVS1Tool — NetworkTool; gate uses the hybrid rule+LLM _pvs1_decision logic
@@ -20,6 +30,7 @@ import re
 import logging
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urlencode
 
 logger = logging.getLogger(__name__)
 
@@ -130,20 +141,61 @@ def _norm_build(build: str) -> str:
     return "hg38"
 
 
+_AUTOPVS1_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (compatible; PythonScript/1.0)",
+}
+
+
+def _is_valid_hgvs(s: str) -> bool:
+    """True if s looks like a transcript HGVS cDNA string (NM_xxx:c.xxx or NR_xxx:c.xxx)."""
+    return bool(s) and bool(re.match(r"^(NM_|NR_|ENST)\d+", s, re.IGNORECASE)) and ":c." in s
+
+
+def _is_intergenic_result(d: dict) -> bool:
+    """True when AutoPVS1 returned an intergenic hit or no gene — unusable result."""
+    return (d.get("variant_type") or "").lower() == "intergenic" or d.get("gene") is None
+
+
 def fetch_variant_data(variant_id: str, hg: str = "hg19") -> dict | None:
+    """Query AutoPVS1 by VCF-style ID (e.g. '1-47882707-C-A'). Returns parsed dict or None."""
     url = f"https://autopvs1.bgi.com/variant/{_norm_build(hg)}/{variant_id}"
-    headers = {
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-        "User-Agent": "Mozilla/5.0 (compatible; PythonScript/1.0)",
-    }
-    print(f"[AutoPVS1] Fetching: {url}")
+    print(f"[AutoPVS1] VCF fetch: {url}")
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(url, headers=_AUTOPVS1_HEADERS, timeout=15)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        print(f"[AutoPVS1] Request failed: {e}")
+        print(f"[AutoPVS1] VCF request failed: {e}")
         return None
     return _parse_autopvs1_html(response.text)
+
+
+def fetch_variant_data_search(
+    hgvs_str: str,
+    hg: str = "hg19",
+) -> tuple[dict, str] | tuple[None, None]:
+    """
+    Query AutoPVS1 via the /search endpoint using a transcript HGVS string.
+
+    AutoPVS1 resolves the HGVS to its canonical VCF coordinates internally
+    and redirects to /variant/{build}/{resolved_id}. This path is robust to
+    stale or wrong genomic coordinates in the source CSV.
+
+    Returns (parsed_dict, resolved_variant_id) on success, (None, None) on failure.
+    The resolved_variant_id comes from the final redirect URL (e.g. '1-47882707-C-A').
+    """
+    params = {"q": hgvs_str, "genome_version": _norm_build(hg)}
+    url = "https://autopvs1.bgi.com/search?" + urlencode(params)
+    print(f"[AutoPVS1] HGVS search: {url}")
+    try:
+        response = requests.get(url, headers=_AUTOPVS1_HEADERS, timeout=15)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"[AutoPVS1] HGVS search failed: {e}")
+        return None, None
+    # Extract the resolved variant_id from the final redirect URL
+    resolved_id = response.url.rstrip("/").split("/")[-1]
+    return _parse_autopvs1_html(response.text), resolved_id
 
 
 def _parse_autopvs1_html(html: str) -> dict:
@@ -230,14 +282,19 @@ def _parse_autopvs1_html(html: str) -> dict:
         data["disease_mechanism"] = None
 
     full_text = soup.get_text()
-    data["pvs1_applicable"] = not bool(
-        re.search(r"incompatible with recommendations", full_text, re.I)
+    # pvs1_applicable: True only when a flowchart is present AND no "incompatible" message.
+    # Defaulting to True for empty pages (old behaviour) was incorrect — an empty page
+    # means AutoPVS1 found nothing, not that PVS1 applies.
+    # Note: `flowchart` is already bound above from soup.find("figure").
+    data["pvs1_applicable"] = (
+        flowchart is not None
+        and not bool(re.search(r"incompatible with recommendations", full_text, re.I))
     )
     return data
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# High-level function  (new signature — no HGVS required, no Ensembl)
+# High-level function  (HGVS-first strategy + guards)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fetch_and_format_autopvs1(
@@ -245,33 +302,86 @@ def fetch_and_format_autopvs1(
     pos:   str,
     ref:   str,
     alt:   str,
-    hgvs:  str = "",   # optional — used only as a label in the output block
+    hgvs:  str = "",
     hg:    str = "hg19",
+    expected_gene: str = "",
 ) -> str | None:
     """
-    Full pipeline: VCF coords → AutoPVS1 ID → fetch → formatted evidence block.
+    Full pipeline: fetch AutoPVS1 evidence and format it as a string block.
+
+    Query strategy:
+      1. HGVS search path (/search?q=) — preferred; resolves the transcript to
+         AutoPVS1's canonical coordinates, immune to stale CSV coords.
+         Only used when hgvs contains a valid transcript HGVS (NM_xxx:c.xxx).
+      2. VCF coords path (/variant/...) — fallback when HGVS is absent or the
+         search path fails.
+
+    Results are discarded (returns None) if:
+      - AutoPVS1 returns variant_type="Intergenic" (coordinates not in any gene)
+      - The returned gene does not match expected_gene (when provided)
 
     Args:
-        chrom : chromosome, e.g. "chr18" or "18"
-        pos   : 1-based position string, e.g. "44580785"
-        ref   : reference allele, e.g. "A"  (use "-" for pure insertions)
-        alt   : alternate allele, e.g. "T"  (use "-" for pure deletions)
-        hgvs  : optional label shown in the output header
+        chrom         : chromosome, e.g. "chr18" or "18"
+        pos           : 1-based position string, e.g. "44580785"
+        ref           : reference allele, e.g. "A"  (use "-" for pure insertions)
+        alt           : alternate allele, e.g. "T"  (use "-" for pure deletions)
+        hgvs          : HGVS notation from the variant dict, e.g.
+                        "NM_012186:c.720C>A p.C240X" (space-split: first token used)
+        hg            : genome build ("hg19" or "hg38")
+        expected_gene : variant's Gene field; used for cross-validation
 
     Returns a multi-line string ready to embed in the augmented context,
-    or None if the fetch failed.
+    or None if the fetch failed or returned unusable data.
     """
-    variant_id = vcf_to_autopvs1_id(chrom, pos, ref, alt)
-    print(f"[AutoPVS1] ID: {variant_id}")
+    hgvs_clean = hgvs.split()[0] if hgvs else ""   # "NM_012186:c.720C>A"
+    d: dict | None = None
+    variant_id: str = vcf_to_autopvs1_id(chrom, pos, ref, alt)  # fallback label
 
-    d = fetch_variant_data(variant_id, hg=hg)
+    # ── Strategy 1: HGVS search (preferred) ──────────────────────────────────
+    if _is_valid_hgvs(hgvs_clean):
+        d, resolved_id = fetch_variant_data_search(hgvs_clean, hg=hg)
+        if d is not None:
+            if _is_intergenic_result(d):
+                logger.warning(
+                    "[AutoPVS1] HGVS search returned intergenic for %s — discarding",
+                    hgvs_clean,
+                )
+                d = None
+            else:
+                variant_id = resolved_id  # use the coordinate AutoPVS1 resolved to
+
+    # ── Strategy 2: VCF coords (fallback) ────────────────────────────────────
+    if d is None:
+        vcf_id = vcf_to_autopvs1_id(chrom, pos, ref, alt)
+        print(f"[AutoPVS1] Falling back to VCF coords: {vcf_id}")
+        d = fetch_variant_data(vcf_id, hg=hg)
+        if d is not None:
+            if _is_intergenic_result(d):
+                logger.warning(
+                    "[AutoPVS1] VCF coords also returned intergenic (%s) — discarding. "
+                    "Possible coordinate error or AutoPVS1 annotation gap for this gene.",
+                    vcf_id,
+                )
+                return None
+
     if d is None:
         return None
 
+    # ── Gene cross-validation ─────────────────────────────────────────────────
+    if expected_gene:
+        returned_gene = (d.get("gene") or "").upper()
+        if returned_gene and returned_gene != expected_gene.upper():
+            logger.warning(
+                "[AutoPVS1] Gene mismatch: expected %s, got %s (%s) — discarding",
+                expected_gene, d.get("gene"), variant_id,
+            )
+            return None
+
+    # ── Format output ─────────────────────────────────────────────────────────
     def _val(v) -> str:
         return str(v) if v not in (None, "", [], {}) else "—"
 
-    steps_str   = " → ".join(d.get("pvs1_decision_steps") or []) or "—"
+    steps_str   = " -> ".join(d.get("pvs1_decision_steps") or []) or "—"
     disease_str = "—"
     if d.get("disease_mechanism"):
         disease_str = "; ".join(
@@ -279,7 +389,7 @@ def fetch_and_format_autopvs1(
             for row in d["disease_mechanism"]
         )
 
-    label = hgvs.split()[0] if hgvs else variant_id
+    label = hgvs_clean if hgvs_clean else variant_id
     lines = [
         f"AUTOPVS1 EVIDENCE ({label}):",
         f"  Variant        : {variant_id}  ({_val(d.get('variant_type'))})",
@@ -421,6 +531,7 @@ class AutoPVS1Tool(NetworkTool):
                 chrom, pos, ref, alt,
                 hgvs=variant.get("HGVS", ""),
                 hg=context.genome_build,
+                expected_gene=variant.get("Gene", ""),
             )
         except requests.exceptions.RequestException as e:
             raise ToolFetchError(

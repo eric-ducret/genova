@@ -9,22 +9,36 @@ The following reasoning has been produced for a genetic variant found in a patie
 
 TASK — INCLUSION DECISION:
 
-Decide whether this variant should proceed to the final clinical conclusion step,
-or whether it can be set aside because it does not plausibly explain the patient's
-phenotype.
+Decide whether this variant should proceed to the final clinical conclusion,
+or be set aside because it does not plausibly explain the patient's phenotype.
 
-Include the variant if:
-- There is a plausible molecular mechanism supported by the retrieved evidence.
-- The gene–disease association is relevant to the patient's clinical presentation.
+When the case is balanced or uncertain, INCLUDE. Exclude only when the reasoning
+points to a clear, affirmative reason the variant cannot explain the phenotype.
+
+Absence or sparseness of evidence is not sufficient for exclusion. Gene-level and
+variant-level evidence should be considered separately. Limited or missing 
+variant-level evidence does not justify exclusion when gene-level evidence is relevant.
+
+INCLUDE if ANY of these hold:
+- The gene is relevant to the patient's clinical presentation (gene-level evidence).
+- A plausible molecular mechanism is supported by the evidence.
 - The inheritance pattern is compatible with the observed zygosity.
+- The reasoning's uncertainties are about MISSING data rather than contrary evidence.
 
-Exclude the variant if:
-- The phenotype fit is poor or absent.
-- No credible mechanism is supported by the evidence.
-- There is strong evidence against causality (benign classification, very high
-  population frequency, clearly unrelated gene function).
-- Evidence is so sparse that the variant cannot be evaluated at all.
+EXCLUDE only if the reasoning identifies a clear affirmative contrary signal:
+- Benign / Likely benign classification with no conflicting interpretation, OR
+- Very high population frequency consistent with a common polymorphism, OR
+- The gene's function is clearly unrelated to the patient's phenotype.
 
-Output exactly one of the following words and nothing else:
-INCLUDE
-EXCLUDE
+Distinguish carefully: "no evidence found" is a reason to INCLUDE (uncertainty),
+while "evidence shows it is benign / common / unrelated" is a reason to EXCLUDE.
+
+Output exactly three lines and nothing else:
+Include-case: <strongest reason to include, ≤15 words>
+Exclude-case: <strongest reason to exclude, ≤15 words>
+Decision: INCLUDE or EXCLUDE
+
+Example output:
+Include-case: gene relevant to phenotype, mechanism plausible
+Exclude-case: variant-level data limited
+Decision: INCLUDE

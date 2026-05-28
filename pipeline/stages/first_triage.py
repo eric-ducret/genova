@@ -6,12 +6,14 @@ Decides whether a variant can be discarded with high confidence before
 the more expensive reasoning stage runs.
 
 Expected SLM output format (from prompts/first_triage.txt):
-    Thought: <decisive evidence phrase, ≤8 words>
+    Keep-case: <strongest reason to keep, ≤10 words>
+    Discard-case: <strongest reason to discard, ≤10 words>
     Decision: KEEP or DISCARD
 
 Public API:
     run_one(variant_context, patient_phenotype, llm) -> tuple[str, str]
-        Returns ("KEEP", thought) or ("DISCARD", thought).
+        Returns ("KEEP", justification) or ("DISCARD", justification).
+        justification is "Keep: <...> | Discard: <...>" for auditability.
 """
 
 from __future__ import annotations
@@ -36,33 +38,48 @@ def _load_prompt() -> str:
     raise FileNotFoundError(f"First-triage prompt not found at {_PROMPT_PATH}.")
 
 
-_THOUGHT_RE  = re.compile(r"Thought:\s*(.+)", re.IGNORECASE)
-_DECISION_RE = re.compile(r"Decision:\s*(KEEP|DISCARD)", re.IGNORECASE)
+_KEEP_CASE_RE    = re.compile(r"Keep-case:\s*(.+)",    re.IGNORECASE)
+_DISCARD_CASE_RE = re.compile(r"Discard-case:\s*(.+)", re.IGNORECASE)
+_DECISION_RE     = re.compile(r"Decision:\s*(KEEP|DISCARD)", re.IGNORECASE)
 
 
 def parse_triage(raw: str) -> tuple[str, str]:
     """
     Parse the raw SLM reply for a first-triage call.
 
-    Expected format:
-        Thought: <decisive evidence phrase, ≤8 words>
+    Expected format (blank lines tolerated between lines):
+        Keep-case: <strongest reason to keep, ≤10 words>
+        Discard-case: <strongest reason to discard, ≤10 words>
         Decision: KEEP or DISCARD
 
     Returns:
-        ("KEEP",    thought)  if Decision is KEEP.
-        ("DISCARD", thought)  if Decision is DISCARD.
+        ("KEEP",    justification)  if Decision is KEEP.
+        ("DISCARD", justification)  if Decision is DISCARD.
         ("KEEP",    "parse error — defaulting to KEEP") on any parse failure.
 
-    The thought is used as the justification in the report appendix.
+    justification = "Keep: <keep_case> | Discard: <discard_case>" for auditability.
+    Only the Decision: value affects the keep/discard outcome.
     """
-    thought_m  = _THOUGHT_RE.search(raw)
-    decision_m = _DECISION_RE.search(raw)
+    # Strip and drop blank lines so accidental empty lines don't confuse the regex search.
+    cleaned = "\n".join(line for line in raw.splitlines() if line.strip())
 
-    thought = thought_m.group(1).strip() if thought_m else ""
+    keep_m    = _KEEP_CASE_RE.search(cleaned)
+    discard_m = _DISCARD_CASE_RE.search(cleaned)
+    decision_m = _DECISION_RE.search(cleaned)
+
+    keep_str    = keep_m.group(1).strip()    if keep_m    else ""
+    discard_str = discard_m.group(1).strip() if discard_m else ""
+
+    logger.debug(
+        "[FirstTriage] Keep-case: %r | Discard-case: %r | raw Decision line: %r",
+        keep_str, discard_str,
+        decision_m.group(0) if decision_m else "(not found)",
+    )
 
     if decision_m:
         decision = decision_m.group(1).upper()
-        return (decision, thought)
+        justification = f"Keep: {keep_str} | Discard: {discard_str}" if (keep_str or discard_str) else decision
+        return (decision, justification)
 
     logger.warning("[FirstTriage] Could not parse response: %r — defaulting to KEEP", raw[:200])
     return ("KEEP", "parse error — defaulting to KEEP")
@@ -82,9 +99,10 @@ def run_one(
         llm:               Shared LLMClient instance.
 
     Returns:
-        ("KEEP", thought) or ("DISCARD", thought) where thought is the ≤8-word
-        rationale from the Thought: line. On SLM or parse failure always returns
-        ("KEEP", ...) — never silently drops a variant.
+        ("KEEP", justification) or ("DISCARD", justification) where justification
+        is "Keep: <keep_case> | Discard: <discard_case>" from the SLM output.
+        On SLM or parse failure always returns ("KEEP", ...) — never silently
+        drops a variant.
     """
     user_prompt = (
         _load_prompt()
@@ -96,7 +114,7 @@ def run_one(
         raw = llm.generate(
             system=_SYSTEM_PROMPT,
             user=user_prompt,
-            max_tokens=60,
+            max_tokens=150,
         )
     except Exception as exc:
         logger.warning("[FirstTriage] SLM call failed: %s — defaulting to KEEP", exc)
