@@ -28,7 +28,7 @@ import xml.etree.ElementTree as ET
 
 from pipeline.tools.base import SLMTool
 from pipeline.core.context import ToolContext
-from pipeline.core.errors import ToolFetchError, ToolParseError
+from pipeline.core.errors import PipelineError, ToolFetchError, ToolParseError
 
 logger = logging.getLogger(__name__)
 
@@ -103,23 +103,67 @@ class LitVar2SummaryTool(SLMTool):
 
     def _resolve_disease_query(self, context: ToolContext) -> str:
         """
-        Ask the SLM once to produce a PubMed-compatible disease search term from the
-        patient phenotype. Prefers official MeSH disease/syndrome names so PubMed's
-        automatic term mapping maps correctly to indexed MeSH headings. Cached and
-        reused across all variants in the run.
+        Ask the SLM once to produce 2–4 PubMed-compatible disease terms from the
+        patient phenotype, returned as a PubMed OR expression. Multiple synonymous
+        or related terms improve recall for genes associated with phenotypically
+        overlapping conditions (e.g. a gene causing microphthalmia would be missed
+        by a query narrowed to a single syndromic term). Cached and reused across
+        all variants in the run.
         """
         system = (
-            "Given a patient phenotype, return one broad disease term for a PubMed search. "
-            "Prefer the general disease category over a specific syndrome subtype "
-            "(e.g. 'epilepsy' not 'benign familial neonatal seizures type 1'; "
-            "'cardiomyopathy' not 'CMH4'). "
-            "Lowercase, no punctuation, no explanation."
+            "Given a patient phenotype, return 2 to 4 PubMed disease search terms as a "
+            "comma-separated list. Include the main disease and its closest synonyms or "
+            "phenotypically overlapping categories that share causal genes "
+            "(e.g. for Marfan syndrome: "
+            "'marfan syndrome, connective tissue disorder, aortic aneurysm, ectopia lentis'). "
+            "Prefer terms indexed in MeSH. Lowercase, no punctuation except commas, no explanation, "
+            "no numbering."
         )
-        return " ".join(
-            context.llm.generate(
-                system=system, user=context.patient_phenotype, max_tokens=20
-            ).strip().lower().split()[:4]
-        )
+        raw = context.llm.generate(
+            system=system, user=context.patient_phenotype, max_tokens=60
+        ).strip().lower()
+
+        return self._parse_disease_terms(raw)
+
+    @staticmethod
+    def _parse_disease_terms(raw: str) -> str:
+        """
+        Parse SLM output into a PubMed OR expression.
+
+        Handles: comma-separated, semicolon-separated, numbered lists ("1. term"),
+        bullet points, extra whitespace. Falls back to the first four words of raw
+        if nothing useful can be extracted.
+
+        Each term is capped at 5 words. Total terms capped at 4.
+        Returns a string like "term1 OR term2 OR term3".
+        """
+        # Strip common noise: "1." / "- " / bullet chars
+        cleaned = re.sub(r"^\s*\d+\.\s*", "", raw, flags=re.MULTILINE)
+        cleaned = re.sub(r"[-•*]\s*", " ", cleaned)
+
+        # Split on comma, semicolon, or newline (model may use any separator)
+        if "," in cleaned or ";" in cleaned:
+            parts = re.split(r"[,;]", cleaned)
+        elif "\n" in cleaned.strip():
+            parts = cleaned.strip().splitlines()
+        else:
+            parts = [cleaned]
+
+        terms = []
+        for part in parts:
+            term = part.strip().strip("\"'")
+            term = " ".join(term.split()[:5])   # max 5 words per term
+            if term:
+                terms.append(term)
+
+        terms = [t for t in terms[:4] if t]     # max 4 terms, drop empties
+
+        if not terms:
+            terms = [" ".join(raw.split()[:4])]
+
+        result = " OR ".join(terms)
+        logger.debug("Disease query resolved: %r → %r", raw, result)
+        return result
 
     # ── step 1: LitVar2 → PMIDs (rsID path) ──────────────────────────────────
 
@@ -285,7 +329,7 @@ class LitVar2SummaryTool(SLMTool):
             f"Abstracts:\n{corpus}"
         )
 
-        return context.llm.generate(system=system, user=user, max_tokens=512).strip()
+        return context.llm.generate(system=system, user=user, max_tokens=800).strip()
 
     # ── primary: gene-level PubMed search ────────────────────────────────────
 
@@ -311,7 +355,7 @@ class LitVar2SummaryTool(SLMTool):
             query_translation — PubMed's MeSH expansion of the submitted term
         """
         gene_clause = f"({gene}[tiab] OR {gene}[Gene])"
-        term = f"{gene_clause} AND {disease_query}" if disease_query else gene_clause
+        term = f"{gene_clause} AND ({disease_query})" if disease_query else gene_clause
 
         # ── primary call: relevance sort ──────────────────────────────────────
         try:
@@ -534,9 +578,15 @@ class LitVar2SummaryTool(SLMTool):
         # 2. rsID search (supplemental variant-specific evidence)
         if rsid_ok:
             logger.info("LitVar2SummaryTool: rsid-level LitVar2 search for rsid=%s", rsid)
-            rsid_result = self._rsid_search(rsid, context)
-            if rsid_result:
-                parts.append(rsid_result)
+            try:
+                rsid_result = self._rsid_search(rsid, context)
+                if rsid_result:
+                    parts.append(rsid_result)
+            except PipelineError as e:
+                logger.warning(
+                    "LitVar2 rsID search failed for %s (%s) — gene-level results preserved",
+                    rsid, e,
+                )
 
         return "\n\n---\n\n".join(parts) if parts else None
 

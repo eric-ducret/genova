@@ -168,6 +168,9 @@ def _apply_compression(
 
 def _gate_reason(tool: "Tool", variant: dict) -> str:
     """Best-effort human-readable reason for gate skip."""
+    tool_reason = getattr(tool, "_last_gate_reason", None)
+    if tool_reason:
+        return tool_reason
     type_val = variant.get("Type", "NA")
     hgvs_val = variant.get("HGVS", "NA")
     return f"type={type_val!r} hgvs={hgvs_val!r}"

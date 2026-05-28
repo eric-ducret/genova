@@ -177,12 +177,19 @@ def checkpoint_messages(user_input: str, scratchpad: list[str],
     )
     return [
         {"role": "system", "content": (
-            "You are a completion checker for a clinical genomics pipeline. "
-            "Assess whether the combined evidence — pre-fetched database results AND "
-            "any search observations — is sufficiently strong to assess the "
-            "variant–phenotype relationship without further web searches. "
-            "Consider: variant-level data, functional evidence, population frequency, "
-            "inheritance coherence, and clinical classifications. "
+            "You are a search decision checker for a clinical genomics pipeline. "
+            "Given the available evidence, decide whether a web search would fill "
+            "a specific, identifiable gap that matters clinically.\n\n"
+            "Say NO (search needed) if a concrete gap exists: "
+            "gene-disease link is unknown or unconfirmed, "
+            "variant functional impact is unclear, "
+            "inheritance mechanism is unresolved, or "
+            "a key piece of evidence is explicitly missing or failed.\n\n"
+            "Say YES (sufficient — skip search) only if the evidence already answers: "
+            "whether this gene is relevant to the phenotype, "
+            "and whether this variant is likely pathogenic or benign — "
+            "with no critical unanswered question remaining.\n\n"
+            "When uncertain, say NO. "
             "Reply ONLY 'yes' or 'no'."
         )},
         {"role": "user", "content": (
@@ -437,38 +444,26 @@ class WebSearchAgentTool(ReActTool):
 
     def gate(self, variant: dict, context: "ToolContext") -> bool:
         """
-        Skip websearch entirely if prior tool evidence is already sufficient
-        to discard this variant with high confidence.
-
-        Triage runs against the accumulated outputs from LitVar2, SpliceAI, and
-        AutoPVS1. It defaults to KEEP on any uncertainty or parse failure, so
-        false discards are rare. The post-retrieval pipeline triage still runs
-        afterwards for variants that do pass this gate.
+        Skip websearch only on hard disqualifying signals from the variant dict.
+        Everything else passes through — the ReActAgent's pre-loop checkpoint
+        handles the 'is prefetched evidence already sufficient?' question, which
+        is the right place for that decision (it sees all prior tool outputs and
+        has a purpose-built prompt). No SLM call here.
         """
-        from pipeline.stages import first_triage as triage_stage
-
-        prefetched_parts = [
-            f"{name.upper().replace('_', ' ')} EVIDENCE:\n{output}"
-            for name, output in context.all_outputs.items()
-            if output
-        ]
-        if not prefetched_parts:
-            return True
-
-        evidence = "\n\n".join(prefetched_parts)
-        decision, justification = triage_stage.run_one(
-            variant_context=evidence,
-            patient_phenotype=context.patient_phenotype,
-            llm=context.llm,
-        )
-
-        if decision == "DISCARD":
-            import logging
-            logging.getLogger(__name__).info(
-                "[WebSearchAgentTool] Pre-websearch triage DISCARD — skipping websearch. "
-                "Reason: %s", justification
-            )
+        # Hard skip: ClinVar benign / likely benign
+        clinvar = (variant.get("ClinVar_class") or "NA").strip()
+        if clinvar.lower() in {"benign", "likely benign"}:
+            self._last_gate_reason = f"ClinVar {clinvar} — web search not needed"
             return False
+
+        # Hard skip: common variant (AF > 1%)
+        try:
+            freq = float(variant.get("Frequency") or 0)
+            if freq > 0.01:
+                self._last_gate_reason = f"common variant (AF={freq:.4f}) — web search not needed"
+                return False
+        except (ValueError, TypeError):
+            pass
 
         return True
 

@@ -35,7 +35,7 @@ _REASONING_PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "reas
 _SCORING_PROMPT_PATH   = Path(__file__).parent.parent.parent / "prompts" / "second_triage.txt"
 
 # Call 1: step-by-step narrative — no score, citation-only rules apply
-MAX_NEW_TOKENS_REASONING = 1200
+MAX_NEW_TOKENS_REASONING = 2000
 # Call 2: three-line Include-case / Exclude-case / Decision block
 MAX_NEW_TOKENS_SCORING   = 150
 

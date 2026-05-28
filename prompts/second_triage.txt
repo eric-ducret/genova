@@ -9,36 +9,57 @@ The following reasoning has been produced for a genetic variant found in a patie
 
 TASK — INCLUSION DECISION:
 
-Decide whether this variant should proceed to the final clinical conclusion,
-or be set aside because it does not plausibly explain the patient's phenotype.
+Decide whether this variant should proceed to the final clinical conclusion.
+INCLUDE only variants with real clinical significance: a clear gene-phenotype link
+AND probable pathogenicity. Both criteria must be supported by evidence.
+Variants included here appear in the final clinical report — be selective.
 
-When the case is balanced or uncertain, INCLUDE. Exclude only when the reasoning
-points to a clear, affirmative reason the variant cannot explain the phenotype.
+INCLUDE requires evidence for BOTH:
 
-Absence or sparseness of evidence is not sufficient for exclusion. Gene-level and
-variant-level evidence should be considered separately. Limited or missing 
-variant-level evidence does not justify exclusion when gene-level evidence is relevant.
+1. GENE-PHENOTYPE LINK — the gene is known or strongly suspected to cause the
+   patient's phenotype:
+   - Gene reported in literature or OMIM for this phenotype or a phenotypically
+     overlapping condition, OR
+   - ClinVar entries for this gene list the patient's disease as associated condition.
 
-INCLUDE if ANY of these hold:
-- The gene is relevant to the patient's clinical presentation (gene-level evidence).
-- A plausible molecular mechanism is supported by the evidence.
-- The inheritance pattern is compatible with the observed zygosity.
-- The reasoning's uncertainties are about MISSING data rather than contrary evidence.
+2. PROBABLE PATHOGENICITY — the variant itself is likely damaging:
+   - ClinVar Pathogenic or Likely pathogenic, OR
+   - Strong ACMG criterion applies (PVS1, PS1, PS3, or equivalent), OR
+   - Variant is rare (AF < 0.1%) with predicted functional impact (LoF, splice
+     disruption, high CADD score), OR
+   - Variant or position reported as disease-causing in literature.
 
-EXCLUDE only if the reasoning identifies a clear affirmative contrary signal:
-- Benign / Likely benign classification with no conflicting interpretation, OR
-- Very high population frequency consistent with a common polymorphism, OR
-- The gene's function is clearly unrelated to the patient's phenotype.
+EXCEPTION — Compound heterozygous candidates:
+   If two or more variants are present in the same gene in this patient, INCLUDE
+   if criterion 1 is met, even when individual variant pathogenicity evidence is limited.
 
-Distinguish carefully: "no evidence found" is a reason to INCLUDE (uncertainty),
-while "evidence shows it is benign / common / unrelated" is a reason to EXCLUDE.
+EXCLUDE if:
+   - Gene-phenotype link is absent or only speculative (no literature, no OMIM
+     association, no ClinVar disease entries for this phenotype), OR
+   - Pathogenicity evidence is absent (VUS or unclassified with no supporting data
+     and no strong predictive signals), OR
+   - ClinVar Benign / Likely benign with no conflicting evidence, OR
+   - Population frequency > 1%, consistent with a common polymorphism.
+
+Important: "no evidence found" means the variant lacks support — it is a reason to
+EXCLUDE, not to keep. Only include when positive evidence is present for both criteria.
 
 Output exactly three lines and nothing else:
 Include-case: <strongest reason to include, ≤15 words>
 Exclude-case: <strongest reason to exclude, ≤15 words>
 Decision: INCLUDE or EXCLUDE
 
-Example output:
-Include-case: gene relevant to phenotype, mechanism plausible
-Exclude-case: variant-level data limited
+Example output (strong case):
+Include-case: OMIM gene for phenotype; PVS1 VeryStrong nonsense variant
+Exclude-case: no variant-level functional data beyond prediction
 Decision: INCLUDE
+
+Example output (excluded — missing gene link):
+Include-case: variant rare and predicted damaging by CADD
+Exclude-case: no gene-disease link for this phenotype; gene unrelated
+Decision: EXCLUDE
+
+Example output (excluded — missing pathogenicity):
+Include-case: gene reported in overlapping phenotype
+Exclude-case: VUS, no functional data, no strong ACMG criterion
+Decision: EXCLUDE
