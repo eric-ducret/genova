@@ -46,7 +46,7 @@ class AgentConfig:
     tokens_thought:      int   = 110
     tokens_action_pick:  int   = 15
     tokens_action_input: int   = 60
-    tokens_checkpoint:   int   = 5
+    tokens_checkpoint:   int   = 15
     tokens_final:        int   = 600
 
 
@@ -118,7 +118,8 @@ def _prefetched_str(prefetched: str) -> str:
 
 
 def thought_messages(user_input: str, tools: ToolRegistry,
-                     conversation: list[dict], scratchpad: list[str]) -> list[dict]:
+                     conversation: list[dict], scratchpad: list[str],
+                     prefetched: str = "") -> list[dict]:
     return [
         {"role": "system", "content": (
             f"You are a reasoning assistant.\n\nAvailable tools:\n{tools.description_block()}\n\n"
@@ -126,11 +127,17 @@ def thought_messages(user_input: str, tools: ToolRegistry,
             "RULES:\n"
             "1. If a tool is strictly necessary, name exactly one tool in your sentence.\n"
             "2. Do NOT use a tool unless truly required.\n"
-            "3. Your output must be ONE sentence starting with 'Thought:' and should convey your strategic reasoning.\n\n"
+            "3. Check the pre-fetched evidence below to understand what has already been retrieved. "
+            "Avoid searching for information already present there — focus on genuine gaps.\n"
+            "4. Your output must be ONE sentence starting with 'Thought:' and should convey your strategic reasoning.\n\n"
             "OUTPUT: One sentence starting with 'Thought:' explaining your strategy for the next step."
         )},
         *conversation,
-        {"role": "user", "content": f"Question: {user_input}{_scratchpad_str(scratchpad)}"},
+        {"role": "user", "content": (
+            f"Question: {user_input}"
+            f"{_prefetched_str(prefetched)}"
+            f"{_scratchpad_str(scratchpad)}"
+        )},
     ]
 
 
@@ -178,17 +185,18 @@ def checkpoint_messages(user_input: str, scratchpad: list[str],
     return [
         {"role": "system", "content": (
             "You are a search decision checker for a clinical genomics pipeline. "
-            "Given the available evidence, decide whether a web search would fill "
-            "a specific, identifiable gap that matters clinically.\n\n"
-            "Say NO (search needed) if a concrete gap exists: "
-            "gene-disease link is unknown or unconfirmed, "
-            "variant functional impact is unclear, "
-            "inheritance mechanism is unresolved, or "
-            "a key piece of evidence is explicitly missing or failed.\n\n"
-            "Say YES (sufficient — skip search) only if the evidence already answers: "
-            "whether this gene is relevant to the phenotype, "
-            "and whether this variant is likely pathogenic or benign — "
-            "with no critical unanswered question remaining.\n\n"
+            "Given the available evidence, decide whether further web search is needed.\n\n"
+            "Primary gaps to check first (prefer these over PubMed):\n"
+            "- OMIM or GeneReviews entry for this gene\n"
+            "- ClinVar submitter details or review status\n"
+            "- Functional or experimental data for this specific variant\n"
+            "- Recent preprints or clinical case reports\n\n"
+            "Secondary gap (only if primary gaps are resolved):\n"
+            "- Critical gene-disease or variant-phenotype literature not already "
+            "present in the pre-fetched evidence\n\n"
+            "Say YES (sufficient) if primary gaps are filled or unresolvable by web search, "
+            "and no critical secondary gap remains.\n"
+            "Say NO (search needed) if any concrete gap above is still open.\n"
             "When uncertain, say NO. "
             "Reply ONLY 'yes' or 'no'."
         )},
@@ -330,7 +338,7 @@ class ReActAgent:
             print(f"\n{'='*44}\n[Step {step + 1}]")
 
             # 1 · Thought
-            thought = self._thought(user_input, conversation, scratchpad)
+            thought = self._thought(user_input, conversation, scratchpad, prefetched)
             scratchpad.append(f"Thought: {thought}")
 
             # 2 · Action selection
@@ -365,9 +373,9 @@ class ReActAgent:
 
     # ── private helpers ─────────────────────
 
-    def _thought(self, user_input, conversation, scratchpad) -> str:
+    def _thought(self, user_input, conversation, scratchpad, prefetched: str = "") -> str:
         raw = self.llm.generate(
-            thought_messages(user_input, self.registry, conversation, scratchpad),
+            thought_messages(user_input, self.registry, conversation, scratchpad, prefetched),
             self.cfg.tokens_thought,
         )
         thought = parse_thought(raw)
@@ -497,20 +505,11 @@ class WebSearchAgentTool(ReActTool):
             f"{k}={variant.get(k, 'NA')}" for k in TARGET_COLUMNS
         )
 
-        prior_evidence_block = ""
-        if context.all_outputs:
-            parts = []
-            for tool_name, output in context.all_outputs.items():
-                if output:
-                    label = tool_name.upper().replace("_", " ")
-                    parts.append(f"PRE-FETCHED {label} EVIDENCE:\n{output}")
-            if parts:
-                prior_evidence_block = "\n\n".join(parts) + "\n"
-
+        # Prior evidence is passed via prefetched= to the agent — not duplicated in the prompt
         prompt = (template
             .replace("{patient_report}", context.patient_phenotype)
             .replace("{variant}", variant_str)
-            .replace("{prior_evidence_block}", prior_evidence_block))
+            .replace("{prior_evidence_block}", ""))
 
         # ── Instantiate and run agent ─────────────────────────────────────────
         cfg   = AgentConfig(model_id="Qwen/Qwen3.5-9B", max_steps=4)
@@ -526,4 +525,8 @@ class WebSearchAgentTool(ReActTool):
             for entry in agent.last_scratchpad:
                 self._last_trace.append(entry)
 
-        return output if output else None
+        if not output:
+            return None
+        gene = context.field("Gene")
+        header = f"Web search evidence for {gene}:" if gene != "NA" else "Web search evidence:"
+        return f"{header}\n{output}"

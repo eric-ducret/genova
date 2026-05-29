@@ -26,8 +26,13 @@ INCLUDE requires evidence for BOTH:
    - ClinVar Pathogenic or Likely pathogenic, OR
    - Strong ACMG criterion applies (PVS1, PS1, PS3, or equivalent), OR
    - Variant is rare (AF < 0.1%) with predicted functional impact (LoF, splice
-     disruption, high CADD score), OR
+     disruption, or high CADD score ≥ 20), OR
+   - Variant is homozygous in a known recessive gene with low population frequency, OR
    - Variant or position reported as disease-causing in literature.
+
+   Note: "no functional study" does NOT equal no pathogenicity support. Rarity,
+   high CADD, homozygosity, and strong gene-disease link are all positive signals
+   even when no wet-lab data exists for this specific variant.
 
 EXCEPTION — Compound heterozygous candidates:
    If two or more variants are present in the same gene in this patient, INCLUDE
@@ -36,22 +41,26 @@ EXCEPTION — Compound heterozygous candidates:
 EXCLUDE if:
    - Gene-phenotype link is absent or only speculative (no literature, no OMIM
      association, no ClinVar disease entries for this phenotype), OR
-   - Pathogenicity evidence is absent (VUS or unclassified with no supporting data
-     and no strong predictive signals), OR
-   - ClinVar Benign / Likely benign with no conflicting evidence, OR
-   - Population frequency > 1%, consistent with a common polymorphism.
+   - Pathogenicity evidence is truly absent: variant is common (AF > 1%), CADD low,
+     no LoF mechanism, ClinVar Benign or Likely benign with no conflicting evidence.
 
-Important: "no evidence found" means the variant lacks support — it is a reason to
-EXCLUDE, not to keep. Only include when positive evidence is present for both criteria.
+Important: missing tool results (failed retrieval, no rsID, no LitVar hits) do NOT
+by themselves justify EXCLUDE. Evaluate the variant-level signals that ARE present
+(frequency, CADD, zygosity, gene-disease association) before deciding.
 
 Output exactly three lines and nothing else:
 Include-case: <strongest reason to include, ≤15 words>
 Exclude-case: <strongest reason to exclude, ≤15 words>
 Decision: INCLUDE or EXCLUDE
 
-Example output (strong case):
+Example output (strong case — known gene, LoF):
 Include-case: OMIM gene for phenotype; PVS1 VeryStrong nonsense variant
 Exclude-case: no variant-level functional data beyond prediction
+Decision: INCLUDE
+
+Example output (included — VUS but strong signals):
+Include-case: known LCA gene; homozygous VUS, very low AF, high CADD
+Exclude-case: ClinVar VUS, no functional study for this specific variant
 Decision: INCLUDE
 
 Example output (excluded — missing gene link):
@@ -59,7 +68,7 @@ Include-case: variant rare and predicted damaging by CADD
 Exclude-case: no gene-disease link for this phenotype; gene unrelated
 Decision: EXCLUDE
 
-Example output (excluded — missing pathogenicity):
-Include-case: gene reported in overlapping phenotype
-Exclude-case: VUS, no functional data, no strong ACMG criterion
+Example output (excluded — common variant, no signal):
+Include-case: gene has some OMIM disease association
+Exclude-case: AF 3%, CADD 8, ClinVar Benign, no LoF mechanism
 Decision: EXCLUDE

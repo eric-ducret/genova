@@ -7,28 +7,19 @@ VARIANT DATA:
 {prior_evidence_block}
 TASK:
 
-Identify peer-reviewed literature that provides evidence regarding
-the relationship between this specific variant—including all its properties such as exact nucleotide or amino acid change, mutation type (e.g., loss-of-function, missense, nonsense), gene name, and any functional annotations—
-and the patient phenotype.
+PubMed literature for this gene and phenotype has already been retrieved by prior tools
+(see pre-fetched evidence block). Do NOT repeat general gene-disease PubMed searches.
 
-You may perform and refine up to 5 focused searches.
-Use web_search to locate high-relevance sources,
-then use web_fetch or ncbi_fetch to examine selected articles in detail and extract key findings.
+Search specifically for complementary evidence not covered by prior tools:
+1. OMIM or GeneReviews page for this gene — gene function, disease mechanism, allelic variants
+2. Full ClinVar record for this variant — submitter classifications, conditions, review status
+3. Recent preprints (bioRxiv, medRxiv) or clinical studies not yet in PubMed
+4. Functional or experimental data for this specific variant or protein position
 
-Iteratively refine your queries based on intermediate results.
-Continue until you have gathered the strongest available evidence regarding the variant–phenotype relationship.
-
-Prioritize, in order:
-1. Evidence on the exact variant
-2. Strong genotype–phenotype correlations
-3. Functional or experimental validation
-4. Segregation data or well-documented case reports
-
-Avoid stopping at gene-level associations if variant-level data is available.
+Use web_search to locate sources, then web_fetch or ncbi_fetch to read the most relevant ones.
+Limit to 3 focused searches. Stop as soon as the key gaps above are filled.
 
 Output format:
-- Provide only concise, directly relevant evidence linking (or not linking) the variant to the phenotype.
-- Present each piece of evidence as a separate bullet.
-- Each bullet should be 1–2 sentences max, including key details (study type, cohort size, functional impact, main conclusion).
-- Include the full URL for each source.
-- Do NOT include explanations, commentary, or unrelated information.
+- One bullet per finding, 1-2 sentences max
+- Include the full URL for each source
+- State clearly if a source was not found or returned no relevant data

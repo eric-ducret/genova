@@ -35,6 +35,18 @@ NCBI_MIN_DELAY = 0.34          # seconds between calls → stays under 3 req/s l
 DEFAULT_TIMEOUT  = 15          # seconds
 DEFAULT_MAX_CHARS = 3000       # safe default — main.py can override per tool instance
 
+# Country-code TLDs whose content is predominantly non-English
+_NON_ENGLISH_TLDS = {
+    ".ru", ".ua", ".by", ".kz",          # Russian-speaking
+    ".ar", ".ir",                          # Arabic / Farsi
+    ".cn", ".jp", ".kr", ".vn",           # CJK + Vietnamese
+    ".pl", ".cz", ".sk", ".hu", ".ro",   # Eastern European
+    ".bg", ".rs", ".hr",                   # Balkan
+    ".tr",                                 # Turkish
+}
+
+NON_ASCII_THRESHOLD = 0.3     # reject page if >30 % of chars are non-ASCII
+
 
 # ─────────────────────────────────────────────
 # HELPERS
@@ -58,6 +70,15 @@ def _clean_xml_text(raw: str) -> str:
     """Strip XML tags and collapse whitespace."""
     text = re.sub(r"<[^>]+>", " ", raw)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_likely_english(url: str) -> bool:
+    """Return False for URLs whose TLD indicates a non-English-primary domain."""
+    try:
+        hostname = urlparse(url).hostname or ""
+        return not any(hostname.endswith(tld) for tld in _NON_ENGLISH_TLDS)
+    except Exception:
+        return True
 
 
 def _extract_body_text(html: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
@@ -115,10 +136,12 @@ class WebSearchTool(NetworkTool):
     )
     input_system = (
         "You are a biomedical search query optimizer. "
-        "Output ONLY few keywords that best retrieve relevant results for the question. "
-        "Prefer gene names, variant identifiers, disease names, and MeSH terms. "
-        "Drop all filler words, explanations, and context. "
-        "Never output tool names, quotes, parentheses, or code. "
+        "Output ONLY 2-4 keywords that best retrieve relevant web results. "
+        "ALWAYS start with the gene symbol and disease or phenotype name. "
+        "NEVER use HGVS notation (NM_..., c.xxx, p.xxx), chromosomal coordinates, "
+        "transcript IDs, or rsIDs — these return no results in general web searches. "
+        "No quotes, no punctuation, no explanation, no tool names. "
+        "Example good output: KSR2 obesity intellectual disability"
     )
     input_template = "Convert to a plain keyword search query: {user_input}"
 
@@ -151,6 +174,11 @@ class WebSearchTool(NetworkTool):
 
         if not results:
             return f"No results found for: {query!r}"
+
+        # Drop results from predominantly non-English domains
+        results = [r for r in results if _is_likely_english(r.get("href", ""))]
+        if not results:
+            return f"No English-language results found for: {query!r}"
 
         lines = []
         for i, r in enumerate(results, 1):
@@ -231,6 +259,10 @@ class WebFetchTool(NetworkTool):
 
         if not text:
             return "Page fetched but no readable content could be extracted (page may be JS-rendered)."
+
+        non_ascii = sum(1 for c in text if ord(c) > 127)
+        if len(text) > 100 and non_ascii / len(text) > NON_ASCII_THRESHOLD:
+            return f"Non-English page detected at {url} — skipping."
 
         hostname = parsed.hostname or url
         return f"Content from {hostname}:\n\n{text}"

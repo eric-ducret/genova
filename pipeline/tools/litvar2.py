@@ -1,24 +1,37 @@
 """
 pipeline/tools/litvar2.py — LitVar2-powered literature summarisation tool.
 
-Search strategy (gene-first):
+Search strategy (gene-first, three tracks):
 
-  1. Gene-level search (primary — always runs when Gene is present)
+  1. Gene + patient phenotype (primary — always runs when Gene is present)
        Uses PubMed esearch with "{gene}[Gene] AND {disease_query}" to retrieve papers
        co-mentioning the gene and the patient's disease. One API call, no LitVar2 loop.
        - Zero hits  → explicit "not linked to disease" string (negative signal for triage)
        - Non-zero   → titles → SLM filter → abstracts → SLM summary
 
-  2. Variant-level search (supplemental — runs when RS_ID is valid)
+  2. Gene + known disease association (supplemental — runs when a disease term is available)
+       Bridges the terminology gap between how the patient's condition is described and how
+       OMIM/CGD name the canonical disease for that gene.
+       Disease term source priority:
+         a. OMIM_phenotype from the variant dict (already curated for this variant)
+         b. NHGRI Clinical Genomic Database (CGD) conditions for the gene — downloaded once
+            per process and cached at the class level; empty dict on download failure.
+       - No disease term available → track skipped silently
+       - Term found → titles → SLM filter → abstracts → SLM summary (framed on patient phenotype)
+
+  3. Variant-level search (supplemental — runs when RS_ID is valid)
        Uses LitVar2 variant publications endpoint (purpose-built for rsID-level tracking).
        - No relevant papers → omitted from output
        - Papers found       → titles → SLM filter → abstracts → SLM summary
 
-  Both sections are included in the output when both searches yield evidence, separated by
-  a divider. Section headers identify the source and the exact query used so downstream
-  reasoning stages can interpret provenance without ambiguity.
+  Tracks 1 and 2 answer different questions: track 1 asks "is this gene linked to this
+  patient's phenotype?", track 2 asks "is this gene's known disease related to what we see?".
+  All tracks that yield evidence are combined in the output, separated by dividers. Section
+  headers embed source and query for downstream traceability.
 """
 
+import gzip
+import io
 import re
 import json
 import time
@@ -38,6 +51,8 @@ LITVAR2_BASE = "https://www.ncbi.nlm.nih.gov/research/litvar2-api"
 LITVAR2_URL  = f"{LITVAR2_BASE}/variant/get/litvar@{{rsid}}%23%23/publications"
 NCBI_BASE    = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 NCBI_DELAY   = 0.34           # stay under 3 req/s
+CGD_URL      = "https://research.nhgri.nih.gov/CGD/download/txt/CGD.txt.gz"
+CGD_MAX_CONDITIONS = 3        # cap OR terms from CGD to keep the query focused
 
 MAX_PMIDS     = 40             # hard cap on PMIDs fetched from LitVar2
 TOP_N_PAPERS  = 8              # how many titles the SLM keeps
@@ -84,6 +99,9 @@ class LitVar2SummaryTool(SLMTool):
     top_n:     int = TOP_N_PAPERS
     max_chars: int = MAX_CHARS
     timeout:   int = DEFAULT_TIMEOUT
+
+    # CGD table cache — populated on first use, shared across all instances and variants
+    _cgd_table: dict[str, list[str]] | None = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -164,6 +182,75 @@ class LitVar2SummaryTool(SLMTool):
         result = " OR ".join(terms)
         logger.debug("Disease query resolved: %r → %r", raw, result)
         return result
+
+    # ── CGD table (gene → known conditions) ──────────────────────────────────
+
+    @classmethod
+    def _load_cgd_table(cls) -> dict[str, list[str]]:
+        """
+        Download and parse the NHGRI Clinical Genomic Database (CGD).
+        Returns {GENE_UPPER: [condition, ...]}. Called at most once per process.
+        Returns an empty dict on any failure so callers degrade gracefully.
+        """
+        try:
+            resp = requests.get(CGD_URL, timeout=30)
+            resp.raise_for_status()
+        except Exception as e:
+            logger.warning("CGD download failed (%s) — known-disease track disabled", e)
+            return {}
+
+        try:
+            with gzip.open(io.BytesIO(resp.content)) as f:
+                text = f.read().decode("utf-8")
+        except Exception as e:
+            logger.warning("CGD decompression failed (%s) — known-disease track disabled", e)
+            return {}
+
+        try:
+            lines = text.splitlines()
+
+            # Locate header row (first non-comment non-empty line)
+            header_idx = 0
+            for i, line in enumerate(lines):
+                if line.startswith("#GENE") or (not line.startswith("#") and line.strip()):
+                    header_idx = i
+                    break
+
+            headers  = [h.strip() for h in lines[header_idx].lstrip("#").split("\t")]
+            gene_col = next((i for i, h in enumerate(headers) if h.upper() == "GENE"), None)
+            cond_col = next(
+                (i for i, h in enumerate(headers) if h.upper() in {"CONDITION", "PHENOTYPE"}),
+                None,
+            )
+            if gene_col is None or cond_col is None:
+                logger.warning("CGD missing GENE/CONDITION column — known-disease track disabled")
+                return {}
+
+            table: dict[str, list[str]] = {}
+            for line in lines[header_idx + 1:]:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) <= max(gene_col, cond_col):
+                    continue
+                gene      = fields[gene_col].strip().upper()
+                condition = fields[cond_col].strip()
+                if gene and condition:
+                    table.setdefault(gene, []).append(condition)
+
+        except Exception as e:
+            logger.warning("CGD parsing failed (%s) — known-disease track disabled", e)
+            return {}
+
+        logger.info("CGD table loaded: %d genes indexed", len(table))
+        return table
+
+    @classmethod
+    def _get_cgd_conditions(cls, gene: str) -> list[str]:
+        """Return known CGD conditions for *gene*, loading the table on first call."""
+        if cls._cgd_table is None:
+            cls._cgd_table = cls._load_cgd_table()
+        return cls._cgd_table.get(gene.upper(), [])
 
     # ── step 1: LitVar2 → PMIDs (rsID path) ──────────────────────────────────
 
@@ -503,6 +590,77 @@ class LitVar2SummaryTool(SLMTool):
             f"Sources:\n{source_lines}"
         )
 
+    # ── supplemental: known-disease PubMed search (track 2) ──────────────────
+
+    def _omim_gene_search(self, gene: str, context: ToolContext) -> str | None:
+        """
+        Supplemental gene-level search anchored on the gene's known disease association
+        rather than the patient's described phenotype. Bridges the terminology gap between
+        how the patient's condition is described and how OMIM/CGD name the disease.
+
+        Disease term source priority:
+          1. OMIM_phenotype from the variant dict (already curated for this variant)
+          2. NHGRI CGD conditions for the gene (class-level cache, loaded once per process)
+
+        Relevance filtering uses the known condition as the question so the SLM selects
+        papers about that specific disease. Summarisation is framed on the patient phenotype
+        so the output remains clinically grounded. Returns None when no disease term is
+        available or no relevant papers are found.
+        """
+        omim_phenotype = context.field("OMIM_phenotype")
+        if omim_phenotype != "NA":
+            conditions = [omim_phenotype]
+            source     = "OMIM"
+        else:
+            conditions = self._get_cgd_conditions(gene)
+            source     = "CGD"
+
+        if not conditions:
+            return None
+
+        # Build quoted-phrase OR query; cap to keep PubMed query focused
+        capped       = conditions[:CGD_MAX_CONDITIONS]
+        disease_query = " OR ".join(f'"{c}"' for c in capped)
+
+        try:
+            pmids, _, query_translation = self._esearch_gene(gene, disease_query)
+        except PipelineError as e:
+            logger.warning("Known-disease search failed for gene=%s (%s)", gene, e)
+            return None
+
+        if not pmids:
+            return None
+
+        titles = self._fetch_titles(pmids)
+        if not titles:
+            return None
+
+        # Relevance filter: anchor on the known condition, not the patient phenotype
+        question       = f"{gene} and {', '.join(capped)}"
+        selected_pmids = self._select_relevant_pmids(titles, question, context)
+        if not selected_pmids:
+            return None
+
+        papers = self._fetch_abstracts(selected_pmids)
+        if not papers:
+            return None
+
+        # Summarise in the context of the patient phenotype so output is clinically framed
+        summary = self._summarise(papers, context.patient_phenotype, gene, context)
+
+        source_lines = "\n".join(
+            f"  - [PMID:{pmid}] {p['title']}  {p['url']}"
+            for pmid, p in papers.items()
+        )
+        return (
+            f"PubMed gene-disease evidence for {gene} (known condition, source: {source})\n"
+            f"[Query: {query_translation} | "
+            f"{len(titles)} screened, {len(papers)} selected | "
+            f"conditions: {'; '.join(capped)}]\n\n"
+            f"{summary}\n\n"
+            f"Sources:\n{source_lines}"
+        )
+
     # ── supplemental: rsID-level LitVar2 search ──────────────────────────────
 
     def _rsid_search(self, rsid: str, context: ToolContext) -> str | None:
@@ -548,16 +706,15 @@ class LitVar2SummaryTool(SLMTool):
 
     def run(self, variant: dict, context: ToolContext) -> str | None:
         """
-        Fetch literature evidence using a gene-first strategy.
+        Fetch literature evidence using a gene-first three-track strategy.
 
-        1. Gene-level (primary): PubMed esearch "{gene}[Gene] AND {disease_query}".
-           Always runs when Gene is present. Returns a positive summary or an explicit
-           "not linked" message — never silent on absence.
-        2. Variant-level (supplemental): LitVar2 rsID endpoint.
-           Runs when RS_ID is valid. Omitted from output when no relevant papers found.
+        1. Gene + patient phenotype (primary): always runs when Gene is present.
+        2. Gene + known disease term (supplemental): runs when OMIM_phenotype is not NA
+           or CGD has an entry for the gene. Bridges phenotype terminology gaps.
+        3. Variant-level (supplemental): LitVar2 rsID endpoint when RS_ID is valid.
 
-        Both blocks are combined when both searches yield evidence, separated by a
-        divider. Each block header embeds source and query for downstream traceability.
+        All tracks that yield evidence are combined, separated by dividers. Each block
+        header embeds source and query for downstream traceability.
         """
         rsid = context.field("RS_ID")
         gene = context.field("Gene")
@@ -570,12 +727,25 @@ class LitVar2SummaryTool(SLMTool):
 
         parts = []
 
-        # 1. Gene-level search (primary — always first)
+        # 1. Gene + patient phenotype (primary)
         if gene_ok:
-            logger.info("LitVar2SummaryTool: gene-level PubMed search for gene=%s", gene)
+            logger.info("LitVar2SummaryTool: gene+phenotype search for gene=%s", gene)
             parts.append(self._gene_search(gene, context))
 
-        # 2. rsID search (supplemental variant-specific evidence)
+        # 2. Gene + known disease association (supplemental)
+        if gene_ok:
+            logger.info("LitVar2SummaryTool: known-disease search for gene=%s", gene)
+            try:
+                omim_block = self._omim_gene_search(gene, context)
+                if omim_block:
+                    parts.append(omim_block)
+            except PipelineError as e:
+                logger.warning(
+                    "Known-disease search failed for gene=%s (%s) — primary results preserved",
+                    gene, e,
+                )
+
+        # 3. rsID search (supplemental variant-specific evidence)
         if rsid_ok:
             logger.info("LitVar2SummaryTool: rsid-level LitVar2 search for rsid=%s", rsid)
             try:
