@@ -1,15 +1,19 @@
-
 Patient phenotype: {patient_phenotype}
+Per-variant conclusions: {conclusions}
 
-Per-variant conclusions:
+TASK: Identify which variant best explains the patient's phenotype.
 
-{conclusions}
+Ground your reasoning in the per-variant conclusions above. For each
+claim you make about a variant, that claim should be traceable to
+something stated in its conclusion (zygosity, inheritance, gene-disease
+evidence, ClinVar status, etc.).
 
-TASK — CLINICAL CONCLUSION:
+Compare the variants against each other and identify which one stands
+out as the most likely cause of the patient's condition. Then write the
+clinical conclusion.
 
-Synthesize the per-variant findings above into a concise overall clinical conclusion. Identify the most significant finding(s) and their relevance to the patient phenotype.
-
-Use exactly this format:
+# Reasoning
+[3–6 sentences comparing the variants, drawing on what each conclusion states]
 
 # Clinical Conclusion
-[2–3 sentences]
+[2–3 sentences naming the primary causative variant and why it fits]
