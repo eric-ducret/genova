@@ -185,13 +185,18 @@ FINAL REPORT
 
 ---
 
+# Reasoning
+...
+
 # Clinical Conclusion
 ...
 ```
 
 **PROCESS DETAILS** logs each tool's gate outcome (`PASS` or `SKIPPED` with reason)
 and its metadata: LitVar2 keeps article titles and PMIDs; WebSearchAgent records the
-full ReAct trace; all tools append their raw string output.
+full ReAct trace; all tools append their raw string output. When first triage runs
+(n > 12), a TRIAGE SUMMARY block and a SECOND TRIAGE (INCLUSION DECISIONS) block are
+appended showing which variants were kept, discarded, or exempted.
 
 **AUGMENTED CONTEXT** is the raw evidence document assembled by Stage 1 (retrieval).
 It covers all variants and is passed as-is to the SLM reasoning and conclusion stages.
@@ -201,9 +206,10 @@ It covers all variants and is passed as-is to the SLM reasoning and conclusion s
 second triage decision. Not shown in the clinical report — used only as input to Stage 4.
 
 **FINAL REPORT** contains structured conclusion blocks for included variants (Stage 4),
-the overall `# Clinical Conclusion` paragraph (Stage 5), and — when triage ran — an
-appendix listing excluded variants (reasoning available in REASONING section) and
-variants discarded at first triage.
+then the Stage 5 final conclusion (a `# Reasoning` comparison paragraph followed by
+a `# Clinical Conclusion` paragraph), and — when triage ran — an appendix listing
+excluded variants (reasoning available in REASONING section) and variants discarded
+at first triage.
 
 ---
 

@@ -71,7 +71,7 @@ variant-pipeline/
 │   ├── tools/
 │   │   ├── __init__.py
 │   │   ├── base.py                  ← Tool, NetworkTool, SLMTool, RAGTool, BotTool
-│   │   ├── litvar2.py               ← literature search: gene-first PubMed + LitVar2 rsID supplement
+│   │   ├── litvar2.py               ← literature search: gene-first three-track PubMed + LitVar2 rsID
 │   │   ├── autopvs1.py              ← AutoPVS1 PVS1 criterion evaluation (LoF variants)
 │   │   ├── spliceai.py              ← SpliceAI splice impact delta scores (Broad API)
 │   │   ├── websearch.py             ← WebSearchTool + WebFetchTool (sub-tools for ReAct agent)
@@ -270,13 +270,17 @@ class ToolContext:
 
     # Shared resources (injected at startup, never instantiated by tools)
     llm: LLMClient                       # call context.llm.generate(system, user, max_tokens)
-    db: VectorStore | None               # None if no DB configured
-    browser: BrowserSession | None       # None if no bot configured
+    db: VectorStore | None = None        # None if no DB configured
+    browser: BrowserSession | None = None  # None if no bot configured
+
+    # Run-level metadata
+    genome_build: str = "hg19"           # reference genome build for this run
+    raw_fields: dict = field(default_factory=dict)  # full original CSV row for this variant
 
     # Convenience
     def field(self, name: str) -> str:
-        """Extract a field from the variant dict. Returns 'NA' if missing."""
-        return self.variant.get(name, "NA")
+        """Extract a field from the variant dict. Returns 'NA' if missing or falsy."""
+        return self.variant.get(name, "NA") or "NA"
 ```
 
 ### Gate system
@@ -381,14 +385,15 @@ note the missing evidence in the report rather than reasoning from a gap.
 | `litvar2_summary` | `SLMTool` | 1 (parallel) | RS_ID valid **or** Gene present (Python gate) |
 | `spliceai` | `NetworkTool` | 1 (parallel) | Python gate — skips synonymous, intergenic, UTR, unresolvable coords |
 | `autopvs1` | `NetworkTool` | 2 (parallel) | Python gate — LoF/frameshift/splice variants only |
-| `websearch_agent` | `ReActTool` | 3 (serial) | None — internal pre-loop checkpoint decides whether to search |
+| `websearch_agent` | `ReActTool` | 3 (serial) | Python gate — hard-skips ClinVar benign/likely-benign and common variants (AF > 1%); pre-loop checkpoint handles remaining cases |
 
-**`litvar2_summary`** runs a gene-first dual-track search:
+**`litvar2_summary`** runs a gene-first three-track search:
 
-- **Gene-level search (primary — always runs when Gene is present)** — queries PubMed `esearch` with `({gene}[tiab] OR {gene}[Gene]) AND {disease_query}`. If no disease co-occurrence is found, retries with gene-only to distinguish "no literature at all" from "gene unrelated to disease". Returns an explicit `"NO DISEASE LINK"` message on zero relevant hits — providing a clear negative signal for triage. Output header includes PubMed's `querytranslation` and pool counts for downstream traceability.
-- **rsID search (supplemental — runs when RS_ID is valid)** — queries the LitVar2 variant publications endpoint for variant-specific literature. Omitted from output if no relevant papers are found. Output header identifies LitVar2 as source, distinguished from the gene-level PubMed block.
+- **Track 1 — Gene + patient phenotype (primary — always runs when Gene is present)** — queries PubMed `esearch` with `({gene}[tiab] OR {gene}[Gene]) AND {disease_query}`. If no disease co-occurrence is found, retries with gene-only to distinguish "no literature at all" from "gene unrelated to disease". Returns an explicit `"NO DISEASE LINK"` message on zero relevant hits — providing a clear negative signal for triage. Output header includes PubMed's `querytranslation` and pool counts for downstream traceability. When total results exceed `MAX_PMIDS`, a second call sorted by publication date adds recent papers not in the relevance window.
+- **Track 2 — Gene + known disease term (supplemental — runs when a disease term is available)** — bridges the terminology gap between how the patient's condition is described and how OMIM/CGD name the canonical disease for that gene. Disease term source priority: (a) `OMIM_phenotype` from the variant dict; (b) NHGRI Clinical Genomic Database (CGD) conditions for the gene — downloaded once per process and cached at the class level (`_cgd_table`). Relevance filtering anchors on the known condition; summarisation is framed on the patient phenotype so output stays clinically grounded. Track silently skipped when no disease term is available or no relevant papers are found.
+- **Track 3 — rsID variant-level search (supplemental — runs when RS_ID is valid)** — queries the LitVar2 variant publications endpoint for variant-specific literature. Omitted from output if no relevant papers are found. Output header identifies LitVar2 as source, distinguished from the gene-level PubMed blocks.
 
-When both searches yield results they are combined in the output separated by `---`. `_disease_query` is resolved once per pipeline run via a single SLM call (`_resolve_disease_query`), cached as an instance attribute, and reused for all variants. The resolver prefers broad MeSH disease category terms so PubMed's automatic term mapping indexes correctly.
+All tracks that yield evidence are combined in the output separated by `---`. `_disease_query` is resolved once per pipeline run via a single SLM call (`_resolve_disease_query`), cached as an instance attribute, and reused for all variants. The resolver returns 2–4 PubMed-compatible disease terms as a PubMed OR expression, preferring MeSH-indexed terms for broad recall.
 
 **`autopvs1`** uses a HGVS-first query strategy: when a valid transcript HGVS is available (`NM_xxx:c.xxx`), it queries AutoPVS1 via `/search?q={hgvs}` so AutoPVS1 resolves coordinates internally — immune to stale CSV coords. Falls back to VCF-style coords (`/variant/{build}/{chrom}-{pos}-{ref}-{alt}`) when HGVS is absent or the search path fails. Results are discarded when AutoPVS1 returns `variant_type="Intergenic"` or the returned gene does not match the expected gene. `pvs1_applicable` is `True` only when a flowchart is present in the response and no "incompatible with recommendations" message is found.
 
@@ -397,9 +402,21 @@ When both searches yield results they are combined in the output separated by `-
 `sai10kPredictions` clinical interpretation block (aberration type, confidence,
 frameshift description). Only the MANE Select transcript is reported. Coordinates
 and genome build are sourced from the canonical variant dict fields; build is read
-from `pipeline/config.py` (`GENOME_BUILD`). Skips synonymous, intergenic, and UTR
-variants via Python gate. Output labels are enriched for SLM readability
-(plain-English aberration names, explicit delta score scale).
+from `pipeline/config.py` (`DEFAULT_GENOME_BUILD`). Gate is two-layer: Python gate
+skips synonymous, intergenic, UTR, and variants with unresolvable coordinates;
+manifest gate additionally skips the API call when a `SpliceAI_v13` column is
+already present in the input (pre-computed scores from ANNOVAR/hg38 format). Output
+labels are enriched for SLM readability (plain-English aberration names, explicit
+delta score scale).
+
+**`websearch_agent`** runs a ReAct loop with three sub-tools (WebSearchTool,
+WebFetchTool, NCBIFetchTool). Before starting the loop, a pre-loop checkpoint prompt
+receives all pre-fetched evidence from earlier tools (LitVar2, AutoPVS1) and decides
+whether any primary gaps remain (OMIM/GeneReviews, ClinVar details, functional data,
+recent case reports). The loop runs up to `max_steps=4` iterations; after each
+observation a mid-loop checkpoint decides whether to continue or stop. The Python
+gate hard-skips ClinVar benign/likely-benign and common variants (AF > 1%) before
+reaching the pre-loop checkpoint.
 
 ---
 
@@ -494,8 +511,8 @@ One small SLM call per variant immediately after retrieval. Decides whether a va
 can be discarded with high confidence given the patient phenotype.
 Prompt loaded from `prompts/first_triage.txt`.
 
-Only runs when `n > TRIAGE_ENABLED_THRESHOLD` (configured in `pipeline/config.py`).
-When skipped, all variants are implicitly KEEP.
+Only runs when `n > TRIAGE_ENABLED_THRESHOLD` (configured in `pipeline/config.py`;
+current value: 12). When skipped, all variants are implicitly KEEP.
 
 Compound heterozygous candidates (two or more variants in the same gene) are
 automatically exempted from DISCARD — a DISCARD decision on any such variant is
@@ -558,6 +575,12 @@ One SLM call per included variant. Takes the variant context slice, its reasonin
 and (if available) the cross-analysis for its gene. Produces the structured variant
 report block. Prompt loaded from `prompts/conclusion.txt`.
 
+After the SLM call, a `_validate_citations` post-processing step strips any inline
+citations that are not grounded in the variant context: `(PMID:XXXXXXXX)` references
+are kept only if that PMID appears in the context; `(https://...)` references are kept
+only if the URL appears verbatim in the context. This prevents hallucinated citations
+from propagating into the final report.
+
 Output format per variant:
 ```
 # Variant [N] — [GENE] ([HGVS])
@@ -571,9 +594,17 @@ Output format per variant:
 
 ### Stage 5 — Final Conclusion (`stages/final_conclusion.py`)
 
-Single SLM call. Takes all included variants' conclusion blocks and the patient phenotype
-and produces the overall `# Clinical Conclusion` paragraph (2–3 sentences).
+Single SLM call. Takes all included variants' conclusion blocks and the patient phenotype.
 Prompt loaded from `prompts/final_conclusion.txt`.
+
+Output format (two sections):
+```
+# Reasoning
+[3–6 sentences comparing variants, drawing on what each conclusion states]
+
+# Clinical Conclusion
+[2–3 sentences naming the primary causative variant and why it fits]
+```
 
 This stage is separate from Stage 4 so that each variant's block can be generated
 individually (reducing SLM memory pressure) while the overall summary still has
@@ -764,11 +795,12 @@ These rules must be respected in all new code:
 
 1. **Tools are stateless with respect to variant data.** Tools must never store
    per-variant results on `self` between calls — all variant-scoped state lives in
-   `ToolContext`. The one accepted exception is run-level caching of expensive
-   one-time computations that are identical across all variants (e.g. `_disease_query`
-   in `litvar2_summary`, derived solely from `patient_phenotype`). Such cached values
-   must be pipeline-run-scoped, variant-independent, and initialised in `__init__`
-   as `None`.
+   `ToolContext`. Two accepted exceptions exist: (a) instance-level caching of
+   expensive one-time computations that are identical across all variants (e.g.
+   `_disease_query` in `litvar2_summary`, derived solely from `patient_phenotype`) —
+   initialised in `__init__` as `None`; (b) class-level caching of data fetched once
+   per process and shared across all instances and variants (e.g. `_cgd_table` in
+   `litvar2_summary`). Both forms must be pipeline-run-scoped and variant-independent.
 
 2. **Tools never load models.** The LLM client is always accessed via `context.llm`.
 
