@@ -618,9 +618,14 @@ class LitVar2SummaryTool(SLMTool):
         if not conditions:
             return None
 
+        # Strip trailing OMIM subtype numbers ("Microphthalmia, isolated 8" → "Microphthalmia, isolated")
+        # before quoting — PubMed cannot phrase-match these numbered subtypes and breaks them apart noisily.
+        def _strip_subtype(s: str) -> str:
+            return re.sub(r",?\s*\d+\s*$", "", s).strip()
+
         # Build quoted-phrase OR query; cap to keep PubMed query focused
-        capped       = conditions[:CGD_MAX_CONDITIONS]
-        disease_query = " OR ".join(f'"{c}"' for c in capped)
+        capped        = conditions[:CGD_MAX_CONDITIONS]
+        disease_query = " OR ".join(f'"{_strip_subtype(c)}"' for c in capped)
 
         try:
             pmids, _, query_translation = self._esearch_gene(gene, disease_query)

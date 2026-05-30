@@ -15,9 +15,9 @@ gate:
 
 compress:
   enabled: true
-  threshold: auto
+  threshold: 20
   strategy: slm
-  max_tokens: 250
+  max_tokens: 350
 
 timeout: 60
 retry:

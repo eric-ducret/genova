@@ -7,9 +7,9 @@ parallel: true
 
 compress:
   enabled: true
-  threshold: auto
+  threshold: 20
   strategy: slm
-  max_tokens: 300
+  max_tokens: 600
 
 timeout: 15
 retry:

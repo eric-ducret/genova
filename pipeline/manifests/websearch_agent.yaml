@@ -10,9 +10,9 @@ parallel: false
 
 compress:
   enabled: true
-  threshold: auto
+  threshold: 20
   strategy: slm
-  max_tokens: 400
+  max_tokens: 600
 
 # ReAct loop can be slow; allow more time
 timeout: 120
