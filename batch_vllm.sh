@@ -31,8 +31,9 @@ echo "================"
 echo "Starting vLLM server..."
 vllm serve Qwen/Qwen3.5-9B \
     --dtype bfloat16 \
-    --max-model-len 16384 \
+    --max-model-len 32768 \
     --port 8001 \
+    --enable-prefix-caching \
     > "$VLLM_LOG" 2>&1 &
 
 VLLM_PID=$!
