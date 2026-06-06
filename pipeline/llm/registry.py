@@ -15,7 +15,7 @@ from pipeline.llm.base import LLMClient
 
 MODELS: dict[str, dict] = {
     "qwen3.5-9b": {
-        "client":           "hf",
+        "client":           "vllm",
         "model_id":         "Qwen/Qwen3.5-9B",
         "enable_thinking":  False,   # MUST remain False — thinking tokens break downstream parsing
         "max_tokens_default": 1024,
