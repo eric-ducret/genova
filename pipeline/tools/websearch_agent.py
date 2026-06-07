@@ -230,8 +230,7 @@ def final_answer_messages(user_input: str, conversation: list[dict],
             "Synthesise the findings that link (or do not link) the variant or gene to the disease. "
             "Include URLs for any sources cited. "
             "Do NOT mention tools, search steps, or internal reasoning. "
-            "Begin directly with the evidence — do NOT write 'Thinking Process', 'Analysis', "
-            "'Let me', or any preamble before the content."
+            "Begin directly with the evidence."
         )},
         *conversation,
         {"role": "user", "content": (

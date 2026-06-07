@@ -414,8 +414,7 @@ class LitVar2SummaryTool(SLMTool):
             "If no abstract contains relevant evidence, write one sentence saying so. "
             "Do NOT use bullet points, headers, or raw URLs. "
             "Do NOT mention abstracts or papers explicitly, just report the findings naturally. "
-            "Begin directly with the summary — do NOT write 'Thinking Process', 'Analysis', "
-            "or any preamble before the paragraph."
+            "Begin directly with the summary."
         )
         user = (
             f"Research question: {question}\n"

@@ -10,9 +10,24 @@ enable_thinking is always silently forced to False per pipeline design rules.
 
 from __future__ import annotations
 
+import re
 import httpx
 
 from pipeline.llm.base import LLMClient
+
+# Qwen3.5-9B generates plain-text "Thinking Process:" preamble headers in
+# non-thinking mode regardless of instructions.  Strip only the header line
+# so the numbered analysis that follows it is preserved as useful content.
+_THINKING_HEADER_RE = re.compile(
+    r"^(?:thinking process|let me (?:think|analyze|look)|analysis|"
+    r"step[- ]by[- ]step[^:\n]*)[\s:]*\n+",
+    re.IGNORECASE,
+)
+
+
+def _strip_thinking_header(text: str) -> str:
+    cleaned = _THINKING_HEADER_RE.sub("", text, count=1).strip()
+    return cleaned if cleaned else text
 
 
 class VLLMClient(LLMClient):
@@ -51,6 +66,7 @@ class VLLMClient(LLMClient):
             "messages":    messages,
             "max_tokens":  max_tokens,
             "temperature": temperature,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         with httpx.Client(timeout=self.request_timeout) as client:
             resp = client.post(
@@ -60,7 +76,8 @@ class VLLMClient(LLMClient):
             resp.raise_for_status()
             data = resp.json()
 
-        return data["choices"][0]["message"]["content"].strip()
+        raw = data["choices"][0]["message"]["content"].strip()
+        return _strip_thinking_header(raw)
 
     async def generate_async(
         self,
@@ -89,7 +106,8 @@ class VLLMClient(LLMClient):
             resp.raise_for_status()
             data = resp.json()
 
-        return data["choices"][0]["message"]["content"].strip()
+        raw = data["choices"][0]["message"]["content"].strip()
+        return _strip_thinking_header(raw)
 
     def is_available(self) -> bool:
         """Ping the vLLM health endpoint."""

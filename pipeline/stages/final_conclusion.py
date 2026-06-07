@@ -30,6 +30,10 @@ _PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "final_conclusi
 
 MAX_NEW_TOKENS_FINAL_CONCLUSION = 600
 
+# With --max-model-len 16384, leave 2000 tokens for prompt template + output.
+# ~4 chars per token → 14384 × 4 = 57536 chars safe budget for the conclusions block.
+_MAX_CONCLUSIONS_CHARS = 50_000
+
 
 def _load_prompt() -> str:
     if _PROMPT_PATH.exists():
@@ -64,6 +68,13 @@ def run(
     logger.info("[FinalConclusion] Synthesising overall clinical conclusion...")
 
     conclusions_text = "\n\n---\n\n".join(conclusions)
+
+    if len(conclusions_text) > _MAX_CONCLUSIONS_CHARS:
+        logger.warning(
+            "[FinalConclusion] Combined conclusions (%d chars) exceeds budget — truncating.",
+            len(conclusions_text),
+        )
+        conclusions_text = conclusions_text[:_MAX_CONCLUSIONS_CHARS] + "\n\n[... truncated ...]"
 
     template    = _load_prompt()
     user_prompt = (template
