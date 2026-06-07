@@ -254,12 +254,14 @@ class Executor:
         total_variants: int,
         genome_build: str = DEFAULT_GENOME_BUILD,
         raw_fields: dict | None = None,
-    ) -> str:
+    ) -> tuple[str, list[dict]]:
         """
-        Run all tools for one variant and return the assembled mini-doc string.
+        Run all tools for one variant and return (mini_doc, log_entries).
 
         The mini-doc is the concatenation of each tool's (possibly compressed)
         output, with failure notes substituted for any PipelineError raised.
+        log_entries is a list of per-tool process log dicts for this variant;
+        callers accumulate and set executor.process_log after all variants complete.
 
         Args:
             variant:          Normalized variant dict (canonical schema).
@@ -268,10 +270,9 @@ class Executor:
             total_variants:   Total number of variants being processed.
 
         Returns:
-            A multi-line string containing all tool outputs for this variant.
+            (mini_doc, log_entries) — thread-safe: no shared state mutated.
         """
-        if variant_index == 0:
-            self.process_log = []
+        local_log: list[dict] = []
 
         all_outputs: dict[str, Optional[str]] = {}
         variant_report = ""
@@ -295,7 +296,7 @@ class Executor:
                 gate_result = self._eval_gate(tool, manifest, variant, context)
                 if not gate_result:
                     logger.debug("[Executor] Gate SKIP — %s", tool.name)
-                    self.process_log.append({
+                    local_log.append({
                         "variant_index": variant_index,
                         "tool_name":     tool.name,
                         "gate":          "SKIP",
@@ -324,7 +325,7 @@ class Executor:
                 if output:
                     variant_report += output + "\n\n"
 
-                self.process_log.append({
+                local_log.append({
                     "variant_index": variant_index,
                     "tool_name":     tool.name,
                     "gate":          "PASS",
@@ -340,7 +341,7 @@ class Executor:
                 logger.error("[Executor] %s", error_note)
                 all_outputs[tool.name] = None
                 variant_report += error_note + "\n\n"
-                self.process_log.append({
+                local_log.append({
                     "variant_index": variant_index,
                     "tool_name":     tool.name,
                     "gate":          "PASS",
@@ -357,7 +358,7 @@ class Executor:
                 logger.exception("[Executor] Unexpected error in %s", tool.name)
                 all_outputs[tool.name] = None
                 variant_report += error_note + "\n\n"
-                self.process_log.append({
+                local_log.append({
                     "variant_index": variant_index,
                     "tool_name":     tool.name,
                     "gate":          "PASS",
@@ -366,7 +367,7 @@ class Executor:
                     "metadata":      None,
                 })
 
-        return variant_report.strip()
+        return variant_report.strip(), local_log
 
     # ── private ───────────────────────────────────────────────────────────────
 

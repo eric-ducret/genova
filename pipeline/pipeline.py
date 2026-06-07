@@ -30,7 +30,10 @@ from __future__ import annotations
 import re
 import logging
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
+
+MAX_WORKERS = 8
 
 from pipeline.config          import (
     DEFAULT_GENOME_BUILD,
@@ -323,29 +326,30 @@ class Pipeline:
                 if len(idxs) >= 2:
                     multi_gene_indices.update(idxs)
 
-            for i, (variant_ctx, variant) in enumerate(zip(context_slices, variants)):
-                gene = variant.get("Gene", "?")
-                hgvs = variant.get("HGVS", variant.get("Variant", "?"))
-                logger.info(
-                    "[Pipeline] Triage %d/%d — %s %s...", i + 1, n, gene, hgvs
-                )
+            def _triage_one(i: int) -> tuple[int, str, str]:
                 decision, justification = first_triage.run_one(
-                    variant_context=variant_ctx,
+                    variant_context=context_slices[i],
                     patient_phenotype=patient_phenotype,
                     llm=self._llm,
                 )
-                # Compound het exemption: override DISCARD → KEEP
-                if decision == "DISCARD" and i in multi_gene_indices:
-                    logger.info(
-                        "[Pipeline] Triage override: variant %d is compound-het candidate "
-                        "in gene %s — forced KEEP",
-                        i + 1, gene,
-                    )
-                    justification = (
-                        f"[compound-het exempt — original triage: DISCARD: {justification}]"
-                    )
-                    decision = "KEEP"
-                triage_results[i] = (decision, justification)
+                return i, decision, justification
+
+            workers = min(MAX_WORKERS, n)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_triage_one, i): i for i in range(n)}
+                for future in as_completed(futures):
+                    i, decision, justification = future.result()
+                    gene = variants[i].get("Gene", "?")
+                    if decision == "DISCARD" and i in multi_gene_indices:
+                        logger.info(
+                            "[Pipeline] Triage override: variant %d is compound-het "
+                            "candidate in gene %s — forced KEEP", i + 1, gene,
+                        )
+                        justification = (
+                            f"[compound-het exempt — original triage: DISCARD: {justification}]"
+                        )
+                        decision = "KEEP"
+                    triage_results[i] = (decision, justification)
         else:
             # No triage — all variants kept
             for i in range(n):
@@ -363,21 +367,23 @@ class Pipeline:
         inclusion_decisions: dict[int, str] = {}
         second_triage_justifications: dict[int, str] = {}
 
-        for pos, i in enumerate(kept_indices):
-            variant = variants[i]
-            gene    = variant.get("Gene", "?")
-            logger.info(
-                "[Pipeline] Reasoning %d/%d (variant idx %d) — %s...",
-                pos + 1, len(kept_indices), i, gene,
-            )
+        def _reason_one(i: int) -> tuple[int, str, str, str]:
             r = reasoning.run_one(variant_context=context_slices[i], llm=self._llm)
-            reasonings[i] = r
             decision, justification = reasoning.parse_inclusion_decision(r)
-            inclusion_decisions[i] = decision
-            second_triage_justifications[i] = justification
-            logger.info(
-                "[Pipeline] Variant %d (%s) second triage → %s", i + 1, gene, decision
-            )
+            return i, r, decision, justification
+
+        workers = min(MAX_WORKERS, len(kept_indices))
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {pool.submit(_reason_one, i): i for i in kept_indices}
+            for future in as_completed(futures):
+                i, r, decision, justification = future.result()
+                gene = variants[i].get("Gene", "?")
+                reasonings[i] = r
+                inclusion_decisions[i] = decision
+                second_triage_justifications[i] = justification
+                logger.info(
+                    "[Pipeline] Variant %d (%s) second triage → %s", i + 1, gene, decision
+                )
 
         # ── Inclusion split (direct from second_triage decisions) ────────────
         include_indices = [i for i in kept_indices if inclusion_decisions.get(i) == "INCLUDE"]
@@ -411,20 +417,26 @@ class Pipeline:
 
         # ── Stage 4: Per-variant conclusion (included variants only) ─────────
         conclusions: dict[int, str] = {}
-        for pos, i in enumerate(include_indices):
-            variant = variants[i]
-            gene    = variant.get("Gene", "NA")
-            ca      = cross_analyses.get(gene) if gene != "NA" else None
-            logger.info(
-                "[Pipeline] Conclusion %d/%d (variant idx %d) — %s...",
-                pos + 1, len(include_indices), i, gene,
-            )
-            conclusions[i] = conclusion.run_one(
+        def _conclude_one(i: int) -> tuple[int, str]:
+            gene = variants[i].get("Gene", "NA")
+            ca   = cross_analyses.get(gene) if gene != "NA" else None
+            return i, conclusion.run_one(
                 variant_context=context_slices[i],
                 reasoning=reasonings[i],
                 cross_analysis=ca,
                 llm=self._llm,
             )
+
+        workers = min(MAX_WORKERS, len(include_indices))
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {pool.submit(_conclude_one, i): i for i in include_indices}
+            for future in as_completed(futures):
+                i, conc = future.result()
+                conclusions[i] = conc
+                logger.info(
+                    "[Pipeline] Conclusion done for variant %d (%s).",
+                    i + 1, variants[i].get("Gene", "?"),
+                )
 
         # ── Stage 5: Final clinical conclusion (Tier 1 only) ─────────────────
         logger.info("[Pipeline] Generating final clinical conclusion...")

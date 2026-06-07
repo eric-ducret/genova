@@ -21,6 +21,7 @@ is removed entirely — it was a workaround, now superseded by the llm= construc
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -123,14 +124,14 @@ def thought_messages(user_input: str, tools: ToolRegistry,
     return [
         {"role": "system", "content": (
             f"You are a reasoning assistant.\n\nAvailable tools:\n{tools.description_block()}\n\n"
-            "Decide what must happen next. Explain your reasoning strategy clearly in your thought process.\n\n"
+            "Decide what must happen next.\n\n"
             "RULES:\n"
             "1. If a tool is strictly necessary, name exactly one tool in your sentence.\n"
             "2. Do NOT use a tool unless truly required.\n"
             "3. Check the pre-fetched evidence below to understand what has already been retrieved. "
             "Avoid searching for information already present there — focus on genuine gaps.\n"
-            "4. Your output must be ONE sentence starting with 'Thought:' and should convey your strategic reasoning.\n\n"
-            "OUTPUT: One sentence starting with 'Thought:' explaining your strategy for the next step."
+            "4. Output ONE sentence starting with 'Thought:' explaining your next step.\n\n"
+            "OUTPUT: One sentence starting with 'Thought:' — nothing before it, nothing after it."
         )},
         *conversation,
         {"role": "user", "content": (
@@ -197,8 +198,8 @@ def checkpoint_messages(user_input: str, scratchpad: list[str],
             "Say YES (sufficient) if primary gaps are filled or unresolvable by web search, "
             "and no critical secondary gap remains.\n"
             "Say NO (search needed) if any concrete gap above is still open.\n"
-            "When uncertain, say NO. "
-            "Reply ONLY 'yes' or 'no'."
+            "When uncertain, say NO.\n"
+            "Your entire response must be a single word: yes or no. No other text whatsoever."
         )},
         {"role": "user", "content": (
             f"Question: {user_input}\n\n"
@@ -224,16 +225,13 @@ def final_answer_messages(user_input: str, conversation: list[dict],
     )
     return [
         {"role": "system", "content": (
-            "You are a helpful assistant. Write a clear, direct final answer "
-            "to the user's question using all evidence provided below. "
-            "You are provided with the results from an agentic search process; "
-            "use this information to retrieve and synthesize the relevant evidences "
-            "that links (or does not link) the specified variant or gene to the disease, "
-            "as requested by the user. "
-            "Focus on extracting the most pertinent findings and presenting them "
-            "in a coherent, evidence-based conclusion. "
-            "Do NOT mention tools, steps, useless information or internal reasoning. "
-            "You MUST include links (https) to the evidences you mention in this conclusion. "
+            "You are a clinical genomics evidence synthesiser. "
+            "Write a clear, direct evidence summary using the sources provided below. "
+            "Synthesise the findings that link (or do not link) the variant or gene to the disease. "
+            "Include URLs for any sources cited. "
+            "Do NOT mention tools, search steps, or internal reasoning. "
+            "Begin directly with the evidence — do NOT write 'Thinking Process', 'Analysis', "
+            "'Let me', or any preamble before the content."
         )},
         *conversation,
         {"role": "user", "content": (
@@ -448,7 +446,18 @@ class WebSearchAgentTool(ReActTool):
 
     name        = "websearch_agent"
     description = "ReAct agent that searches the web and NCBI for variant-phenotype evidence."
-    _last_trace: list[str] | None = None
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._tl = threading.local()   # thread-local storage for _last_trace
+
+    @property
+    def _last_trace(self) -> list[str]:
+        return getattr(self._tl, "trace", [])
+
+    @_last_trace.setter
+    def _last_trace(self, value: list[str]) -> None:
+        self._tl.trace = value
 
     def gate(self, variant: dict, context: "ToolContext") -> bool:
         """

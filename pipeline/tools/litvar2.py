@@ -36,6 +36,7 @@ import re
 import json
 import time
 import logging
+import threading
 import requests
 import xml.etree.ElementTree as ET
 
@@ -102,10 +103,12 @@ class LitVar2SummaryTool(SLMTool):
 
     # CGD table cache — populated on first use, shared across all instances and variants
     _cgd_table: dict[str, list[str]] | None = None
+    _cgd_lock  = threading.Lock()
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._disease_query: str | None = None
+        self._disease_query_lock = threading.Lock()
 
     # ── gate ──────────────────────────────────────────────────────────────────
 
@@ -134,8 +137,8 @@ class LitVar2SummaryTool(SLMTool):
             "phenotypically overlapping categories that share causal genes "
             "(e.g. for Marfan syndrome: "
             "'marfan syndrome, connective tissue disorder, aortic aneurysm, ectopia lentis'). "
-            "Prefer terms indexed in MeSH. Lowercase, no punctuation except commas, no explanation, "
-            "no numbering."
+            "Prefer terms indexed in MeSH. Lowercase, no punctuation except commas. "
+            "Output ONLY the comma-separated terms — no explanation, no numbering, no preamble."
         )
         raw = context.llm.generate(
             system=system, user=context.patient_phenotype, max_tokens=60
@@ -249,7 +252,9 @@ class LitVar2SummaryTool(SLMTool):
     def _get_cgd_conditions(cls, gene: str) -> list[str]:
         """Return known CGD conditions for *gene*, loading the table on first call."""
         if cls._cgd_table is None:
-            cls._cgd_table = cls._load_cgd_table()
+            with cls._cgd_lock:
+                if cls._cgd_table is None:   # double-checked locking
+                    cls._cgd_table = cls._load_cgd_table()
         return cls._cgd_table.get(gene.upper(), [])
 
     # ── step 1: LitVar2 → PMIDs (rsID path) ──────────────────────────────────
@@ -408,7 +413,9 @@ class LitVar2SummaryTool(SLMTool):
             "Cite sources inline using (PMID:XXXXXXXX) immediately after the relevant claim. "
             "If no abstract contains relevant evidence, write one sentence saying so. "
             "Do NOT use bullet points, headers, or raw URLs. "
-            "Do NOT mention abstracts or papers explicitly, just report the findings naturally."
+            "Do NOT mention abstracts or papers explicitly, just report the findings naturally. "
+            "Begin directly with the summary — do NOT write 'Thinking Process', 'Analysis', "
+            "or any preamble before the paragraph."
         )
         user = (
             f"Research question: {question}\n"
@@ -725,7 +732,9 @@ class LitVar2SummaryTool(SLMTool):
         gene = context.field("Gene")
 
         if self._disease_query is None:
-            self._disease_query = self._resolve_disease_query(context)
+            with self._disease_query_lock:
+                if self._disease_query is None:   # double-checked locking
+                    self._disease_query = self._resolve_disease_query(context)
 
         rsid_ok = rsid != "NA" and re.match(r"^rs\d+$", rsid, re.IGNORECASE) is not None
         gene_ok = gene != "NA" and gene.strip() != ""
