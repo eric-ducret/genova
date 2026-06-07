@@ -19,8 +19,11 @@ CSV / Excel  ──►  normalize_upload()
              Pipeline.run(variants, phenotype)
                         │
         ┌─────────────────────────────────────────┐
-        │  Stage 1 — Retrieval (all variants)      │
+        │  Stage 1 — Retrieval                     │
+        │  32 variants processed in parallel       │
+        │  (ThreadPoolExecutor, MAX_WORKERS=32)    │
         │                                          │
+        │  per variant:                            │
         │  order 1 parallel: LitVar2  SpliceAI     │
         │  order 2 parallel: AutoPVS1              │
         │  order 3 serial:   WebSearchAgentTool    │
@@ -34,6 +37,7 @@ CSV / Excel  ──►  normalize_upload()
                        ▼
         ┌─────────────────────────────────────────┐
         │  Stage 2 — Reasoning + Second Triage     │
+        │  32 variants in parallel                 │
         │  per kept variant:                       │
         │   call 1 → step-by-step reasoning        │
         │   call 2 → INCLUDE / EXCLUDE decision    │
@@ -49,6 +53,7 @@ CSV / Excel  ──►  normalize_upload()
                        ▼
         ┌─────────────────────────────────────────┐
         │  Stage 4 — Per-variant Conclusion        │
+        │  32 variants in parallel                 │
         │  one SLM call per included variant       │
         └──────────────┬──────────────────────────┘
                        │
@@ -65,9 +70,12 @@ CSV / Excel  ──►  normalize_upload()
 sbatch launch.sh
 ```
 
-`launch.sh` starts two processes in the same job allocation:
-1. **vLLM server** on the GPU (serves Qwen/Qwen3.5-9B via OpenAI-compatible HTTP)
-2. **FastAPI server** on CPU (pipeline logic, calls vLLM for SLM steps)
+`batch_vllm.sh` starts vLLM then runs the batch pipeline:
+1. **vLLM server** — `Qwen/Qwen3.5-9B`, `--max-model-len 16384`, `--gpu-memory-utilization 0.90`
+2. **batch.py** — processes a folder of variant CSV files, 32 variants in parallel per run
+
+vLLM takes several minutes to initialize (Qwen3.5 hybrid Mamba architecture). The
+startup script polls for up to 5 minutes before proceeding.
 
 ---
 

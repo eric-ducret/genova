@@ -183,9 +183,18 @@ class LLMClient(ABC):
 Calls the vLLM OpenAI-compatible HTTP endpoint (`/v1/chat/completions`).
 Supports async via `httpx.AsyncClient`. Used in production.
 
+Every request includes `"chat_template_kwargs": {"enable_thinking": False}` — this
+is the vLLM equivalent of the `enable_thinking=False` flag that the HF tokenizer
+applies via `apply_chat_template`. Without it, Qwen3.5-9B generates plain-text
+"Thinking Process:" preambles in non-thinking mode that contaminate downstream
+context and break output parsers. A `_strip_thinking_header()` regex is also applied
+to every response as a defensive fallback.
+
 **`hf_client.py`** — fallback for local dev without GPU.
 Wraps `transformers.pipeline("text-generation")`.
 Same interface, slower. Useful for testing tool logic without a running vLLM server.
+Applies `enable_thinking=False` via `tokenizer.apply_chat_template` — this is what
+prevents thinking preambles in HF mode and was the reference for the vLLM fix.
 
 ### Model registry
 
@@ -207,7 +216,10 @@ def get_client(model_name: str, **kwargs) -> LLMClient:
 
 **Qwen3.5 note:** `enable_thinking` must always be `False` in this pipeline.
 The thinking mode produces chain-of-thought tokens that bloat the context and
-break downstream parsing. This is enforced at the registry level, not per-tool.
+break downstream parsing. For the HF client this is enforced via
+`tokenizer.apply_chat_template(..., enable_thinking=False)`. For the vLLM client
+it is enforced via `"chat_template_kwargs": {"enable_thinking": False}` in the
+request payload — the two are equivalent but use different APIs.
 
 ---
 
@@ -465,21 +477,29 @@ executor is in async mode. Tools at different order values run sequentially
 This allows expressing dependencies: a compression tool at order 99 sees the
 full accumulated `variant_report` from all earlier tools.
 
-### Parallelism modes
+### Parallelism
 
-Configured globally in `pipeline/config.py`:
+All pipeline stages use a `ThreadPoolExecutor` with `MAX_WORKERS = 32` (set in
+both `pipeline/stages/retrieval.py` and `pipeline/pipeline.py`). Variants are
+processed concurrently; tools within each variant still run in manifest order.
 
-```python
-EXECUTION_MODE = "async"   # "async" | "sequential"
-```
+vLLM's continuous batching handles concurrent HTTP requests natively — parallel
+threads translate directly into higher GPU throughput without any special async
+plumbing in the pipeline.
 
-- `sequential` — variants processed one by one, tools within each variant run in order.
-  Safest, easiest to debug, sufficient for ≤10 variants.
-- `async` — variants processed concurrently via `asyncio.gather`.
-  Tools marked `parallel: true` at the same order level run concurrently within each variant.
-  Recommended for production on A100 node with vLLM serving async requests.
+Thread-safety requirements:
+- `executor.run_variant()` returns `(mini_doc, log_entries)` — no shared state mutated.
+- `LitVar2SummaryTool._disease_query` and `_cgd_table` are initialized with
+  double-checked locking (`threading.Lock()`).
+- `WebSearchAgentTool._last_trace` uses `threading.local()` to avoid cross-thread
+  contamination.
 
-Switching between modes requires no changes to tool code.
+GPU KV cache math for the A100 40 GB (Qwen3.5-9B bfloat16):
+- Model weights: ~18 GB → KV cache pool: ~18 GB (at `--gpu-memory-utilization 0.90`)
+- ~112 KB per token; 32 workers × ~3000 tokens each ≈ 10.7 GB — well within budget.
+- Beyond ~48 workers vLLM starts queuing rather than crashing; latency increases.
+
+To change worker count, edit `MAX_WORKERS` in both files (one line each).
 
 ---
 
@@ -543,7 +563,8 @@ molecular mechanism → inheritance coherence → flags and uncertainties.
 **Call 2 — second triage** (`prompts/second_triage.txt`): takes the variant context
 and the reasoning from call 1 and emits a structured inclusion decision. Decoupling
 the decision from the narrative prevents the model from forcing a favourable outcome
-to justify speculative reasoning.
+to justify speculative reasoning. `MAX_NEW_TOKENS_SCORING = 400` — budget is large
+enough to accommodate any residual thinking preamble before the three decision lines.
 
 SLM output format for second triage:
 ```
@@ -610,6 +631,11 @@ This stage is separate from Stage 4 so that each variant's block can be generate
 individually (reducing SLM memory pressure) while the overall summary still has
 visibility across all variants.
 
+The combined conclusions text is truncated to 50 000 characters before the LLM
+call (`_MAX_CONCLUSIONS_CHARS`) to prevent a `400 Bad Request` from vLLM when a
+large number of variants are included and the combined text exceeds
+`--max-model-len 16384` tokens.
+
 ---
 
 ## Deployment
@@ -622,25 +648,37 @@ visibility across all variants.
 
 ```bash
 #!/bin/bash
-#SBATCH --job-name=variant-pipeline
+#SBATCH --job-name=variant_batch
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:a100:1
-#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --mem=40G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=08:00:00
 
 # Start vLLM server
 vllm serve Qwen/Qwen3.5-9B \
     --dtype bfloat16 \
-    --max-model-len 32768 \
-    --port 8001 &
+    --max-model-len 16384 \
+    --gpu-memory-utilization 0.90 \
+    --port 8001 \
+    --enable-prefix-caching \
+    > vllm_startup.log 2>&1 &
 
-# Wait for vLLM to be ready
-sleep 60
+# Poll until ready (Qwen3.5 Mamba architecture takes several minutes to initialize)
+for i in $(seq 1 60); do
+    curl -sf http://localhost:8001/v1/models > /dev/null 2>&1 && break
+    sleep 5
+done
 
-# Start FastAPI server
-uvicorn server:app --host 0.0.0.0 --port 8000
+# Run batch pipeline
+python batch.py "$JOBS_FOLDER" --backend vllm
 ```
+
+`--max-model-len 16384` — keeps KV cache within the 40 GB A100 budget.
+`--gpu-memory-utilization 0.90` — reserves headroom to avoid OOM during concurrent requests.
+`--enable-prefix-caching` — reuses KV cache for shared prompt prefixes across requests.
+Startup polling uses 60 attempts × 5 s = 5 minutes; Qwen3.5's hybrid Mamba
+architecture needs this much time on first load.
 
 ### Local / dev
 

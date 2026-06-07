@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 8
+MAX_WORKERS = 32
 
 
 def _variant_dict_to_str(variant: dict) -> str:

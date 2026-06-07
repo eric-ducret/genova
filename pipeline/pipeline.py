@@ -33,7 +33,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
-MAX_WORKERS = 8
+MAX_WORKERS = 32
 
 from pipeline.config          import (
     DEFAULT_GENOME_BUILD,
