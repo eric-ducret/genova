@@ -422,7 +422,7 @@ class LitVar2SummaryTool(SLMTool):
             f"Abstracts:\n{corpus}"
         )
 
-        return context.llm.generate(system=system, user=user, max_tokens=800).strip()
+        return context.llm.generate(system=system, user=user, max_tokens=400).strip()
 
     # ── primary: gene-level PubMed search ────────────────────────────────────
 

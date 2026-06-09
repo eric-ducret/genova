@@ -44,11 +44,11 @@ class AgentConfig:
     top_p:               float = 0.8
     do_sample:           bool  = True
     max_steps:           int   = 4
-    tokens_thought:      int   = 110
+    tokens_thought:      int   = 50
     tokens_action_pick:  int   = 15
     tokens_action_input: int   = 60
     tokens_checkpoint:   int   = 15
-    tokens_final:        int   = 600
+    tokens_final:        int   = 300
 
 
 # ─────────────────────────────────────────────

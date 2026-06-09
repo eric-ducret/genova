@@ -114,7 +114,7 @@ def run_one(
         raw = llm.generate(
             system=_SYSTEM_PROMPT,
             user=user_prompt,
-            max_tokens=150,
+            max_tokens=100,
         )
     except Exception as exc:
         logger.warning("[FirstTriage] SLM call failed: %s — defaulting to KEEP", exc)
