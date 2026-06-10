@@ -188,7 +188,6 @@ def checkpoint_messages(user_input: str, scratchpad: list[str],
             "You are a search decision checker for a clinical genomics pipeline. "
             "Given the available evidence, decide whether further web search is needed.\n\n"
             "Primary gaps to check first (prefer these over PubMed):\n"
-            "- OMIM or GeneReviews entry for this gene\n"
             "- ClinVar submitter details or review status\n"
             "- Functional or experimental data for this specific variant\n"
             "- Recent preprints or clinical case reports\n\n"
