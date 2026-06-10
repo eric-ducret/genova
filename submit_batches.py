@@ -8,7 +8,7 @@ the walltime budget.  Then submits all batches via:
 
     sbatch batch_pheno_vllm.sh <batch_number> <jobs_folder> <n_batches>
 
-Calibration:  171 variants ≈ 12.5 min  →  ~0.073 min/variant.
+Calibration:  171 variants ≈ 20 min (no API key) / 15 min (with NCBI_API_KEY).
 Overhead:     vLLM startup adds ~10 min to every job.
 
 Usage:
@@ -21,6 +21,7 @@ Usage:
 import argparse
 import csv
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,7 +31,11 @@ _PHENO_CSV        = _SCRIPT_DIR / "pheno_prompts.csv"
 _SBATCH_SCRIPT    = _SCRIPT_DIR / "batch_pheno_vllm.sh"
 _MAX_VARIANTS     = 600
 _VLLM_STARTUP_MIN = 10      # minutes added per job for vLLM startup
-_MINS_PER_VARIANT = 12.5 / 171  # calibrated: 171-variant patient ≈ 12.5 min
+# Calibration notes (171-variant patient):
+#   Without NCBI API key (3 req/s, serialised):  ~20 min → 0.117 min/variant
+#   With    NCBI API key (10 req/s, serialised):  ~15 min → 0.088 min/variant
+# Free key: https://www.ncbi.nlm.nih.gov/account/  → set NCBI_API_KEY env var.
+_MINS_PER_VARIANT = 0.088 if os.environ.get("NCBI_API_KEY") else 0.117
 
 
 def _load_eligible() -> list[int]:

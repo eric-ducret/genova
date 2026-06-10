@@ -32,6 +32,7 @@ Search strategy (gene-first, three tracks):
 
 import gzip
 import io
+import os
 import re
 import json
 import time
@@ -51,22 +52,52 @@ logger = logging.getLogger(__name__)
 LITVAR2_BASE = "https://www.ncbi.nlm.nih.gov/research/litvar2-api"
 LITVAR2_URL  = f"{LITVAR2_BASE}/variant/get/litvar@{{rsid}}%23%23/publications"
 NCBI_BASE    = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-NCBI_DELAY   = 0.34           # stay under 3 req/s
+# Without API key: 3 req/s → 0.34 s delay.  With API key: 10 req/s → 0.11 s delay.
+# Set NCBI_API_KEY env var (free key from https://www.ncbi.nlm.nih.gov/account/).
+NCBI_API_KEY = os.environ.get("NCBI_API_KEY", "")
+NCBI_DELAY   = 0.11 if NCBI_API_KEY else 0.34
 CGD_URL      = "https://research.nhgri.nih.gov/CGD/download/txt/CGD.txt.gz"
 CGD_MAX_CONDITIONS = 3        # cap OR terms from CGD to keep the query focused
 
 MAX_PMIDS     = 40             # hard cap on PMIDs fetched from LitVar2
 TOP_N_PAPERS  = 8              # how many titles the SLM keeps
-MAX_CHARS     = 600            # abstract truncation per paper
+MAX_CHARS     = 1200           # abstract truncation per paper (~full abstract)
 DEFAULT_TIMEOUT = 15
+
+# Global rate limiter: serialises NCBI/LitVar2 request slots across all threads.
+# With 32 concurrent workers, per-thread sleep(0.34) would burst 32 requests at
+# once.  This lock + timestamp ensures at most 1 request every NCBI_DELAY seconds
+# globally, staying within NCBI's 3 req/s unauthenticated limit.
+_NCBI_RATE_LOCK      = threading.Lock()
+_NCBI_LAST_CALL_TIME = 0.0
+
+
+def _ncbi_rate_limit() -> None:
+    global _NCBI_LAST_CALL_TIME
+    with _NCBI_RATE_LOCK:
+        elapsed = time.time() - _NCBI_LAST_CALL_TIME
+        wait = NCBI_DELAY - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        _NCBI_LAST_CALL_TIME = time.time()
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _ncbi_get(endpoint: str, params: dict, timeout: int = DEFAULT_TIMEOUT) -> requests.Response:
-    time.sleep(NCBI_DELAY)
-    resp = requests.get(f"{NCBI_BASE}/{endpoint}", params=params, timeout=timeout)
-    resp.raise_for_status()
+    _ncbi_rate_limit()
+    if NCBI_API_KEY:
+        params = {**params, "api_key": NCBI_API_KEY}
+    for attempt in range(4):
+        resp = requests.get(f"{NCBI_BASE}/{endpoint}", params=params, timeout=timeout)
+        if resp.status_code == 429:
+            wait = 2.0 ** attempt   # 1s, 2s, 4s, 8s
+            logger.warning("NCBI rate limit (429) — backing off %.0fs (attempt %d/4)", wait, attempt + 1)
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp
+    resp.raise_for_status()  # re-raise on final attempt
     return resp
 
 
@@ -263,8 +294,17 @@ class LitVar2SummaryTool(SLMTool):
         url = LITVAR2_URL.format(rsid=rsid)
         logger.debug("LitVar2 fetch: %s", url)
         try:
-            resp = requests.get(url, timeout=self.timeout)
-            resp.raise_for_status()
+            _ncbi_rate_limit()
+            api_params = {"api_key": NCBI_API_KEY} if NCBI_API_KEY else {}
+            for attempt in range(4):
+                resp = requests.get(url, params=api_params, timeout=self.timeout)
+                if resp.status_code == 429:
+                    wait = 2.0 ** attempt
+                    logger.warning("LitVar2 rate limit (429) — backing off %.0fs (attempt %d/4)", wait, attempt + 1)
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                break
             data = resp.json()
         except Exception as e:
             raise ToolFetchError(f"LitVar2 API request failed for {rsid}: {e}") from e

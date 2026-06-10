@@ -11,6 +11,7 @@ enable_thinking is always silently forced to False per pipeline design rules.
 from __future__ import annotations
 
 import re
+import time
 import httpx
 
 from pipeline.llm.base import LLMClient
@@ -42,7 +43,7 @@ class VLLMClient(LLMClient):
         self,
         base_url: str = "http://localhost:8001",
         model_id: str = "Qwen/Qwen3.5-9B",
-        request_timeout: float = 120.0,
+        request_timeout: float = 300.0,
         **kwargs,
     ):
         self.base_url       = base_url.rstrip("/")
@@ -68,13 +69,22 @@ class VLLMClient(LLMClient):
             "temperature": temperature,
             "chat_template_kwargs": {"enable_thinking": False},
         }
-        with httpx.Client(timeout=self.request_timeout) as client:
-            resp = client.post(
-                f"{self.base_url}/v1/chat/completions",
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        _retries = 2
+        _backoff  = 15.0
+        for attempt in range(_retries + 1):
+            try:
+                with httpx.Client(timeout=self.request_timeout) as client:
+                    resp = client.post(
+                        f"{self.base_url}/v1/chat/completions",
+                        json=payload,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                break
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as exc:
+                if attempt == _retries:
+                    raise
+                time.sleep(_backoff * (attempt + 1))
 
         raw = data["choices"][0]["message"]["content"].strip()
         return _strip_thinking_header(raw)

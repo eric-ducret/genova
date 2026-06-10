@@ -14,6 +14,7 @@ name/description fields, but override run(query: str) for ReActAgent compatibili
 
 import re
 import time
+import threading
 import logging
 import requests
 import urllib.request
@@ -35,6 +36,36 @@ NCBI_MIN_DELAY = 0.34          # seconds between calls → stays under 3 req/s l
 DEFAULT_TIMEOUT  = 15          # seconds
 DEFAULT_MAX_CHARS = 3000       # safe default — main.py can override per tool instance
 
+# Global rate limiters — enforce minimum intervals per process across all threads.
+# With 32 workers, per-thread sleeps are ineffective: all threads sleep independently
+# and fire simultaneously.  These locks serialise the request slots instead.
+_NCBI_WS_RATE_LOCK      = threading.Lock()
+_NCBI_WS_LAST_CALL_TIME = 0.0
+
+_DDG_RATE_LOCK      = threading.Lock()
+_DDG_LAST_CALL_TIME = 0.0
+_DDG_DELAY          = 2.0   # DuckDuckGo: 1 search per 2s per process
+
+
+def _ncbi_ws_rate_limit() -> None:
+    global _NCBI_WS_LAST_CALL_TIME
+    with _NCBI_WS_RATE_LOCK:
+        elapsed = time.time() - _NCBI_WS_LAST_CALL_TIME
+        wait = NCBI_MIN_DELAY - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        _NCBI_WS_LAST_CALL_TIME = time.time()
+
+
+def _ddg_rate_limit() -> None:
+    global _DDG_LAST_CALL_TIME
+    with _DDG_RATE_LOCK:
+        elapsed = time.time() - _DDG_LAST_CALL_TIME
+        wait = _DDG_DELAY - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        _DDG_LAST_CALL_TIME = time.time()
+
 # Country-code TLDs whose content is predominantly non-English
 _NON_ENGLISH_TLDS = {
     ".ru", ".ua", ".by", ".kz",          # Russian-speaking
@@ -55,13 +86,21 @@ NON_ASCII_THRESHOLD = 0.3     # reject page if >30 % of chars are non-ASCII
 def _ncbi_get(endpoint: str, params: dict, timeout: int = DEFAULT_TIMEOUT) -> requests.Response:
     """
     Wrapper around NCBI E-utilities GET requests.
-    Enforces the minimum delay to respect the 3 req/s rate limit.
-    Raises requests.HTTPError on bad status codes.
+    Uses a global rate limiter (not per-thread sleep) to stay under 3 req/s.
+    Retries up to 4 times on 429 with exponential backoff.
     """
-    time.sleep(NCBI_MIN_DELAY)
     url = f"{NCBI_BASE}/{endpoint}"
     logger.debug("NCBI GET %s params=%s", endpoint, params)
-    resp = requests.get(url, params=params, timeout=timeout)
+    for attempt in range(4):
+        _ncbi_ws_rate_limit()
+        resp = requests.get(url, params=params, timeout=timeout)
+        if resp.status_code == 429:
+            wait = 2.0 ** attempt
+            logger.warning("NCBI rate limit (429) — backing off %.0fs (attempt %d/4)", wait, attempt + 1)
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp
     resp.raise_for_status()
     return resp
 
@@ -166,6 +205,7 @@ class WebSearchTool(NetworkTool):
         logger.debug("WebSearchTool query=%r max_results=%d", query, self.max_results)
 
         try:
+            _ddg_rate_limit()
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=self.max_results, region="us-en"))
         except Exception as e:

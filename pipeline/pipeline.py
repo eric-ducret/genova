@@ -33,7 +33,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
-MAX_WORKERS = 32
+MAX_WORKERS          = 32   # retrieval (network tools, I/O bound)
+MAX_WORKERS_LLM      = 16   # reasoning/conclusion (vLLM calls, GPU-bound)
 
 from pipeline.config          import (
     DEFAULT_GENOME_BUILD,
@@ -372,12 +373,23 @@ class Pipeline:
             decision, justification = reasoning.parse_inclusion_decision(r)
             return i, r, decision, justification
 
-        workers = min(MAX_WORKERS, len(kept_indices))
+        workers = min(MAX_WORKERS_LLM, len(kept_indices))
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             futures = {pool.submit(_reason_one, i): i for i in kept_indices}
             for future in as_completed(futures):
-                i, r, decision, justification = future.result()
+                i = futures[future]
                 gene = variants[i].get("Gene", "?")
+                try:
+                    i, r, decision, justification = future.result()
+                except Exception as exc:
+                    logger.error(
+                        "[Pipeline] Reasoning failed for variant %d (%s): %s — marking EXCLUDE",
+                        i + 1, gene, exc,
+                    )
+                    reasonings[i] = f"[REASONING FAILED: {exc}]"
+                    inclusion_decisions[i] = "EXCLUDE"
+                    second_triage_justifications[i] = f"reasoning error: {exc}"
+                    continue
                 reasonings[i] = r
                 inclusion_decisions[i] = decision
                 second_triage_justifications[i] = justification
@@ -427,7 +439,7 @@ class Pipeline:
                 llm=self._llm,
             )
 
-        workers = min(MAX_WORKERS, len(include_indices))
+        workers = min(MAX_WORKERS_LLM, len(include_indices))
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             futures = {pool.submit(_conclude_one, i): i for i in include_indices}
             for future in as_completed(futures):

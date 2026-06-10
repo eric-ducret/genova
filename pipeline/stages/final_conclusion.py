@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "final_conclusion.txt"
 
-MAX_NEW_TOKENS_FINAL_CONCLUSION = 300
+MAX_NEW_TOKENS_FINAL_CONCLUSION = 600
 
 # With --max-model-len 16384, leave 2000 tokens for prompt template + output.
 # ~4 chars per token → 14384 × 4 = 57536 chars safe budget for the conclusions block.

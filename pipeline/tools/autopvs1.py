@@ -28,6 +28,8 @@ Pipeline class:
 
 import re
 import logging
+import threading
+import time
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlencode
@@ -146,6 +148,22 @@ _AUTOPVS1_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; PythonScript/1.0)",
 }
 
+# Per-process rate limiter: autopvs1.bgi.com is a free public service.
+# 1 req/s per process → 6 parallel jobs = ~6 req/s total.
+_AUTOPVS1_RATE_LOCK      = threading.Lock()
+_AUTOPVS1_LAST_CALL_TIME = 0.0
+_AUTOPVS1_DELAY          = 1.0
+
+
+def _autopvs1_rate_limit() -> None:
+    global _AUTOPVS1_LAST_CALL_TIME
+    with _AUTOPVS1_RATE_LOCK:
+        elapsed = time.time() - _AUTOPVS1_LAST_CALL_TIME
+        wait = _AUTOPVS1_DELAY - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        _AUTOPVS1_LAST_CALL_TIME = time.time()
+
 
 def _is_valid_hgvs(s: str) -> bool:
     """True if s looks like a transcript HGVS cDNA string (NM_xxx:c.xxx or NR_xxx:c.xxx)."""
@@ -162,6 +180,7 @@ def fetch_variant_data(variant_id: str, hg: str = "hg19") -> dict | None:
     url = f"https://autopvs1.bgi.com/variant/{_norm_build(hg)}/{variant_id}"
     print(f"[AutoPVS1] VCF fetch: {url}")
     try:
+        _autopvs1_rate_limit()
         response = requests.get(url, headers=_AUTOPVS1_HEADERS, timeout=15)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
@@ -188,6 +207,7 @@ def fetch_variant_data_search(
     url = "https://autopvs1.bgi.com/search?" + urlencode(params)
     print(f"[AutoPVS1] HGVS search: {url}")
     try:
+        _autopvs1_rate_limit()
         response = requests.get(url, headers=_AUTOPVS1_HEADERS, timeout=15)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:

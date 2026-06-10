@@ -14,6 +14,8 @@ Public pipeline class:
   SpliceAITool — NetworkTool
 """
 
+import threading
+import time
 import requests
 
 from pipeline.tools.base import NetworkTool
@@ -31,6 +33,23 @@ SPLICEAI_API = {
     "19": "https://spliceai-37-xwkwwwxdwq-uc.a.run.app/spliceai/",
     "37": "https://spliceai-37-xwkwwwxdwq-uc.a.run.app/spliceai/",
 }
+
+# Per-process rate limiter: 1 req/s → 6 parallel jobs = ~6 req/s total on the API.
+# Without this, 32 workers per job burst all requests simultaneously → 429s.
+_SPLICEAI_RATE_LOCK      = threading.Lock()
+_SPLICEAI_LAST_CALL_TIME = 0.0
+_SPLICEAI_DELAY          = 1.0   # seconds between requests within this process
+
+
+def _spliceai_rate_limit() -> None:
+    global _SPLICEAI_LAST_CALL_TIME
+    with _SPLICEAI_RATE_LOCK:
+        elapsed = time.time() - _SPLICEAI_LAST_CALL_TIME
+        wait = _SPLICEAI_DELAY - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        _SPLICEAI_LAST_CALL_TIME = time.time()
+
 
 SCORE_KEYS   = ["DS_AG", "DS_AL", "DS_DG", "DS_DL"]
 POS_KEYS     = ["DP_AG", "DP_AL", "DP_DG", "DP_DL"]
@@ -145,8 +164,18 @@ def fetch_and_format_spliceai(
     print(f"[SpliceAI] Querying: {variant_id} (hg{hg_param})")
 
     try:
-        r = requests.get(base_url, params=params, timeout=timeout)
-        r.raise_for_status()
+        for attempt in range(4):
+            _spliceai_rate_limit()
+            r = requests.get(base_url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                wait = 2.0 ** attempt   # 1s, 2s, 4s, 8s
+                print(f"[SpliceAI] 429 rate limit — backing off {wait:.0f}s (attempt {attempt + 1}/4)")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            break
+        else:
+            raise requests.exceptions.RequestException(f"SpliceAI returned 429 after 4 attempts for {variant_id}")
     except requests.exceptions.Timeout as e:
         raise ToolFetchError(f"SpliceAI request timed out for {variant_id}") from e
     except requests.exceptions.RequestException as e:

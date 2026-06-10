@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "conclusion.txt"
 
-MAX_NEW_TOKENS_REPORT = 500
+MAX_NEW_TOKENS_REPORT = 700
 
 
 def _validate_citations(result: str, context: str) -> str:

@@ -35,10 +35,10 @@ _REASONING_PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "reas
 _SCORING_PROMPT_PATH   = Path(__file__).parent.parent.parent / "prompts" / "second_triage.txt"
 
 # Call 1: step-by-step narrative — no score, citation-only rules apply
-MAX_NEW_TOKENS_REASONING = 1000
+MAX_NEW_TOKENS_REASONING = 1500
 # Call 2: three-line Include-case / Exclude-case / Decision block
-# 150 is ample for the 3-line decision; enable_thinking=False keeps preamble absent.
-MAX_NEW_TOKENS_SCORING   = 150
+# 200 gives headroom for any residual preamble before the 3 structured lines.
+MAX_NEW_TOKENS_SCORING   = 200
 
 _INCLUDE_CASE_RE = re.compile(r"Include-case:\s*(.+)", re.IGNORECASE)
 _EXCLUDE_CASE_RE = re.compile(r"Exclude-case:\s*(.+)", re.IGNORECASE)
