@@ -446,8 +446,10 @@ _CLEAR_LOF_TYPES = {
 }
 
 # Variant types that unambiguously do NOT warrant PVS1
+# NOTE: "synonymous" and "silent" are intentionally excluded — synonymous variants
+# at exon boundaries can disrupt exonic splice enhancers or create cryptic sites.
 _CLEAR_NON_LOF_TYPES = {
-    "missense", "synonymous", "silent", "utr", "utr3", "utr5",
+    "missense", "utr", "utr3", "utr5",
     "intergenic", "upstream", "downstream",
 }
 
@@ -491,11 +493,6 @@ class AutoPVS1Tool(NetworkTool):
             print(f"[PVS1 gate] NO (rule) — type: {type_val}")
             return False
 
-        # Synonymous: protein annotation ends with = e.g. p.(Ser47=)
-        if re.search(r"p\.\([a-z]+\d+=\)", hgvs_val):
-            print(f"[PVS1 gate] NO (synonymous hgvs) — hgvs: {hgvs_val}")
-            return False
-
         # Deep intronic: offset > 10 bp from exon boundary
         deep = re.search(r"[+\-](\d+)[acgt]", hgvs_val)
         if deep and int(deep.group(1)) > 10:
@@ -518,10 +515,12 @@ class AutoPVS1Tool(NetworkTool):
                 "Should the PVS1 ACMG criterion be evaluated for this variant?\n"
                 f"Type: {type_val}\n"
                 f"HGVS: {hgvs_val}\n\n"
-                "Answer YES only if this is a loss-of-function variant: frameshift, "
+                "Answer YES if this is a loss-of-function variant: frameshift, "
                 "nonsense/stop-gain, canonical splice site (±1 or ±2 bp from exon), "
                 "start-loss, or exon-spanning deletion/duplication.\n"
-                "Answer NO for missense, synonymous, deep intronic, or UTR variants."
+                "Answer YES also for synonymous variants that could disrupt splicing "
+                "(last base of exon, exonic splice enhancer position, or near splice site).\n"
+                "Answer NO for missense, deep intronic (>10 bp from exon), or UTR variants."
             ),
             max_tokens=5,
         )
