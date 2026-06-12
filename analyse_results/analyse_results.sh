@@ -8,11 +8,13 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=eric.ducret@unil.ch
 
-# Usage: sbatch analyse_results/analyse_results.sh [results_dir] [workers]
-#   results_dir  — path to results folder (default: <project_root>/results)
-#   workers      — parallel SLM workers   (default: 8)
+# Usage: sbatch analyse_results/analyse_results.sh [results_dir] [workers] [ground_truth_csv]
+#   results_dir       — path to results folder (default: <project_root>/results)
+#   workers           — parallel SLM workers   (default: 8)
+#   ground_truth_csv  — CSV with patient_id,expert_gene columns (optional)
 RESULTS_DIR="${1:-}"
 WORKERS="${2:-8}"
+GROUND_TRUTH="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -62,12 +64,11 @@ for i in $(seq 1 60); do
     sleep 5
 done
 
-# --- Run analyse_results ---
+# --- Build argument list ---
 cd "$PROJECT_DIR"
 
 EXTRA_ARGS=""
-if [ -n "$RESULTS_DIR" ]; then
-    EXTRA_ARGS="--results-dir $RESULTS_DIR"
-fi
+[ -n "$RESULTS_DIR" ]   && EXTRA_ARGS="$EXTRA_ARGS --results-dir $RESULTS_DIR"
+[ -n "$GROUND_TRUTH" ]  && EXTRA_ARGS="$EXTRA_ARGS --ground-truth $GROUND_TRUTH"
 
 python analyse_results/analyse_results.py $EXTRA_ARGS --workers "$WORKERS"
