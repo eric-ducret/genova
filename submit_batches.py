@@ -53,7 +53,11 @@ def _load_eligible() -> list[int]:
             if str(row.get("is_solution_here", "0")).strip() != "1":
                 n_no_solution += 1
                 continue
-            n = int(row["n_variants"])
+            try:
+                n = int(row["n_variants"])
+            except (ValueError, KeyError):
+                print(f"  Warning: skipping row with invalid n_variants={row.get('n_variants')!r}")
+                continue
             if n <= _MAX_VARIANTS:
                 eligible_variants.append(n)
     if n_not_solved:
@@ -112,6 +116,10 @@ def main() -> None:
     eligible = _load_eligible()
     total    = len(eligible)
 
+    if not eligible:
+        print("ERROR: no eligible patients found after filtering.", file=sys.stderr)
+        sys.exit(1)
+
     avg_variants = sum(eligible) / len(eligible)
 
     if args.patients_per_batch:
@@ -155,7 +163,7 @@ def main() -> None:
             else:
                 job_id = result.stdout.strip()
                 print(f"  Batch {i}/{n_batches}: {job_id}")
-            submitted += 1
+                submitted += 1
 
     if not args.dry_run:
         print(f"\nSubmitted {submitted}/{n_batches} jobs.")

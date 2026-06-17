@@ -287,15 +287,16 @@ class SpliceAITool(NetworkTool):
     mask: int = 0
 
     def gate(self, variant: dict, context: ToolContext) -> bool:
-        # Always run if a pre-computed score is available — run() will format it
-        if context.field("SpliceAI_score") != "NA":
-            return True
-
-        # Skip variant types that cannot have splice impact
+        # Skip variant types that cannot have splice impact (checked before pre-computed score
+        # so an intergenic ANNOVAR score is not injected into a context where it is meaningless)
         type_val = variant.get("Type", "").lower().strip()
         if any(t in type_val for t in _NO_SPLICE_TYPES):
             print(f"[SpliceAI gate] SKIP — type: {type_val!r}")
             return False
+
+        # If a pre-computed score exists, run() will format it directly (no API call needed)
+        if context.field("SpliceAI_score") != "NA":
+            return True
 
         # Require resolvable coordinates (needed for the API call)
         coords = parse_variant_coords(

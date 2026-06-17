@@ -157,6 +157,17 @@ def _normalize_type(raw: str) -> str:
     return _TYPE_MAP.get(raw.strip().lower(), raw)
 
 
+def _parse_spliceai_score(raw: str) -> str:
+    """Normalize SpliceAI_score: ANNOVAR writes four pipe-separated delta scores → extract max."""
+    if raw == "NA":
+        return "NA"
+    try:
+        vals = [float(x) for x in raw.split("|") if x.strip() not in ("", ".")]
+        return str(round(max(vals), 4)) if vals else "NA"
+    except ValueError:
+        return raw  # already a plain float string
+
+
 def _parse_aachange(raw: str) -> str:
     """Extract a display HGVS string from ANNOVAR AAChange annotation."""
     if not raw or raw in ("NA", ".", "", "nan"):
@@ -236,6 +247,9 @@ def _build_normalized_df(df: pd.DataFrame, df_original: pd.DataFrame) -> pd.Data
     out["Type"] = out["Type"].apply(
         lambda v: _normalize_type(v) if v != "NA" else v
     )
+
+    # Normalise SpliceAI_score: ANNOVAR pipe-separated "DS_AG|DS_AL|DS_DG|DS_DL" → max
+    out["SpliceAI_score"] = out["SpliceAI_score"].apply(_parse_spliceai_score)
 
     return out
 

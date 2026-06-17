@@ -386,7 +386,7 @@ class Pipeline:
                 i = futures[future]
                 gene = variants[i].get("Gene", "?")
                 try:
-                    i, r, decision, justification = future.result()
+                    _, r, decision, justification = future.result()
                 except Exception as exc:
                     logger.error(
                         "[Pipeline] Reasoning failed for variant %d (%s): %s — marking EXCLUDE",
@@ -456,13 +456,16 @@ class Pipeline:
                     i + 1, variants[i].get("Gene", "?"),
                 )
 
-        # ── Stage 5: Final clinical conclusion (Tier 1 only) ─────────────────
-        logger.info("[Pipeline] Generating final clinical conclusion...")
-        final_summary = final_conclusion.run(
-            conclusions=[conclusions[i] for i in include_indices],
-            patient_phenotype=patient_phenotype,
-            llm=self._llm,
-        )
+        # ── Stage 5: Final clinical conclusion (included variants only) ──────
+        if not include_indices:
+            final_summary = "No variants were included after second triage — no clinical conclusion generated."
+        else:
+            logger.info("[Pipeline] Generating final clinical conclusion...")
+            final_summary = final_conclusion.run(
+                conclusions=[conclusions[i] for i in include_indices],
+                patient_phenotype=patient_phenotype,
+                llm=self._llm,
+            )
 
         # ── Assemble final output ─────────────────────────────────────────────
 
