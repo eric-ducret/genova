@@ -164,18 +164,19 @@ def fetch_and_format_spliceai(
     print(f"[SpliceAI] Querying: {variant_id} (hg{hg_param})")
 
     try:
-        for attempt in range(4):
-            _spliceai_rate_limit()
-            r = requests.get(base_url, params=params, timeout=timeout)
-            if r.status_code == 429:
-                wait = 2.0 ** attempt   # 1s, 2s, 4s, 8s
-                print(f"[SpliceAI] 429 rate limit — backing off {wait:.0f}s (attempt {attempt + 1}/4)")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            break
-        else:
-            raise requests.exceptions.RequestException(f"SpliceAI returned 429 after 4 attempts for {variant_id}")
+        _spliceai_rate_limit()
+        r = requests.get(base_url, params=params, timeout=timeout)
+        if r.status_code == 429:
+            # User-based quota limit — retrying will not help; short wait only
+            # to let any parallel in-flight requests settle before failing fast.
+            time.sleep(2.0)
+            raise ToolFetchError(
+                f"SpliceAI API user rate limit exceeded for {variant_id} — "
+                "quota is per-user and cannot be recovered by retrying"
+            )
+        r.raise_for_status()
+    except ToolFetchError:
+        raise
     except requests.exceptions.Timeout as e:
         raise ToolFetchError(f"SpliceAI request timed out for {variant_id}") from e
     except requests.exceptions.RequestException as e:
@@ -250,6 +251,18 @@ def fetch_and_format_spliceai(
     return "\n".join(lines)
 
 
+def _format_precomputed(score_str: str) -> str:
+    """Format a pre-computed SpliceAI max delta score from the input CSV."""
+    max_ds = _safe_float(score_str)
+    lines = [
+        "SPLICEAI SPLICE IMPACT SCORES (pre-computed from input):",
+        f"  Max delta score : {max_ds:.4f}  ->  {_interpret(max_ds)}",
+        f"  (Delta scores range 0–1; >= 0.2 = possible impact, >= 0.5 = moderate, >= 0.8 = high)",
+        f"  (Individual per-type scores DS_AG/AL/DG/DL not available — pre-computed value only)",
+    ]
+    return "\n".join(lines)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PIPELINE TOOL CLASS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -274,13 +287,17 @@ class SpliceAITool(NetworkTool):
     mask: int = 0
 
     def gate(self, variant: dict, context: ToolContext) -> bool:
+        # Always run if a pre-computed score is available — run() will format it
+        if context.field("SpliceAI_score") != "NA":
+            return True
+
         # Skip variant types that cannot have splice impact
         type_val = variant.get("Type", "").lower().strip()
         if any(t in type_val for t in _NO_SPLICE_TYPES):
             print(f"[SpliceAI gate] SKIP — type: {type_val!r}")
             return False
 
-        # Require resolvable coordinates
+        # Require resolvable coordinates (needed for the API call)
         coords = parse_variant_coords(
             variant_str=variant.get("Variant", ""),
             chrom_field=variant.get("Chromosome", ""),
@@ -295,6 +312,10 @@ class SpliceAITool(NetworkTool):
         return True
 
     def run(self, variant: dict, context: ToolContext) -> str | None:
+        pre_score = context.field("SpliceAI_score")
+        if pre_score != "NA":
+            return _format_precomputed(pre_score)
+
         coords = parse_variant_coords(
             variant_str=variant.get("Variant", ""),
             chrom_field=variant.get("Chromosome", ""),

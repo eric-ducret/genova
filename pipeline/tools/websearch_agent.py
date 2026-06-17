@@ -28,6 +28,7 @@ from typing import Optional
 
 from pipeline.tools.base import ReActTool
 from pipeline.core.context import ToolContext
+from pipeline.core.normalizer import normalize_gene
 from pipeline.tools.websearch import WebSearchTool, WebFetchTool
 from pipeline.tools.ncbi import NCBIFetchTool
 
@@ -210,25 +211,32 @@ def checkpoint_messages(user_input: str, scratchpad: list[str],
 
 
 def final_answer_messages(user_input: str, conversation: list[dict],
-                           scratchpad: list[str], prefetched: str = "") -> list[dict]:
+                           observations: list[str], prefetched: str = "") -> list[dict]:
     """
-    Final answer sees both pre-fetched evidence and scratchpad observations
-    as distinct labelled blocks, ensuring nothing is silently omitted.
+    Final answer sees both pre-fetched evidence and tool observations as distinct
+    labelled blocks.  observations must already be filtered to Observation-only lines
+    (use _observations_only) — Thought/Action lines must not appear here.
     """
     pre_block = (
         f"Pre-fetched evidence (prior tools):\n{prefetched.strip()}\n\n"
         if prefetched.strip() else ""
     )
     obs_block = (
-        "\n".join(scratchpad) if scratchpad else "No additional searches were performed."
+        "\n".join(observations) if observations else "No additional searches were performed."
     )
     return [
         {"role": "system", "content": (
-            "You are a clinical genomics evidence synthesiser. "
-            "Write a clear, direct evidence summary using the sources provided below. "
-            "Synthesise the findings that link (or do not link) the variant or gene to the disease. "
-            "Include URLs for any sources cited. "
-            "Do NOT mention tools, search steps, or internal reasoning. "
+            "You are a clinical genomics evidence synthesiser.\n"
+            "Write a factual evidence summary using ONLY the observations listed below.\n\n"
+            "STRICT RULES — violations undermine clinical safety:\n"
+            "1. Do NOT add any fact from your training knowledge. "
+            "Every claim must be directly traceable to a successful observation.\n"
+            "2. If an observation shows an error (HTTP error, timeout, empty page, "
+            "JS-rendered, access denied), do NOT infer or reconstruct its content. "
+            "State explicitly: 'Source inaccessible ([URL or name]) — content not retrieved.'\n"
+            "3. If a gap could not be filled due to access errors, say so rather than filling it.\n"
+            "4. Include the full URL for each cited source.\n"
+            "5. Do NOT mention tools, search steps, or internal reasoning.\n\n"
             "Begin directly with the evidence."
         )},
         *conversation,
@@ -268,6 +276,15 @@ def parse_yes_no(raw: str) -> Optional[bool]:
     return None
 
 
+def _observations_only(scratchpad: list[str]) -> list[str]:
+    """
+    Return only actual tool output lines from the scratchpad.
+    Strips Thought / Action / Action Input entries so the final synthesizer
+    cannot recycle LLM-generated reasoning as if it were retrieved evidence.
+    """
+    return [s for s in scratchpad if s.startswith("Observation (")]
+
+
 # ─────────────────────────────────────────────
 # REACT AGENT  (verbatim from retrieval_agent.py;
 #               constructor extended with optional llm= parameter)
@@ -300,17 +317,21 @@ class ReActAgent:
     # ── public entry point ──────────────────
 
     def run(self, user_input: str, conversation: list[dict] = None,
-            prefetched: str = "") -> str:
+            prefetched: str = "", forced_first_query: str = "") -> str:
         """
         Run the ReAct loop.
 
         Args:
-            user_input:   The task / question for the agent.
-            conversation: Prior conversation turns (currently unused / reset).
-            prefetched:   Pre-fetched evidence string (LitVar2 + AutoPVS1 blocks).
-                          Passed to every checkpoint and the final answer so the
-                          model always has full context when deciding whether to
-                          keep searching or synthesize a conclusion.
+            user_input:          The task / question for the agent.
+            conversation:        Prior conversation turns (currently unused / reset).
+            prefetched:          Pre-fetched evidence string (LitVar2 + AutoPVS1 blocks).
+                                 Passed to every checkpoint and the final answer so the
+                                 model always has full context when deciding whether to
+                                 keep searching or synthesize a conclusion.
+            forced_first_query:  If set, the first ReAct step is always a web_search
+                                 with this exact query string, bypassing the Thought →
+                                 action-pick → action-input LLM calls for that step.
+                                 Caller passes "{gene} disease" as the entry point.
         """
         self._last_trace = []
         conversation = []
@@ -328,6 +349,26 @@ class ReActAgent:
                 return self._final(user_input, conversation, scratchpad, prefetched)
             print("[Pre-loop checkpoint] Pre-fetched evidence insufficient — proceeding with search.")
             self._last_trace.append("[Pre-loop checkpoint] Insufficient — proceeding with ReAct loop")
+
+        # ── Forced first search ───────────────────────────────────────────────
+        # Always kick off with "{gene} disease" so the agent's first observation
+        # is a gene-disease overview page, regardless of what the LLM would pick.
+        # Executes web_search directly — no Thought/action-pick/action-input calls.
+        if forced_first_query:
+            ws_tool = self.registry.get("web_search")
+            if ws_tool is not None:
+                print(f"\n[Forced first search] web_search({forced_first_query!r})")
+                self._last_trace.append(
+                    f"[Forced first search] web_search({forced_first_query!r})"
+                )
+                obs = ws_tool.run(forced_first_query)
+                print(f"[Obs]  {obs}")
+                scratchpad.append(f"Action: web_search")
+                scratchpad.append(f"Action Input: {forced_first_query}")
+                scratchpad.append(f"Observation (web_search): {obs}")
+                if self._check(user_input, scratchpad, prefetched):
+                    self.last_scratchpad = scratchpad
+                    return self._final(user_input, conversation, scratchpad, prefetched)
 
         # ── ReAct loop ────────────────────────────────────────────────────────
         for step in range(self.cfg.max_steps):
@@ -410,8 +451,9 @@ class ReActAgent:
 
     def _final(self, user_input, conversation, scratchpad,
                prefetched: str = "") -> str:
+        observations = _observations_only(scratchpad)
         answer = self.llm.generate(
-            final_answer_messages(user_input, conversation, scratchpad, prefetched),
+            final_answer_messages(user_input, conversation, observations, prefetched),
             self.cfg.tokens_final,
         )
         print(f"[Answer] {answer}")
@@ -524,7 +566,12 @@ class WebSearchAgentTool(ReActTool):
         adapted_llm = _LLMAdapter(context.llm)
         agent = ReActAgent(cfg, tools, llm=adapted_llm)
 
-        output = agent.run(prompt, conversation=[], prefetched=prefetched)
+        # Force the first search to always be "{gene} disease" as a grounding entry point.
+        gene = normalize_gene(context.field("Gene"))
+        forced_first_query = f"{gene} disease" if gene != "NA" else ""
+
+        output = agent.run(prompt, conversation=[], prefetched=prefetched,
+                           forced_first_query=forced_first_query)
 
         # Capture ReAct trace from agent
         self._last_trace.extend(agent._last_trace)
@@ -534,6 +581,5 @@ class WebSearchAgentTool(ReActTool):
 
         if not output:
             return None
-        gene = context.field("Gene")
         header = f"Web search evidence for {gene}:" if gene != "NA" else "Web search evidence:"
         return f"{header}\n{output}"

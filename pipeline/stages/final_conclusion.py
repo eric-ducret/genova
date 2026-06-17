@@ -1,5 +1,5 @@
-"""
-pipeline/stages/final_conclusion.py — Overall clinical conclusion stage.
+﻿"""
+pipeline/stages/final_conclusion.py â€” Overall clinical conclusion stage.
 
 The last synthesis stage. Reads all per-variant conclusion strings produced by
 stages/conclusion.py and generates the short "# Clinical Conclusion" paragraph
@@ -31,7 +31,7 @@ _PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "final_conclusi
 MAX_NEW_TOKENS_FINAL_CONCLUSION = 600
 
 # With --max-model-len 16384, leave 2000 tokens for prompt template + output.
-# ~4 chars per token → 14384 × 4 = 57536 chars safe budget for the conclusions block.
+# ~4 chars per token â†’ 14384 Ã— 4 = 57536 chars safe budget for the conclusions block.
 _MAX_CONCLUSIONS_CHARS = 50_000
 
 
@@ -54,7 +54,7 @@ def run(
     Args:
         conclusions:       List of per-variant conclusion strings from conclusion.run_one().
                            Each string is a structured block:
-                               # Variant [N] — [GENE] ([HGVS])
+                               # Variant [N] â€” [GENE] ([HGVS])
                                **Molecular mechanism:** ...
                                ...
                                **Comment:** ...
@@ -62,7 +62,7 @@ def run(
         llm:               Shared LLMClient instance.
 
     Returns:
-        The "# Clinical Conclusion" paragraph (2–3 sentences) identifying the
+        The "# Clinical Conclusion" paragraph (2â€“3 sentences) identifying the
         most significant findings and their relevance to the patient phenotype.
     """
     logger.info("[FinalConclusion] Synthesising overall clinical conclusion...")
@@ -71,7 +71,7 @@ def run(
 
     if len(conclusions_text) > _MAX_CONCLUSIONS_CHARS:
         logger.warning(
-            "[FinalConclusion] Combined conclusions (%d chars) exceeds budget — truncating.",
+            "[FinalConclusion] Combined conclusions (%d chars) exceeds budget â€” truncating.",
             len(conclusions_text),
         )
         conclusions_text = conclusions_text[:_MAX_CONCLUSIONS_CHARS] + "\n\n[... truncated ...]"
@@ -82,7 +82,9 @@ def run(
         .replace("{conclusions}", conclusions_text))
 
     return llm.generate(
-        system="You are an expert clinical geneticist.",
+        system="You are an expert clinical geneticist. Base every claim strictly on the evidence below.",
         user=user_prompt,
         max_tokens=MAX_NEW_TOKENS_FINAL_CONCLUSION,
     )
+
+

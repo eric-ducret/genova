@@ -7,26 +7,24 @@ For each patient in results/, reads the most recent report.txt and:
      identifiers (GENE (HGVS)) from most to least probable causative (JSON array).
   2. Parses the report for stage-level funnel statistics (first triage, second
      triage, inclusion decisions, conclusion membership).
-  3. Cross-references with pheno_prompts.csv for phenotype type and n_variants.
-  4. Cross-references with an optional ground-truth CSV to compute the expert
-     variant's rank and per-stage survival.
+  3. Cross-references with pheno_prompts.csv for all metadata including the
+     expert solution gene (solution column), is_solution_here, and
+     resolution_status.
 
-Output: results_table_{YYYYMMDD}.csv — one row per case with all §2 fields from
-        analysis_strategy.md. Ready for use in analysis_notebook.ipynb.
+pheno_prompts.csv expected columns:
+    patient_id, prompt, n_variants, resolution_status, phenotype_present,
+    solution, is_solution_here
+
+Output: results_table_{YYYYMMDD}.csv — one row per case with all §2 fields
+        from analysis_strategy.md. Ready for use in analysis_notebook.ipynb.
 
 Usage:
     python analyse_results.py
     python analyse_results.py --results-dir /path/to/results
     python analyse_results.py --pheno-csv /path/to/pheno_prompts.csv
-    python analyse_results.py --ground-truth /path/to/ground_truth.csv
     python analyse_results.py --vllm-url http://localhost:8001
     python analyse_results.py --workers 8
     python analyse_results.py --output-dir /path/to/out
-
-Ground truth CSV format (patient_id column required):
-    patient_id, expert_gene [, expert_hgvs]
-    or
-    patient_id, expert_variant  (will be treated as gene name)
 """
 
 import argparse
@@ -48,6 +46,11 @@ _DEFAULT_PHENO_CSV   = Path(__file__).parent.parent / "pheno_prompts.csv"
 
 # Folder names follow the pattern: {patient_stem}_{YYYYMMDD_HHMMSS}
 _TIMESTAMP_RE = re.compile(r"_(\d{8}_\d{6})$")
+
+# Prompts matching these strings (case-insensitive, stripped) are classified
+# as generic phenotype (default "visual impairment" assigned when no specific
+# phenotype was available in the clinical metadata).
+_GENERIC_PHENOTYPE_STRINGS = {"visual impairment", "blindness", "unknown"}
 
 # ─── SLM ranking prompt ────────────────────────────────────────────────────────
 
@@ -171,6 +174,19 @@ def _fallback_parse_gene_tokens(text: str) -> list[str]:
 
 # ─── report parsing — stage funnel ────────────────────────────────────────────
 
+def _split_gene_field(raw_list: list[str]) -> list[str]:
+    """
+    Flatten a list of raw gene captures into individual unique gene names.
+
+    The pipeline uses the variant's Gene field verbatim, which can be "SAG"
+    or "SAG;SAG" (compound het entry). Split on ";" and deduplicate while
+    preserving first-occurrence order.
+    """
+    return list(dict.fromkeys(
+        g.strip() for raw in raw_list for g in raw.split(";") if g.strip()
+    ))
+
+
 def _parse_report_funnel(report_text: str) -> dict:
     """
     Extract stage-level funnel statistics and per-variant decisions from report.
@@ -221,15 +237,18 @@ def _parse_report_funnel(report_text: str) -> dict:
 
     # Discarded variants list in TRIAGE SUMMARY
     # Format: "  Variant N — GENE (HGVS): justification"
+    # Gene can be "SAG" or "SAG;SAG" (compound het in same gene) — include ";" in
+    # character class and split afterwards.
     discard_block_m = re.search(
         r"Discarded variants:\n((?:  Variant .+\n)+)",
         report_text,
     )
     if discard_block_m:
-        result["discarded_genes"] = re.findall(
-            r"Variant \d+ — ([A-Za-z][A-Za-z0-9\-]*)\s*[\s(]",
+        raw = re.findall(
+            r"Variant \d+ — ([A-Za-z][A-Za-z0-9;\-]*)\s*[\s(]",
             discard_block_m.group(1),
         )
+        result["discarded_genes"] = _split_gene_field(raw)
 
     # Also check FINAL REPORT appendix (redundant but catches edge cases)
     appendix_discard_m = re.search(
@@ -237,12 +256,12 @@ def _parse_report_funnel(report_text: str) -> dict:
         report_text,
     )
     if appendix_discard_m:
-        extra = re.findall(
-            r"- Variant \d+ — ([A-Za-z][A-Za-z0-9\-]*)",
+        raw_extra = re.findall(
+            r"- Variant \d+ — ([A-Za-z][A-Za-z0-9;\-]*)",
             appendix_discard_m.group(1),
         )
         existing_upper = {g.upper() for g in result["discarded_genes"]}
-        for g in extra:
+        for g in _split_gene_field(raw_extra):
             if g.upper() not in existing_upper:
                 result["discarded_genes"].append(g)
                 existing_upper.add(g.upper())
@@ -262,13 +281,13 @@ def _parse_report_funnel(report_text: str) -> dict:
 
     # Per-variant inclusion decisions
     # Format: "  Variant N — GENE  HGVS  [INCLUDE|EXCLUDE]"
-    # Two spaces are used as field separators; HGVS may contain single spaces.
+    # Gene can be "SAG;SAG" — ";" included in character class, split afterwards.
     decisions = re.findall(
-        r"  Variant \d+ — ([A-Za-z][A-Za-z0-9\-]*)  .+?  \[(INCLUDE|EXCLUDE)\]",
+        r"  Variant \d+ — ([A-Za-z][A-Za-z0-9;\-]*)  .+?  \[(INCLUDE|EXCLUDE)\]",
         report_text,
     )
-    result["included_genes"] = [g for g, d in decisions if d == "INCLUDE"]
-    result["excluded_genes"] = [g for g, d in decisions if d == "EXCLUDE"]
+    result["included_genes"] = _split_gene_field([g for g, d in decisions if d == "INCLUDE"])
+    result["excluded_genes"] = _split_gene_field([g for g, d in decisions if d == "EXCLUDE"])
 
     # n_input fallback: when triage didn't run, all variants went to second triage
     if result["n_input"] is None and result["n_evaluated_second"] is not None:
@@ -281,9 +300,10 @@ def _parse_report_funnel(report_text: str) -> dict:
         re.DOTALL,
     )
     if final_report_m:
-        # Matches: "# Variant [N] — GENE ..." (em-dash U+2014 or regular hyphen)
+        # Non-greedy [^\n]*? stops at the first dash (the em-dash separator),
+        # avoiding false matches on hyphens inside HGVS notation.
         conclusion_genes = re.findall(
-            r"^# Variant[^\n]*[—\-]\s*([A-Za-z][A-Za-z0-9\-]+)",
+            r"^# Variant[^\n]*?[—\-]\s*([A-Za-z][A-Za-z0-9\-]+)",
             final_report_m.group(1),
             re.MULTILINE,
         )
@@ -295,29 +315,43 @@ def _parse_report_funnel(report_text: str) -> dict:
 
 # ─── expert variant tracking ─────────────────────────────────────────────────
 
+def _parse_expert_genes(expert_gene: str | None) -> list[str]:
+    """
+    Split a potentially compound solution string into individual gene names.
+
+    The solution column can be a single gene ("SAG") or semicolon-separated
+    genes ("HSD17B10;HSD17B10"). Returns a deduplicated list of uppercased
+    gene names, preserving order. Empty list if input is blank.
+    """
+    if not expert_gene:
+        return []
+    return list(dict.fromkeys(
+        g.strip().upper() for g in expert_gene.split(";") if g.strip()
+    ))
+
+
 def _expert_stage_info(funnel: dict, expert_gene: str | None) -> dict:
     """
-    Determine whether the expert variant survived each pipeline stage.
+    Determine whether any expert gene survived each pipeline stage.
 
-    Returns booleans for first triage survival, second triage survival,
-    and presence in the final conclusion. Returns None for each field when
-    the expert gene is unknown or the stage information is unavailable.
+    For compound solutions ("GENE1;GENE2"), returns True if ANY expert gene
+    passed the stage. Returns None when stage information is unavailable.
     """
     na = {"expert_first_triage_survived": None,
           "expert_second_triage_survived": None,
           "expert_in_conclusion": None}
 
-    if not expert_gene:
+    expert_genes = _parse_expert_genes(expert_gene)
+    if not expert_genes:
         return na
 
-    eg = expert_gene.strip().upper()
-    discarded_up = {g.upper() for g in funnel["discarded_genes"]}
-    excluded_up  = {g.upper() for g in funnel["excluded_genes"]}
-    included_up  = {g.upper() for g in funnel["included_genes"]}
+    discarded_up  = {g.upper() for g in funnel["discarded_genes"]}
+    excluded_up   = {g.upper() for g in funnel["excluded_genes"]}
+    included_up   = {g.upper() for g in funnel["included_genes"]}
     conclusion_up = {g.upper() for g in funnel["conclusion_genes"]}
 
     if funnel["triage_ran"]:
-        survived_t1 = eg not in discarded_up
+        survived_t1 = any(eg not in discarded_up for eg in expert_genes)
     else:
         survived_t1 = True  # triage skipped → all variants are kept
 
@@ -328,13 +362,12 @@ def _expert_stage_info(funnel: dict, expert_gene: str | None) -> dict:
             "expert_in_conclusion": False,
         }
 
-    # Second triage: None if we have no decision data for this gene
     if included_up or excluded_up:
-        survived_t2 = eg in included_up
+        survived_t2 = any(eg in included_up for eg in expert_genes)
     else:
         survived_t2 = None  # parse failure or very small case without decision data
 
-    in_conclusion = eg in conclusion_up
+    in_conclusion = any(eg in conclusion_up for eg in expert_genes)
 
     return {
         "expert_first_triage_survived": survived_t1,
@@ -345,76 +378,90 @@ def _expert_stage_info(funnel: dict, expert_gene: str | None) -> dict:
 
 def _find_expert_rank(ranked_variants: list[str], expert_gene: str | None) -> int | None:
     """
-    Find the 1-indexed rank of the expert gene in the ranked variant list.
+    Find the best (lowest) 1-indexed rank of any expert gene in the ranked list.
 
-    Matches by the gene name portion of each identifier (the part before any
-    space or parenthesis). Returns None if the expert gene is absent from the
-    ranked list or if expert_gene is not provided.
+    For compound solutions ("GENE1;GENE2"), returns the minimum rank across all
+    expert genes. Returns None if no expert gene appears in the ranked list.
     """
-    if not expert_gene or not ranked_variants:
+    expert_genes = _parse_expert_genes(expert_gene)
+    if not expert_genes or not ranked_variants:
         return None
-    eg = expert_gene.strip().upper()
+
+    expert_genes_set = set(expert_genes)
+    best: int | None = None
     for i, identifier in enumerate(ranked_variants):
-        gene_part = re.split(r"[\s(]", identifier)[0].strip().upper()
-        if gene_part == eg:
-            return i + 1
-    return None
+        # Extract everything before the first space or parenthesis, then split on ";"
+        # to handle SLM outputs like "SAG;SAG (HGVS)" for compound het cases.
+        raw_gene = re.split(r"[\s(]", identifier)[0].strip().upper()
+        identifier_genes = {g.strip() for g in raw_gene.split(";") if g.strip()}
+        if identifier_genes & expert_genes_set:
+            rank = i + 1
+            if best is None or rank < best:
+                best = rank
+    return best
 
 
 # ─── auxiliary data loaders ───────────────────────────────────────────────────
 
 def _load_pheno_data(pheno_csv: Path) -> dict[str, dict]:
     """
-    Load phenotype type and n_variants from pheno_prompts.csv.
+    Load all metadata from pheno_prompts.csv.
 
-    Phenotype type is determined by:
-      - An explicit 'phenotype_type' column if present, or
-      - Inferred: prompt == "visual impairment" → generic, otherwise specific.
+    Expected columns:
+        patient_id, prompt, n_variants, resolution_status,
+        phenotype_present, solution, is_solution_here
+
+    Returns {patient_id: {phenotype_type, n_variants, prompt,
+                           expert_gene, is_solution_here, resolution_status}}.
+
+    phenotype_type is inferred from the prompt:
+        - "generic" if the phenotype description (after "The patient has ") is
+          one of the known vague strings (visual impairment, blindness, unknown)
+        - "specific" otherwise
     """
     data: dict[str, dict] = {}
     if not pheno_csv.exists():
-        logger.warning("[analyse] pheno_prompts.csv not found at %s — phenotype fields will be empty", pheno_csv)
+        logger.warning(
+            "[analyse] pheno_prompts.csv not found at %s — metadata fields will be empty",
+            pheno_csv,
+        )
         return data
+
     with open(pheno_csv, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             pid = row.get("patient_id", "").strip()
             if not pid:
                 continue
+
             prompt = row.get("prompt", "").strip()
-            if "phenotype_type" in row:
-                pt = row["phenotype_type"].strip()
-            else:
-                pt = "generic" if prompt.lower().strip() == "visual impairment" else "specific"
+
+            # Infer phenotype_type from the prompt text
+            # Strip the common preamble "The patient has " to get the bare phenotype
+            bare = re.sub(r"^the patient has\s+", "", prompt, flags=re.IGNORECASE).strip()
+            phenotype_type = "generic" if bare.lower() in _GENERIC_PHENOTYPE_STRINGS else "specific"
+
+            # Expert gene: the solution column (empty string for unsolved cases)
+            expert_gene = row.get("solution", "").strip()
+
+            # is_solution_here: 1 = the expert variant was present in the pipeline input
+            try:
+                is_solution_here = int(row.get("is_solution_here", "0").strip())
+            except ValueError:
+                is_solution_here = 0
+
+            resolution_status = row.get("resolution_status", "").strip()
+
             data[pid] = {
-                "phenotype_type": pt,
-                "n_variants": row.get("n_variants", ""),
-                "prompt": prompt,
+                "phenotype_type":    phenotype_type,
+                "n_variants":        row.get("n_variants", "").strip(),
+                "prompt":            prompt,
+                "expert_gene":       expert_gene,
+                "is_solution_here":  is_solution_here,
+                "resolution_status": resolution_status,
             }
+
     logger.info("[analyse] Loaded pheno data for %d patients from %s", len(data), pheno_csv)
-    return data
-
-
-def _load_ground_truth(gt_csv: Path | None) -> dict[str, str]:
-    """
-    Load expert gene names from a ground truth CSV.
-
-    Expected columns: patient_id, expert_gene  (or expert_variant as alias).
-    Returns {patient_id: expert_gene_string}.
-    """
-    if not gt_csv or not gt_csv.exists():
-        if gt_csv:
-            logger.warning("[analyse] Ground truth CSV not found at %s", gt_csv)
-        return {}
-    data: dict[str, str] = {}
-    with open(gt_csv, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            pid = row.get("patient_id", "").strip()
-            gene = (row.get("expert_gene") or row.get("expert_variant") or "").strip()
-            if pid:
-                data[pid] = gene
-    logger.info("[analyse] Loaded ground truth for %d patients from %s", len(data), gt_csv)
     return data
 
 
@@ -461,12 +508,15 @@ def _process_patient(
     report_path: Path,
     llm,
     pheno_data: dict[str, dict],
-    gt_data: dict[str, str],
 ) -> dict:
     """
     Process one patient report. Returns a per-case dict with all §2 fields.
     """
     text = report_path.read_text(encoding="utf-8")
+
+    # Metadata from pheno CSV (expert gene comes from here, not a separate GT file)
+    pheno       = pheno_data.get(stem, {})
+    expert_gene = pheno.get("expert_gene", "")
 
     # SLM-based variant ranking from final conclusion
     conclusion = _extract_final_conclusion(text)
@@ -486,18 +536,16 @@ def _process_patient(
     else:
         logger.warning("[analyse] No final conclusion found in %s", report_path)
 
-    # Stage funnel parsing
+    # Stage funnel parsing (pure regex, no SLM)
     funnel     = _parse_report_funnel(text)
-    expert_gene = gt_data.get(stem, "")
-    stage_info  = _expert_stage_info(funnel, expert_gene or None)
+    stage_info = _expert_stage_info(funnel, expert_gene or None)
     expert_rank = _find_expert_rank(ranked_variants, expert_gene or None)
-
-    # Phenotype metadata
-    pheno = pheno_data.get(stem, {})
 
     return {
         "patient_id":                    stem,
         "phenotype_type":                pheno.get("phenotype_type", ""),
+        "resolution_status":             pheno.get("resolution_status", ""),
+        "is_solution_here":              pheno.get("is_solution_here", ""),
         "n_variants_pheno":              pheno.get("n_variants", ""),
         "n_input_report":                funnel["n_input"],
         "triage_ran":                    funnel["triage_ran"],
@@ -522,6 +570,8 @@ def _process_patient(
 _OUTPUT_COLUMNS = [
     "patient_id",
     "phenotype_type",
+    "resolution_status",
+    "is_solution_here",
     "n_variants_pheno",
     "n_input_report",
     "triage_ran",
@@ -551,11 +601,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--pheno-csv", type=Path, default=_DEFAULT_PHENO_CSV, metavar="CSV",
-        help=f"pheno_prompts.csv with patient_id, prompt, n_variants columns (default: {_DEFAULT_PHENO_CSV})",
-    )
-    parser.add_argument(
-        "--ground-truth", type=Path, default=None, metavar="CSV",
-        help="Ground truth CSV with patient_id and expert_gene columns (optional)",
+        help=(
+            "pheno_prompts.csv with columns: patient_id, prompt, n_variants, "
+            "resolution_status, phenotype_present, solution, is_solution_here "
+            f"(default: {_DEFAULT_PHENO_CSV})"
+        ),
     )
     parser.add_argument(
         "--vllm-url", default="http://localhost:8001", metavar="URL",
@@ -583,12 +633,12 @@ def main() -> None:
     logger.info("[analyse] %d patient(s) found.", len(reports))
 
     pheno_data = _load_pheno_data(args.pheno_csv)
-    gt_data    = _load_ground_truth(args.ground_truth)
 
-    if gt_data:
-        logger.info("[analyse] Ground truth loaded for %d patient(s).", len(gt_data))
-    else:
-        logger.info("[analyse] No ground truth provided — expert_rank and stage survival will be empty.")
+    n_with_gt = sum(1 for v in pheno_data.values() if v.get("expert_gene"))
+    logger.info(
+        "[analyse] Pheno data loaded: %d patients, %d with an expert gene (solution).",
+        len(pheno_data), n_with_gt,
+    )
 
     from pipeline.llm.vllm_client import VLLMClient
     llm = VLLMClient(base_url=args.vllm_url)
@@ -602,7 +652,7 @@ def main() -> None:
     workers = min(args.workers, len(reports))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_process_patient, stem, path, llm, pheno_data, gt_data): stem
+            pool.submit(_process_patient, stem, path, llm, pheno_data): stem
             for stem, path in reports.items()
         }
         for future in as_completed(futures):

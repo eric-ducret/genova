@@ -44,6 +44,7 @@ import xml.etree.ElementTree as ET
 from pipeline.tools.base import SLMTool
 from pipeline.core.context import ToolContext
 from pipeline.core.errors import PipelineError, ToolFetchError, ToolParseError
+from pipeline.core.normalizer import normalize_gene as _normalize_gene
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +55,14 @@ LITVAR2_URL  = f"{LITVAR2_BASE}/variant/get/litvar@{{rsid}}%23%23/publications"
 NCBI_BASE    = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 # Without API key: 3 req/s → 0.34 s delay.  With API key: 10 req/s → 0.11 s delay.
 # Set NCBI_API_KEY env var (free key from https://www.ncbi.nlm.nih.gov/account/).
-NCBI_API_KEY = os.environ.get("NCBI_API_KEY", "")
-NCBI_DELAY   = 0.11 if NCBI_API_KEY else 0.34
+NCBI_API_KEY       = os.environ.get("NCBI_API_KEY", "")
+# Number of sbatch jobs running in parallel and sharing the same NCBI quota.
+# Override with NCBI_PARALLEL_JOBS env var if the job count changes.
+NCBI_PARALLEL_JOBS = int(os.environ.get("NCBI_PARALLEL_JOBS", "6"))
+# Per-process inter-request delay derived from NCBI's rate limit and the number of
+# parallel processes.  Without key: 3 req/s global → delay = JOBS/3 s per process.
+# With key: 10 req/s global → delay = JOBS/10 s per process.
+NCBI_DELAY = NCBI_PARALLEL_JOBS / (10.0 if NCBI_API_KEY else 3.0)
 CGD_URL      = "https://research.nhgri.nih.gov/CGD/download/txt/CGD.txt.gz"
 CGD_MAX_CONDITIONS = 3        # cap OR terms from CGD to keep the query focused
 
@@ -84,19 +91,27 @@ def _ncbi_rate_limit() -> None:
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+_NCBI_MAX_ATTEMPTS = 5
+_NCBI_BACKOFF_BASE = 10.0   # seconds — 10, 20, 40, 80, 160 s
+
+
 def _ncbi_get(endpoint: str, params: dict, timeout: int = DEFAULT_TIMEOUT) -> requests.Response:
     _ncbi_rate_limit()
     if NCBI_API_KEY:
         params = {**params, "api_key": NCBI_API_KEY}
-    for attempt in range(4):
+    resp = None
+    for attempt in range(_NCBI_MAX_ATTEMPTS):
         resp = requests.get(f"{NCBI_BASE}/{endpoint}", params=params, timeout=timeout)
-        if resp.status_code == 429:
-            wait = 2.0 ** attempt   # 1s, 2s, 4s, 8s
-            logger.warning("NCBI rate limit (429) — backing off %.0fs (attempt %d/4)", wait, attempt + 1)
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        return resp
+        if resp.status_code != 429:
+            resp.raise_for_status()
+            return resp
+        wait = _NCBI_BACKOFF_BASE * (2 ** attempt)
+        logger.warning(
+            "NCBI rate limit (429) — backing off %.0fs (attempt %d/%d)",
+            wait, attempt + 1, _NCBI_MAX_ATTEMPTS,
+        )
+        time.sleep(wait)
+        _ncbi_rate_limit()   # re-enter the global slot after the backoff sleep
     resp.raise_for_status()  # re-raise on final attempt
     return resp
 
@@ -146,7 +161,7 @@ class LitVar2SummaryTool(SLMTool):
     def gate(self, variant: dict, context: ToolContext) -> bool:
         """Run when a valid rsID is present OR when a gene symbol is available."""
         rsid = context.field("RS_ID")
-        gene = context.field("Gene")
+        gene = _normalize_gene(context.field("Gene"))
         rsid_ok = rsid != "NA" and re.match(r"^rs\d+$", rsid, re.IGNORECASE) is not None
         gene_ok = gene != "NA" and gene.strip() != ""
         return rsid_ok or gene_ok
@@ -296,15 +311,21 @@ class LitVar2SummaryTool(SLMTool):
         try:
             _ncbi_rate_limit()
             api_params = {"api_key": NCBI_API_KEY} if NCBI_API_KEY else {}
-            for attempt in range(4):
+            resp = None
+            for attempt in range(_NCBI_MAX_ATTEMPTS):
                 resp = requests.get(url, params=api_params, timeout=self.timeout)
-                if resp.status_code == 429:
-                    wait = 2.0 ** attempt
-                    logger.warning("LitVar2 rate limit (429) — backing off %.0fs (attempt %d/4)", wait, attempt + 1)
-                    time.sleep(wait)
-                    continue
+                if resp.status_code != 429:
+                    resp.raise_for_status()
+                    break
+                wait = _NCBI_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    "LitVar2 rate limit (429) — backing off %.0fs (attempt %d/%d)",
+                    wait, attempt + 1, _NCBI_MAX_ATTEMPTS,
+                )
+                time.sleep(wait)
+                _ncbi_rate_limit()   # re-enter the global slot after the backoff sleep
+            else:
                 resp.raise_for_status()
-                break
             data = resp.json()
         except Exception as e:
             raise ToolFetchError(f"LitVar2 API request failed for {rsid}: {e}") from e
@@ -768,7 +789,7 @@ class LitVar2SummaryTool(SLMTool):
         header embeds source and query for downstream traceability.
         """
         rsid = context.field("RS_ID")
-        gene = context.field("Gene")
+        gene = _normalize_gene(context.field("Gene"))
 
         if self._disease_query is None:
             with self._disease_query_lock:

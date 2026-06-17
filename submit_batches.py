@@ -39,28 +39,42 @@ _MINS_PER_VARIANT = 0.088 if os.environ.get("NCBI_API_KEY") else 0.117
 
 
 def _load_eligible() -> list[int]:
-    """Return list of n_variants for each eligible patient (n_variants <= _MAX_VARIANTS)."""
-    all_variants = []
+    """Return list of n_variants for eligible patients (n_variants <= _MAX_VARIANTS, resolution_status == Solved, is_solution_here == 1)."""
+    all_rows = []
     eligible_variants = []
+    n_not_solved = 0
+    n_no_solution = 0
     with open(_PHENO_CSV, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
+            all_rows.append(row)
+            if row.get("resolution_status", "").strip() != "Solved":
+                n_not_solved += 1
+                continue
+            if str(row.get("is_solution_here", "0")).strip() != "1":
+                n_no_solution += 1
+                continue
             n = int(row["n_variants"])
-            all_variants.append(n)
             if n <= _MAX_VARIANTS:
                 eligible_variants.append(n)
-    n_excluded = len(all_variants) - len(eligible_variants)
+    if n_not_solved:
+        print(f"  Skipped {n_not_solved} patient(s) with resolution_status != Solved")
+    if n_no_solution:
+        print(f"  Skipped {n_no_solution} patient(s) with is_solution_here != 1")
+    n_excluded = len(all_rows) - n_not_solved - n_no_solution - len(eligible_variants)
     if n_excluded:
         print(f"  Excluded {n_excluded} patient(s) with >{_MAX_VARIANTS} variants")
     return eligible_variants
 
 
-def _compute_n_batches(eligible: list[int], max_hours: float) -> tuple[int, int, float]:
+def _compute_n_batches(eligible: list[int], max_hours: float, max_per_batch: int | None = None) -> tuple[int, int, float]:
     """Return (n_batches, patients_per_batch, estimated_minutes_per_batch)."""
     available_min = max_hours * 60 - _VLLM_STARTUP_MIN
     avg_variants  = sum(eligible) / len(eligible)
     avg_min       = avg_variants * _MINS_PER_VARIANT
 
     patients_per_batch = max(1, int(available_min / avg_min))
+    if max_per_batch:
+        patients_per_batch = min(patients_per_batch, max_per_batch)
     n_batches          = math.ceil(len(eligible) / patients_per_batch)
     est_min_per_batch  = patients_per_batch * avg_min + _VLLM_STARTUP_MIN
 
@@ -77,6 +91,8 @@ def main() -> None:
                    help="Target max walltime per job in hours (default: 6.0)")
     p.add_argument("--patients-per-batch", type=int, default=None, metavar="N",
                    help="Override: fix how many patients per batch (skips auto-compute)")
+    p.add_argument("--max-patients-per-batch", type=int, default=None, metavar="N",
+                   help="Cap on patients per batch; auto-compute will not exceed this (default: no cap)")
     p.add_argument("--dry-run", action="store_true",
                    help="Print sbatch commands without submitting")
     args = p.parse_args()
@@ -103,7 +119,9 @@ def main() -> None:
         n_batches          = math.ceil(total / patients_per_batch)
         est_min            = patients_per_batch * avg_variants * _MINS_PER_VARIANT + _VLLM_STARTUP_MIN
     else:
-        n_batches, patients_per_batch, est_min = _compute_n_batches(eligible, args.max_hours)
+        n_batches, patients_per_batch, est_min = _compute_n_batches(
+            eligible, args.max_hours, args.max_patients_per_batch
+        )
 
     print(f"\nPatients eligible : {total}")
     print(f"Patients per batch: ~{patients_per_batch}  "

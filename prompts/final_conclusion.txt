@@ -1,12 +1,11 @@
+RULE: Ground every claim in the per-variant conclusions below.
+Each claim about a variant must be traceable to something stated in its conclusion
+(zygosity, inheritance, gene-disease evidence, ClinVar status, etc.).
+
 Patient phenotype: {patient_phenotype}
 Per-variant conclusions: {conclusions}
 
 TASK: Identify which variant best explains the patient's phenotype.
-
-Ground your reasoning in the per-variant conclusions above. For each
-claim you make about a variant, that claim should be traceable to
-something stated in its conclusion (zygosity, inheritance, gene-disease
-evidence, ClinVar status, etc.).
 
 Compare the variants against each other and identify which one stands
 out as the most likely cause of the patient's condition. Then write the

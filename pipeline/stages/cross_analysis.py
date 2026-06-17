@@ -1,5 +1,5 @@
-"""
-pipeline/stages/cross_analysis.py — Gene-level cross-variant analysis stage.
+﻿"""
+pipeline/stages/cross_analysis.py â€” Gene-level cross-variant analysis stage.
 
 Runs after per-variant reasoning is complete. For each gene that has two or more
 variants in the current run, this stage evaluates potential gene-level interactions
@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 _PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "cross_analysis.txt"
 
 MAX_NEW_TOKENS_CROSS_ANALYSIS = 200
+_MAX_VARIANT_DATA_CHARS = 40_000
+
 
 
 def _load_prompt() -> str:
@@ -57,7 +59,7 @@ def run(
         llm:              Shared LLMClient instance.
 
     Returns:
-        Short cross-analysis text (3–5 sentences) describing any identified
+        Short cross-analysis text (3â€“5 sentences) describing any identified
         interaction or noting the absence of meaningful inter-variant relationships.
     """
     logger.info(
@@ -71,6 +73,8 @@ def run(
             f"--- VARIANT {n} ---\n{ctx}\n\nREASONING:\n{reason}"
         )
     variant_data = "\n\n".join(parts)
+    variant_data = variant_data[:_MAX_VARIANT_DATA_CHARS]
+
 
     template    = _load_prompt()
     user_prompt = (template
@@ -78,7 +82,9 @@ def run(
         .replace("{variant_data}", variant_data))
 
     return llm.generate(
-        system="You are an expert clinical geneticist.",
+        system="You are an expert clinical geneticist. Base every claim strictly on the evidence below.",
         user=user_prompt,
         max_tokens=MAX_NEW_TOKENS_CROSS_ANALYSIS,
     )
+
+

@@ -1,3 +1,6 @@
+RULE: Cite only sources that appear verbatim in the evidence below.
+Use (PMID:XXXXXXXX) for PubMed papers or a bare URL in parentheses for web sources.
+Do not add a references section. Omit citations where the evidence does not clearly back the statement.
 
 Patient phenotype and augmented evidence:
 {augmented_context}
@@ -9,9 +12,8 @@ PRIOR REASONING:
 
 TASK — STRUCTURED REPORT FOR THIS VARIANT:
 
-Using your prior reasoning above, produce the final clinical report for this variant. Do NOT re-derive or repeat reasoning steps — synthesize only.
-
-When a claim is directly supported by a source in the evidence above, cite it inline immediately after the claim using (PMID:XXXXXXXX) for PubMed papers or a bare URL in parentheses for web sources. Only cite sources that genuinely support the specific claim. Omit citations where the evidence does not clearly back the statement. Do not add a references section.
+Using your prior reasoning above, produce the final clinical report for this variant.
+Do NOT re-derive or repeat reasoning steps — synthesize only.
 
 Use exactly this format:
 

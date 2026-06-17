@@ -1,5 +1,5 @@
-"""
-pipeline/stages/conclusion.py — SLM structured report stage.
+﻿"""
+pipeline/stages/conclusion.py â€” SLM structured report stage.
 
 Ported from run_conclusion() in server_main.py.
 
@@ -38,8 +38,8 @@ def _validate_citations(result: str, context: str) -> str:
     Strip inline citations from the model output that have no grounding in context.
 
     Two citation forms are checked:
-      (PMID:12345678)  — removed if that PMID number does not appear anywhere in context.
-      (https://...)    — removed if that URL does not appear as a substring in context.
+      (PMID:12345678)  â€” removed if that PMID number does not appear anywhere in context.
+      (https://...)    â€” removed if that URL does not appear as a substring in context.
 
     After removals, stray spaces before punctuation and double spaces are collapsed.
     """
@@ -80,7 +80,7 @@ def run_one(
     llm: "LLMClient",
 ) -> str:
     """
-    Stage 4 — Structured clinical report for one variant.
+    Stage 4 â€” Structured clinical report for one variant.
 
     Args:
         variant_context: Per-variant context string from Stage 1 (retrieval).
@@ -92,7 +92,7 @@ def run_one(
 
     Returns:
         Structured report block for this variant:
-            # Variant [N] — [GENE] ([HGVS])
+            # Variant [N] â€” [GENE] ([HGVS])
             **Molecular mechanism:** ...
             **Phenotype fit:** ...
             **Inheritance check:** ...
@@ -115,8 +115,10 @@ def run_one(
         .replace("{cross_analysis_block}", cross_analysis_block))
 
     result = llm.generate(
-        system="You are an expert clinical geneticist.",
+        system="You are an expert clinical geneticist. Base every claim strictly on the evidence below.",
         user=user_prompt,
         max_tokens=MAX_NEW_TOKENS_REPORT,
     )
     return _validate_citations(result, variant_context)
+
+

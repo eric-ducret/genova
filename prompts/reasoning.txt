@@ -1,19 +1,20 @@
+RULES — apply throughout:
+- Base every claim strictly on the evidence below.
+- Every factual claim must cite its source (PMID, URL, tool output, or variant field).
+- If a fact is not in the evidence, write: "[not in evidence]" — do not infer from prior knowledge.
+- Do not produce a final score or classification.
+- Do not skip any step.
 
 Patient phenotype and augmented evidence for this variant:
 {augmented_context}
 
 TASK — DETAILED REASONING:
 
-Reason step by step using ONLY the provided evidence. Every factual claim must be
-traceable to a specific reference present in the evidence above (e.g. PMID, URL,
-database record, or tool output). If no supporting reference is available for a
-claim, explicitly state what is missing rather than inferring from prior knowledge.
+Reason step by step using ONLY the provided evidence.
 
-Reasoning steps:
-
-1. Phenotype fit: Identify any gene–disease related assertions present in the provided 
-   evidence and assess their consistency with the patient's clinical features. Quote or cite 
-   the relevant context passage (e.g. "LitVar2 reports [PMID:XXXXX]…", "AutoPVS1 output states…"). 
+1. Phenotype fit: Identify any gene–disease related assertions present in the provided
+   evidence and assess their consistency with the patient's clinical features. Quote or cite
+   the relevant context passage (e.g. "LitVar2 reports [PMID:XXXXX]…", "AutoPVS1 output states…").
    Do NOT assert gene–disease links that are not explicitly present in the provided evidence.
 
 2. Variant description: Explain each component of the variant notation (chromosome,
@@ -31,10 +32,3 @@ Reasoning steps:
 5. Flags and uncertainties: Note any contradictions, gaps, or missing evidence
    (e.g. no population frequency data, no literature hits, failed tool). Be explicit
    about what information is absent and how that affects confidence.
-
-Rules:
-- Make the reasoning explicit and step-by-step.
-- Do NOT skip any step.
-- Do NOT produce a final classification or score.
-- Do NOT introduce external knowledge without a citation from the provided evidence.
-  If you are uncertain whether a fact is in the evidence, omit it or flag it as uncertain.

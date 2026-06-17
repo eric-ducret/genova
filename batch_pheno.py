@@ -32,6 +32,15 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+try:
+    from external_prefetch.config import MANIFEST_PATH
+    from external_prefetch.cache_wrapper import install_cache
+    if MANIFEST_PATH.exists():
+        install_cache()
+        logger.info("[batch_pheno] Pre-fetch cache active: %s", MANIFEST_PATH.parent)
+except ImportError:
+    pass
+
 _SCRIPT_DIR   = Path(__file__).parent
 _PHENO_CSV    = _SCRIPT_DIR / "pheno_prompts.csv"
 _RESULTS_DIR  = _SCRIPT_DIR / "results"
@@ -43,8 +52,21 @@ def _load_batch(batch_number: int, n_batches: int) -> list[tuple[str, str]]:
     """Return [(patient_id, prompt), …] for the requested batch."""
     df = pd.read_csv(_PHENO_CSV)
 
-    eligible = df[df["n_variants"] <= _MAX_VARIANTS].reset_index(drop=True)
-    excluded = len(df) - len(eligible)
+    eligible = df[
+        (df["n_variants"] <= _MAX_VARIANTS) &
+        (df["resolution_status"].str.strip() == "Solved") &
+        (df["is_solution_here"].astype(str).str.strip() == "1")
+    ].reset_index(drop=True)
+    n_not_solved   = len(df[df["resolution_status"].str.strip() != "Solved"])
+    n_no_solution  = len(df[
+        (df["resolution_status"].str.strip() == "Solved") &
+        (df["is_solution_here"].astype(str).str.strip() != "1")
+    ])
+    excluded = len(df) - n_not_solved - n_no_solution - len(eligible)
+    if n_not_solved:
+        logger.info("[batch_pheno] Skipped %d patient(s) with resolution_status != Solved", n_not_solved)
+    if n_no_solution:
+        logger.info("[batch_pheno] Skipped %d patient(s) with is_solution_here != 1", n_no_solution)
     if excluded:
         logger.info(
             "[batch_pheno] Excluded %d patient(s) with >%d variants",
@@ -68,6 +90,80 @@ def _load_batch(batch_number: int, n_batches: int) -> list[tuple[str, str]]:
         start + 1, start + size, total, size,
     )
     return list(zip(chunk["patient_id"].astype(str), chunk["prompt"].astype(str)))
+
+
+def _warmup_track1(
+    patients: list[tuple[str, str]],
+    jobs_folder: Path,
+    llm,
+) -> None:
+    """
+    Sequential Phase 1.5 warmup: resolve disease query (SLM) + NCBI Track 1 for
+    every patient, storing all results in the pre-fetch cache.
+
+    Must run as a single sequential job BEFORE the 6 parallel Phase 2 GPU jobs
+    start, so none of them ever make live NCBI calls (all hits from this cache).
+
+    Patch 6 in cache_wrapper ensures the disease_query string written here is
+    identical to the one used by each patient's pipeline.run() call in Phase 2.
+    """
+    from external_prefetch.prefetch import _prefetch_esearch, _prefetch_titles_and_abstracts
+    from pipeline.core.normalizer import normalize_upload
+    from pipeline.core.context import ToolContext
+    from pipeline.tools.litvar2 import LitVar2SummaryTool
+
+    tool = LitVar2SummaryTool()
+    n = len(patients)
+
+    for i, (patient_id, phenotype) in enumerate(patients, 1):
+        csv_path = jobs_folder / f"cut_viland_{patient_id}.csv"
+        logger.info("[warmup] %d/%d — %s", i, n, csv_path.name)
+
+        if not csv_path.exists():
+            logger.warning("[warmup] %s not found — skipping", csv_path.name)
+            continue
+
+        try:
+            raw = csv_path.read_bytes()
+            variants, _ = normalize_upload(raw, csv_path.name)
+        except Exception as e:
+            logger.error("[warmup] Cannot normalize %s: %s — skipping", csv_path.name, e)
+            continue
+
+        # Resolve disease query via SLM — Patch 6 stores the result in
+        # disease_query/{hash(phenotype)}.json and returns it on cache hit.
+        # Call directly (bypassing the instance-level double-checked locking)
+        # so each patient gets its own SLM call regardless of tool._disease_query.
+        ctx = ToolContext(
+            variant={},
+            patient_phenotype=phenotype,
+            all_outputs={},
+            variant_report="",
+            variant_index=0,
+            total_variants=len(variants),
+            llm=llm,
+        )
+        try:
+            disease_query = tool._resolve_disease_query(ctx)
+            logger.info("[warmup] disease_query=%r", disease_query[:80])
+        except Exception as e:
+            logger.error("[warmup] SLM disease query failed for %s: %s — skipping", patient_id, e)
+            continue
+
+        # NCBI Track 1 — sequential, rate-limited, stored in NCBI cache
+        seen_genes: set[str] = set()
+        for v in variants:
+            gene = v.get("Gene", "NA")
+            if gene in ("NA", "") or gene in seen_genes:
+                continue
+            seen_genes.add(gene)
+            try:
+                pmids = _prefetch_esearch(gene, disease_query)
+                if pmids:
+                    _prefetch_titles_and_abstracts(pmids, f"{gene}/track1")
+                    logger.debug("[warmup] Track1 gene=%s: %d PMIDs cached", gene, len(pmids))
+            except Exception as e:
+                logger.warning("[warmup] NCBI Track1 failed gene=%s: %s", gene, e)
 
 
 async def _run_all(
@@ -149,8 +245,9 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="Run the variant pipeline on one patient batch."
     )
-    p.add_argument("batch_number", type=int, metavar="BATCH",
-                   help="Batch number to run (1-indexed, must be ≤ --n-batches)")
+    p.add_argument("batch_number", type=int, metavar="BATCH", nargs="?",
+                   help="Batch number to run (1-indexed, must be ≤ --n-batches); "
+                        "not required when --warmup-only is set")
     p.add_argument("jobs_folder", type=Path,
                    help="Folder containing cut_viland_<patient_id>.csv files")
     p.add_argument("--n-batches", type=int, default=_DEFAULT_N_BATCHES, metavar="N",
@@ -161,19 +258,14 @@ def main() -> None:
                    help="vLLM base URL (default: http://localhost:8001)")
     p.add_argument("--notify-email", metavar="ADDRESS", default="eric.ducret@unil.ch",
                    help="Send email summary on completion")
+    p.add_argument("--warmup-only", action="store_true",
+                   help="Phase 1.5 mode: resolve disease queries (SLM) + NCBI Track 1 "
+                        "for ALL patients sequentially, then exit. "
+                        "Run this as a single sequential GPU job before Phase 2.")
     args = p.parse_args()
-
-    if args.batch_number < 1 or args.batch_number > args.n_batches:
-        print(f"ERROR: batch_number must be between 1 and {args.n_batches}", file=sys.stderr)
-        sys.exit(1)
 
     if not args.jobs_folder.is_dir():
         print(f"ERROR: {args.jobs_folder} is not a directory", file=sys.stderr)
-        sys.exit(1)
-
-    patients = _load_batch(args.batch_number, args.n_batches)
-    if not patients:
-        print("ERROR: batch is empty", file=sys.stderr)
         sys.exit(1)
 
     from pipeline.pipeline import Pipeline
@@ -186,6 +278,38 @@ def main() -> None:
             model_name="qwen3.5-9b",
             llm_kwargs={"base_url": args.vllm_url},
         )
+
+    # ── Phase 1.5 warmup mode ─────────────────────────────────────────────────
+    if args.warmup_only:
+        # Load ALL patients (no batch splitting) for the sequential warmup
+        df = pd.read_csv(_PHENO_CSV)
+        mask = (
+            (df["n_variants"] <= _MAX_VARIANTS) &
+            (df["resolution_status"].str.strip() == "Solved") &
+            (df["is_solution_here"].astype(str).str.strip() == "1")
+        )
+        all_patients = list(zip(
+            df[mask]["patient_id"].astype(str),
+            df[mask]["prompt"].astype(str),
+        ))
+        logger.info("[warmup] Starting Phase 1.5 warmup for %d patients", len(all_patients))
+        _warmup_track1(all_patients, args.jobs_folder, pipeline._llm)
+        logger.info("[warmup] Phase 1.5 complete — NCBI Track 1 cache filled")
+        return
+
+    # ── Normal Phase 2 batch mode ─────────────────────────────────────────────
+    if args.batch_number is None:
+        print("ERROR: batch_number is required unless --warmup-only is set", file=sys.stderr)
+        sys.exit(1)
+
+    if args.batch_number < 1 or args.batch_number > args.n_batches:
+        print(f"ERROR: batch_number must be between 1 and {args.n_batches}", file=sys.stderr)
+        sys.exit(1)
+
+    patients = _load_batch(args.batch_number, args.n_batches)
+    if not patients:
+        print("ERROR: batch is empty", file=sys.stderr)
+        sys.exit(1)
 
     results = asyncio.run(_run_all(patients, args.jobs_folder, pipeline))
 

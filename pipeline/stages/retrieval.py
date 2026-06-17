@@ -1,5 +1,5 @@
-"""
-pipeline/stages/retrieval.py — Per-variant tool fan-out stage.
+﻿"""
+pipeline/stages/retrieval.py â€” Per-variant tool fan-out stage.
 
 For each variant, calls Executor.run_variant() to run all tools in manifest order,
 then returns a list of per-variant context strings. Each string is self-contained:
@@ -55,7 +55,7 @@ def run(
     raw_rows: list[dict] | None = None,
 ) -> list[str]:
     """
-    Stage 1 — Per-variant tool fan-out, parallelised across variants.
+    Stage 1 â€” Per-variant tool fan-out, parallelised across variants.
 
     Args:
         variants:          List of normalized variant dicts.
@@ -121,3 +121,5 @@ def run(
     executor.process_log = sorted(all_log_entries, key=lambda e: e["variant_index"])
 
     return context_slices  # type: ignore[return-value]  # all slots filled above
+
+

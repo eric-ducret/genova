@@ -12,8 +12,23 @@ Public function:
 """
 
 import io
+import re
 
 import pandas as pd
+
+
+def normalize_gene(gene_field: str) -> str:
+    """
+    Return the first non-empty gene symbol from a field that may contain
+    duplicates or multiple genes separated by ';', ',' or '/'.
+    e.g. "BRCA1;BRCA1" -> "BRCA1",  "BRCA1;BRCA2" -> "BRCA1",  "BRCA1" -> "BRCA1"
+    """
+    for token in re.split(r"[;,/]", gene_field):
+        token = token.strip()
+        if token and token.upper() != "NA":
+            return token
+    return gene_field.strip()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SCHEMA
@@ -23,7 +38,7 @@ TARGET_COLUMNS = [
     "Variant", "Chromosome", "Position", "RS_ID", "Ref_seq", "Var_seq",
     "Type", "HGVS", "Zygosity", "Gene", "OMIM_phenotype",
     "OMIM_inheritance", "Inheritance", "ClinVar_class",
-    "Allelic_balance", "Frequency", "CADD_score",
+    "Allelic_balance", "Frequency", "CADD_score", "SpliceAI_score",
 ]
 
 COLUMN_ALIASES = {
@@ -92,6 +107,11 @@ COLUMN_ALIASES = {
     "cadd_score": "CADD_score", "cadd": "CADD_score", "phred": "CADD_score",
     "cadd_phred": "CADD_score",
     "cadd_v17_phred": "CADD_score",
+    # SpliceAI_score — pre-computed max delta score from any source
+    "spliceai_score": "SpliceAI_score", "spliceai": "SpliceAI_score",
+    "spliceai_v13": "SpliceAI_score", "spliceai_max_score": "SpliceAI_score",
+    "spliceai_maxscore": "SpliceAI_score", "spliceai_ds_max": "SpliceAI_score",
+    "spliceai_max": "SpliceAI_score",
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════

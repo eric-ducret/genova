@@ -1,3 +1,5 @@
+RULE: Base your assessment solely on the evidence below. Do not infer from prior knowledge.
+
 Patient phenotype: {patient_phenotype}
 
 Retrieved evidence:
@@ -9,8 +11,6 @@ Decide whether this variant can be discarded with high confidence because it
 does not explain the patient's phenotype. Discard ONLY when the case against
 relevance clearly outweighs the case for it. When the two are balanced or
 uncertain, KEEP.
-
-Base your assessment solely on the evidence above.
 
 Weight the retrieved evidence as follows:
 - "PubMed gene-disease evidence" → strong reason to keep (gene linked to phenotype).

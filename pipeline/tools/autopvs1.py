@@ -389,8 +389,10 @@ def fetch_and_format_autopvs1(
 
     # ── Gene cross-validation ─────────────────────────────────────────────────
     if expected_gene:
-        returned_gene = (d.get("gene") or "").upper()
-        if returned_gene and returned_gene != expected_gene.upper():
+        # Gene field may contain multiple genes (e.g. "BRCA1;BRCA2" or "BRCA1,BRCA2").
+        expected_genes = {g.strip().upper() for g in re.split(r"[;,/]", expected_gene) if g.strip()}
+        returned_gene  = (d.get("gene") or "").upper()
+        if returned_gene and returned_gene not in expected_genes:
             logger.warning(
                 "[AutoPVS1] Gene mismatch: expected %s, got %s (%s) — discarding",
                 expected_gene, d.get("gene"), variant_id,

@@ -1,12 +1,12 @@
-"""
-pipeline/stages/reasoning.py — Two-call SLM clinical reasoning stage.
+﻿"""
+pipeline/stages/reasoning.py â€” Two-call SLM clinical reasoning stage.
 
 Splitting the original single call into two focused calls reduces hallucination
 by separating the evidence-grounded narrative from the inclusion decision:
 
-  Call 1 — reasoning:  step-by-step clinical reasoning using ONLY cited evidence.
+  Call 1 â€” reasoning:  step-by-step clinical reasoning using ONLY cited evidence.
                        Prompt: prompts/reasoning.txt
-  Call 2 — second_triage: structured INCLUDE/EXCLUDE decision with justification.
+  Call 2 â€” second_triage: structured INCLUDE/EXCLUDE decision with justification.
                            Prompt: prompts/second_triage.txt
                            Format: Include-case / Exclude-case / Decision (3 lines)
 
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 _REASONING_PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "reasoning.txt"
 _SCORING_PROMPT_PATH   = Path(__file__).parent.parent.parent / "prompts" / "second_triage.txt"
 
-# Call 1: step-by-step narrative — no score, citation-only rules apply
+# Call 1: step-by-step narrative â€” no score, citation-only rules apply
 MAX_NEW_TOKENS_REASONING = 1500
 # Call 2: three-line Include-case / Exclude-case / Decision block
 # 200 gives headroom for any residual preamble before the 3 structured lines.
@@ -45,7 +45,7 @@ _EXCLUDE_CASE_RE = re.compile(r"Exclude-case:\s*(.+)", re.IGNORECASE)
 _DECISION_RE     = re.compile(r"Decision:\s*(INCLUDE|EXCLUDE)", re.IGNORECASE)
 
 
-# ── Prompt loaders ────────────────────────────────────────────────────────────
+# â”€â”€ Prompt loaders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _load_reasoning_prompt() -> str:
     if _REASONING_PROMPT_PATH.exists():
@@ -63,15 +63,15 @@ def _load_scoring_prompt() -> str:
     )
 
 
-# ── Score parser ──────────────────────────────────────────────────────────────
+# â”€â”€ Score parser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def parse_inclusion_decision(reasoning_text: str) -> tuple[str, str]:
     """
     Parse the INCLUDE/EXCLUDE decision and justification from run_one output.
 
     Expected embedded format (after the "SECOND TRIAGE:" marker):
-        Include-case: <strongest reason to include, ≤15 words>
-        Exclude-case: <strongest reason to exclude, ≤15 words>
+        Include-case: <strongest reason to include, â‰¤15 words>
+        Exclude-case: <strongest reason to exclude, â‰¤15 words>
         Decision: INCLUDE or EXCLUDE
 
     Blank lines are stripped before parsing (Qwen without thinking sometimes
@@ -80,7 +80,7 @@ def parse_inclusion_decision(reasoning_text: str) -> tuple[str, str]:
     Returns:
         ("INCLUDE" | "EXCLUDE", justification)
         justification = "Include: <include_case> | Exclude: <exclude_case>"
-        Defaults to ("INCLUDE", "parse error — defaulting to INCLUDE") on failure.
+        Defaults to ("INCLUDE", "parse error â€” defaulting to INCLUDE") on failure.
     """
     cleaned = "\n".join(line for line in reasoning_text.splitlines() if line.strip())
 
@@ -111,24 +111,24 @@ def parse_inclusion_decision(reasoning_text: str) -> tuple[str, str]:
     m2 = re.search(r"\b(INCLUDE|EXCLUDE)\b", tail, re.IGNORECASE)
     if m2:
         logger.warning(
-            "[SecondTriage] Decision: prefix not found — matched bare word in tail: %r",
+            "[SecondTriage] Decision: prefix not found â€” matched bare word in tail: %r",
             m2.group(0),
         )
         return (m2.group(1).upper(), f"Include: {include_str} | Exclude: {exclude_str}")
 
     logger.warning(
-        "[SecondTriage] Could not parse INCLUDE/EXCLUDE decision — defaulting to INCLUDE. "
+        "[SecondTriage] Could not parse INCLUDE/EXCLUDE decision â€” defaulting to INCLUDE. "
         "Raw tail: %r",
         reasoning_text[-200:],
     )
-    return ("INCLUDE", "parse error — defaulting to INCLUDE")
+    return ("INCLUDE", "parse error â€” defaulting to INCLUDE")
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+# â”€â”€ Main entry point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def run_one(variant_context: str, llm: "LLMClient") -> str:
     """
-    Stage 2 — Two-call clinical reasoning for one variant.
+    Stage 2 â€” Two-call clinical reasoning for one variant.
 
     Call 1 (reasoning):
         Generates step-by-step clinical reasoning grounded in cited evidence only.
@@ -152,19 +152,19 @@ def run_one(variant_context: str, llm: "LLMClient") -> str:
         on its own line. Compatible with parse_inclusion_decision() and with the
         REASONING display section in pipeline.py.
     """
-    # ── Call 1: evidence-grounded narrative ───────────────────────────────────
-    logger.info("[Reasoning] Call 1/2 — step-by-step reasoning...")
+    # â”€â”€ Call 1: evidence-grounded narrative â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    logger.info("[Reasoning] Call 1/2 â€” step-by-step reasoning...")
     reasoning_template = _load_reasoning_prompt()
     reasoning_user     = reasoning_template.replace("{augmented_context}", variant_context)
 
     reasoning_text = llm.generate(
-        system="You are an expert clinical geneticist.",
+        system="You are an expert clinical geneticist. Base every claim strictly on the evidence below.",
         user=reasoning_user,
         max_tokens=MAX_NEW_TOKENS_REASONING,
     )
 
-    # ── Call 2: binary inclusion decision ────────────────────────────────────
-    logger.info("[Reasoning] Call 2/2 — second_triage inclusion decision (INCLUDE/EXCLUDE)...")
+    # â”€â”€ Call 2: binary inclusion decision â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    logger.info("[Reasoning] Call 2/2 â€” second_triage inclusion decision (INCLUDE/EXCLUDE)...")
     scoring_template = _load_scoring_prompt()
     scoring_user     = (
         scoring_template
@@ -173,16 +173,18 @@ def run_one(variant_context: str, llm: "LLMClient") -> str:
     )
 
     decision_text = llm.generate(
-        system="You are an expert clinical geneticist.",
+        system="You are an expert clinical geneticist. Base every claim strictly on the evidence below.",
         user=scoring_user,
         max_tokens=MAX_NEW_TOKENS_SCORING,
     )
 
     logger.debug("[SecondTriage] Full model output:\n%s", decision_text.strip())
 
-    # ── Combine for downstream display ───────────────────────────────────────
+    # â”€â”€ Combine for downstream display â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # parse_inclusion_decision() searches for the Decision: line within the
     # "SECOND TRIAGE:" block.  The full three-line output is preserved so the
     # REASONING display section shows Include-case / Exclude-case / Decision.
     combined = reasoning_text.rstrip() + "\n\nSECOND TRIAGE:\n" + decision_text.strip()
     return combined
+
+

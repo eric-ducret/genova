@@ -1,13 +1,13 @@
-"""
-pipeline/stages/first_triage.py — Post-retrieval SLM triage stage.
+﻿"""
+pipeline/stages/first_triage.py â€” Post-retrieval SLM triage stage.
 
 One small SLM call per variant immediately after retrieval.
 Decides whether a variant can be discarded with high confidence before
 the more expensive reasoning stage runs.
 
 Expected SLM output format (from prompts/first_triage.txt):
-    Keep-case: <strongest reason to keep, ≤10 words>
-    Discard-case: <strongest reason to discard, ≤10 words>
+    Keep-case: <strongest reason to keep, â‰¤10 words>
+    Discard-case: <strongest reason to discard, â‰¤10 words>
     Decision: KEEP or DISCARD
 
 Public API:
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _PROMPT_PATH   = Path(__file__).parent.parent.parent / "prompts" / "first_triage.txt"
-_SYSTEM_PROMPT = "You are an expert clinical geneticist."
+_SYSTEM_PROMPT = "You are an expert clinical geneticist. Base every claim strictly on the evidence below."
 
 
 def _load_prompt() -> str:
@@ -48,14 +48,14 @@ def parse_triage(raw: str) -> tuple[str, str]:
     Parse the raw SLM reply for a first-triage call.
 
     Expected format (blank lines tolerated between lines):
-        Keep-case: <strongest reason to keep, ≤10 words>
-        Discard-case: <strongest reason to discard, ≤10 words>
+        Keep-case: <strongest reason to keep, â‰¤10 words>
+        Discard-case: <strongest reason to discard, â‰¤10 words>
         Decision: KEEP or DISCARD
 
     Returns:
         ("KEEP",    justification)  if Decision is KEEP.
         ("DISCARD", justification)  if Decision is DISCARD.
-        ("KEEP",    "parse error — defaulting to KEEP") on any parse failure.
+        ("KEEP",    "parse error â€” defaulting to KEEP") on any parse failure.
 
     justification = "Keep: <keep_case> | Discard: <discard_case>" for auditability.
     Only the Decision: value affects the keep/discard outcome.
@@ -81,8 +81,8 @@ def parse_triage(raw: str) -> tuple[str, str]:
         justification = f"Keep: {keep_str} | Discard: {discard_str}" if (keep_str or discard_str) else decision
         return (decision, justification)
 
-    logger.warning("[FirstTriage] Could not parse response: %r — defaulting to KEEP", raw[:200])
-    return ("KEEP", "parse error — defaulting to KEEP")
+    logger.warning("[FirstTriage] Could not parse response: %r â€” defaulting to KEEP", raw[:200])
+    return ("KEEP", "parse error â€” defaulting to KEEP")
 
 
 def run_one(
@@ -91,7 +91,7 @@ def run_one(
     llm: "LLMClient",
 ) -> tuple[str, str]:
     """
-    First triage — fast discard gate immediately after retrieval.
+    First triage â€” fast discard gate immediately after retrieval.
 
     Args:
         variant_context:   Per-variant context string from Stage 1 (retrieval).
@@ -101,7 +101,7 @@ def run_one(
     Returns:
         ("KEEP", justification) or ("DISCARD", justification) where justification
         is "Keep: <keep_case> | Discard: <discard_case>" from the SLM output.
-        On SLM or parse failure always returns ("KEEP", ...) — never silently
+        On SLM or parse failure always returns ("KEEP", ...) â€” never silently
         drops a variant.
     """
     user_prompt = (
@@ -117,7 +117,9 @@ def run_one(
             max_tokens=100,
         )
     except Exception as exc:
-        logger.warning("[FirstTriage] SLM call failed: %s — defaulting to KEEP", exc)
-        return ("KEEP", f"SLM error — defaulting to KEEP: {exc}")
+        logger.warning("[FirstTriage] SLM call failed: %s â€” defaulting to KEEP", exc)
+        return ("KEEP", f"SLM error â€” defaulting to KEEP: {exc}")
 
     return parse_triage(raw)
+
+

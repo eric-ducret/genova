@@ -42,7 +42,7 @@ from pipeline.config          import (
 )
 from pipeline.core.manifest  import ManifestLoader
 from pipeline.core.executor  import Executor
-from pipeline.core.normalizer import TARGET_COLUMNS
+from pipeline.core.normalizer import TARGET_COLUMNS, normalize_gene
 from pipeline.llm.registry   import get_client
 from pipeline.tools          import AutoPVS1Tool, LitVar2SummaryTool, SpliceAITool, WebSearchAgentTool
 from pipeline.stages         import retrieval, reasoning, conclusion, cross_analysis, final_conclusion, first_triage
@@ -96,7 +96,7 @@ def _group_by_gene(variants: list[dict]) -> dict[str, list[int]]:
     """
     groups: dict[str, list[int]] = defaultdict(list)
     for i, variant in enumerate(variants):
-        gene = variant.get("Gene", "NA")
+        gene = normalize_gene(variant.get("Gene", "NA"))
         if gene and gene != "NA":
             groups[gene].append(i)
     return dict(groups)
@@ -297,6 +297,12 @@ class Pipeline:
         if not variants:
             raise ValueError("variants list is empty — nothing to analyze.")
 
+        # Reset per-run state: _disease_query is derived from patient_phenotype and
+        # must not bleed across run() calls when the same Pipeline instance is reused.
+        for _tool in self._tools:
+            if hasattr(_tool, "_disease_query"):
+                _tool._disease_query = None
+
         n = len(variants)
         logger.info("[Pipeline] Processing %d variants.", n)
 
@@ -409,7 +415,7 @@ class Pipeline:
         # ── Stage 3.5: Gene-level cross-analysis (included variants only) ──────
         gene_groups_included: dict[str, list[int]] = defaultdict(list)
         for i in include_indices:
-            gene = variants[i].get("Gene", "NA")
+            gene = normalize_gene(variants[i].get("Gene", "NA"))
             if gene and gene != "NA":
                 gene_groups_included[gene].append(i)
 
