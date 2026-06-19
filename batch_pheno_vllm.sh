@@ -47,17 +47,17 @@ VLLM_PID=$!
 trap "kill $VLLM_PID 2>/dev/null" EXIT
 
 # --- Wait for vLLM to be ready ---
-for i in $(seq 1 60); do
+for i in $(seq 1 120); do
     if curl -sf http://localhost:8001/v1/models > /dev/null 2>&1; then
         echo "vLLM ready after $((i * 5))s"
         break
     fi
-    if [ $i -eq 60 ]; then
+    if [ $i -eq 120 ]; then
         echo "ERROR: vLLM did not start after 10 minutes. vllm_startup.log:"
         cat "$VLLM_LOG"
         exit 1
     fi
-    echo "  attempt $i/60..."
+    echo "  attempt $i/120..."
     sleep 5
 done
 

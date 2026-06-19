@@ -56,7 +56,7 @@ class NCBIFetchTool(NetworkTool):
     # URL pattern matchers
     _PUBMED_RE  = re.compile(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)")
     _PMC_RE     = re.compile(r"pmc\.ncbi\.nlm\.nih\.gov/articles/PMC(\d+)")
-    _CLINVAR_RE = re.compile(r"ncbi\.nlm\.nih\.gov/clinvar/variation/(\d+)")
+    _CLINVAR_RE = re.compile(r"ncbi\.nlm\.nih\.gov/clinvar/variation/(?:VCV0*)?(\d+)(?:\.\d+)?")
     _NCBI_RE    = re.compile(r"ncbi\.nlm\.nih\.gov")
 
     def __init__(self, max_chars: int = DEFAULT_MAX_CHARS, timeout: int = DEFAULT_TIMEOUT):

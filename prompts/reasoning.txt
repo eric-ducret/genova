@@ -28,6 +28,9 @@ Reason step by step using ONLY the provided evidence.
 4. Inheritance coherence: Evaluate whether the observed zygosity is consistent with
    the gene's known inheritance mode. Use only the inheritance data present in the
    context (variant fields or retrieved evidence).
+   Important: for X-linked genes (Inheritance=XL), variant callers often report the
+   single allele in males as "hom" (homozygous) because there is only one X chromosome.
+   This is hemizygous, not truly homozygous — do not flag it as a contradiction.
 
 5. Flags and uncertainties: Note any contradictions, gaps, or missing evidence
    (e.g. no population frequency data, no literature hits, failed tool). Be explicit

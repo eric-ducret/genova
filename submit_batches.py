@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 _SCRIPT_DIR       = Path(__file__).parent
 _PHENO_CSV        = _SCRIPT_DIR / "pheno_prompts.csv"
@@ -70,7 +71,7 @@ def _load_eligible() -> list[int]:
     return eligible_variants
 
 
-def _compute_n_batches(eligible: list[int], max_hours: float, max_per_batch: int | None = None) -> tuple[int, int, float]:
+def _compute_n_batches(eligible: list[int], max_hours: float, max_per_batch: Optional[int] = None) -> tuple[int, int, float]:
     """Return (n_batches, patients_per_batch, estimated_minutes_per_batch)."""
     available_min = max_hours * 60 - _VLLM_STARTUP_MIN
     avg_variants  = sum(eligible) / len(eligible)

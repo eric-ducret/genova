@@ -21,6 +21,7 @@ Use exactly this format:
 **Molecular mechanism:** [one sentence]
 **Phenotype fit:** [match / mismatch / uncertain] — [one sentence justification]
 **Inheritance check:** [consistent / inconsistent / insufficient data]
+   Note: homozygous in an AR gene = consistent. "hom" for an X-linked gene = hemizygous in males, consistent with XL.
 **Evidence strength:** [strong / moderate / weak / absent]
 **ACMG criteria**: [criteria with justification]
 **Comment:** [2–3 sentences]

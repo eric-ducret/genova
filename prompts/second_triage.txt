@@ -27,7 +27,7 @@ Does at least one of the following apply?
   - ClinVar Pathogenic or Likely pathogenic, OR
   - Strong ACMG criterion present (PVS1, PS1, PS3, or equivalent), OR
   - Variant rare (AF < 0.1%) with LoF, splice disruption, or CADD ≥ 20, OR
-  - Variant homozygous in a known recessive gene with low population frequency, OR
+  - Variant homozygous or hemizygous (including "hom" in X-linked genes) in a known recessive/X-linked gene with low population frequency, OR
   - Variant or position reported as disease-causing in cited literature.
 Note: "no functional study" does NOT mean no pathogenicity support. Rarity, high CADD,
 homozygosity, and a strong gene-disease link are positive signals even without wet-lab data.

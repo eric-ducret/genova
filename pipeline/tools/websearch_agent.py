@@ -566,7 +566,6 @@ class WebSearchAgentTool(ReActTool):
         adapted_llm = _LLMAdapter(context.llm)
         agent = ReActAgent(cfg, tools, llm=adapted_llm)
 
-        # Force the first search to always be "{gene} disease" as a grounding entry point.
         gene = normalize_gene(context.field("Gene"))
         forced_first_query = f"{gene} disease" if gene != "NA" else ""
 

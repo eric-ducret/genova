@@ -314,6 +314,9 @@ class LitVar2SummaryTool(SLMTool):
             resp = None
             for attempt in range(_NCBI_MAX_ATTEMPTS):
                 resp = requests.get(url, params=api_params, timeout=self.timeout)
+                if resp.status_code == 400:
+                    logger.debug("LitVar2: %s not indexed (400) — no variant-level publications", rsid)
+                    return []
                 if resp.status_code != 429:
                     resp.raise_for_status()
                     break

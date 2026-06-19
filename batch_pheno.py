@@ -26,6 +26,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -89,7 +90,16 @@ def _load_batch(batch_number: int, n_batches: int) -> list[tuple[str, str]]:
         batch_number, n_batches,
         start + 1, start + size, total, size,
     )
-    return list(zip(chunk["patient_id"].astype(str), chunk["prompt"].astype(str)))
+    pairs = list(zip(chunk["patient_id"].astype(str), chunk["prompt"].astype(str)))
+    _EMPTY_PHENOTYPE = {"unknown", "na", "n/a", "", "none", "unspecified"}
+    for pid, prompt in pairs:
+        if prompt.strip().lower() in _EMPTY_PHENOTYPE or len(prompt.strip()) < 10:
+            logger.warning(
+                "[batch_pheno] Patient %s has missing/trivial phenotype %r — "
+                "pipeline results will be unreliable",
+                pid, prompt.strip()[:40],
+            )
+    return pairs
 
 
 def _warmup_track1(
@@ -170,10 +180,10 @@ async def _run_all(
     patients: list[tuple[str, str]],
     jobs_folder: Path,
     pipeline,
-) -> list[str | None]:
+) -> list:
     from pipeline.core.normalizer import normalize_upload
 
-    saved: list[str | None] = []
+    saved = []
     for i, (patient_id, phenotype) in enumerate(patients, 1):
         csv_path = jobs_folder / f"cut_viland_{patient_id}.csv"
         logger.info("[batch_pheno] Job %d/%d — %s", i, len(patients), csv_path.name)
