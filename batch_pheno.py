@@ -42,6 +42,9 @@ try:
 except ImportError:
     pass
 
+from pipeline.config import DEFAULT_MODEL
+from pipeline.llm.registry import MODELS
+
 _SCRIPT_DIR   = Path(__file__).parent
 _PHENO_CSV    = _SCRIPT_DIR / "pheno_prompts.csv"
 _RESULTS_DIR  = _SCRIPT_DIR / "results"
@@ -281,11 +284,11 @@ def main() -> None:
     from pipeline.pipeline import Pipeline
     if args.backend == "hf":
         from pipeline.llm.hf_client import HFClient
-        llm = HFClient(model_id="Qwen/Qwen3.5-9B")
+        llm = HFClient(model_id=MODELS[DEFAULT_MODEL]["model_id"])
         pipeline = Pipeline(llm=llm)
     else:
         pipeline = Pipeline(
-            model_name="qwen3.5-9b",
+            model_name=DEFAULT_MODEL,
             llm_kwargs={"base_url": args.vllm_url},
         )
 

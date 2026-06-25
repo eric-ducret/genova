@@ -27,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.core.normalizer import normalize_upload
 from pipeline.pipeline import Pipeline
+from pipeline.config import DEFAULT_MODEL
+from pipeline.llm.registry import MODELS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -62,12 +64,12 @@ def _get_pipeline() -> Pipeline:
         if _LLM_BACKEND == "hf":
             # Dev / CPU fallback — build HFClient directly and pass it in
             from pipeline.llm.hf_client import HFClient
-            _llm = HFClient(model_id="Qwen/Qwen3.5-9B", use_4bit=_USE_4BIT)
+            _llm = HFClient(model_id=MODELS[DEFAULT_MODEL]["model_id"], use_4bit=_USE_4BIT)
             _pipeline = Pipeline(llm=_llm)
         else:
             # Production: vLLM OpenAI-compatible endpoint
             _pipeline = Pipeline(
-                model_name="qwen3.5-9b",
+                model_name=DEFAULT_MODEL,
                 llm_kwargs={"base_url": _VLLM_BASE_URL},
             )
     return _pipeline
@@ -78,7 +80,7 @@ def _get_pipeline() -> Pipeline:
 @app.get("/health")
 def health():
     """Liveness check. Returns 200 if the server process is running."""
-    return {"status": "ok", "model": "qwen3.5-9b", "backend": _LLM_BACKEND}
+    return {"status": "ok", "model": DEFAULT_MODEL, "backend": _LLM_BACKEND}
 
 
 @app.post("/analyze")

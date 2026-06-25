@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 _RESULTS_DIR = Path(__file__).parent / "results"
 
+from pipeline.config import DEFAULT_MODEL
+from pipeline.llm.registry import MODELS
+
 
 def _find_jobs(folder: Path) -> list[tuple[Path, Path]]:
     """Return (csv, txt) pairs found in folder, matched by stem."""
@@ -124,11 +127,11 @@ def main() -> None:
     from pipeline.pipeline import Pipeline
     if args.backend == "hf":
         from pipeline.llm.hf_client import HFClient
-        llm = HFClient(model_id="Qwen/Qwen3.5-9B")
+        llm = HFClient(model_id=MODELS[DEFAULT_MODEL]["model_id"])
         pipeline = Pipeline(llm=llm)
     else:
         pipeline = Pipeline(
-            model_name="qwen3.5-9b",
+            model_name=DEFAULT_MODEL,
             llm_kwargs={"base_url": args.vllm_url},
         )
 

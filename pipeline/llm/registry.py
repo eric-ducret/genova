@@ -15,10 +15,19 @@ from pipeline.llm.base import LLMClient
 
 MODELS: dict[str, dict] = {
     "qwen3.5-9b": {
-        "client":           "vllm",
-        "model_id":         "Qwen/Qwen3.5-9B",
-        "enable_thinking":  False,   # MUST remain False — thinking tokens break downstream parsing
+        "client":             "vllm",
+        "model_id":           "Qwen/Qwen3.5-9B",
+        "enable_thinking":    False,   # MUST remain False — thinking tokens break downstream parsing
         "max_tokens_default": 1024,
+        # Qwen3 requires this vLLM extension to suppress thinking-mode preambles.
+        "vllm_extra_payload": {"chat_template_kwargs": {"enable_thinking": False}},
+    },
+    "gemma4-e4b": {
+        "client":             "vllm",
+        "model_id":           "google/gemma-4-E4B",
+        "enable_thinking":    False,
+        "max_tokens_default": 1024,
+        # No vllm_extra_payload needed — Gemma uses a standard chat template.
     },
     # Add new models here following the same pattern.
     # "my-new-model": {
@@ -26,6 +35,7 @@ MODELS: dict[str, dict] = {
     #     "model_id": "org/model",
     #     "enable_thinking": False,
     #     "max_tokens_default": 1024,
+    #     "vllm_extra_payload": {},   # optional: extra fields merged into every request payload
     # },
 }
 
@@ -55,7 +65,8 @@ def get_client(model_name: str, **kwargs) -> LLMClient:
 
     if client_type == "vllm":
         from pipeline.llm.vllm_client import VLLMClient
-        return VLLMClient(model_id=model_id, **kwargs)
+        extra = config.get("vllm_extra_payload", {})
+        return VLLMClient(model_id=model_id, extra_payload=extra, **kwargs)
 
     if client_type == "hf":
         from pipeline.llm.hf_client import HFClient

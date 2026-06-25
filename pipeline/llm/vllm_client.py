@@ -44,11 +44,13 @@ class VLLMClient(LLMClient):
         base_url: str = "http://localhost:8001",
         model_id: str = "Qwen/Qwen3.5-9B",
         request_timeout: float = 300.0,
+        extra_payload: dict | None = None,
         **kwargs,
     ):
-        self.base_url       = base_url.rstrip("/")
-        self.model_id       = model_id
+        self.base_url        = base_url.rstrip("/")
+        self.model_id        = model_id
         self.request_timeout = request_timeout
+        self._extra_payload  = extra_payload or {}
 
     def generate(
         self,
@@ -67,7 +69,7 @@ class VLLMClient(LLMClient):
             "messages":    messages,
             "max_tokens":  max_tokens,
             "temperature": temperature,
-            "chat_template_kwargs": {"enable_thinking": False},
+            **self._extra_payload,
         }
         _retries = 2
         _backoff  = 15.0
@@ -107,6 +109,7 @@ class VLLMClient(LLMClient):
             "messages":    messages,
             "max_tokens":  max_tokens,
             "temperature": temperature,
+            **self._extra_payload,
         }
         async with httpx.AsyncClient(timeout=self.request_timeout) as client:
             resp = await client.post(

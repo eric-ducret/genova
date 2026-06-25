@@ -221,6 +221,37 @@ at first triage.
 
 ---
 
+## Analysing results
+
+After a batch run, use `analyse_results/analyse_results.py` to produce a
+per-case summary CSV:
+
+```bash
+bash analyse_results/analyse_results.sh
+# or directly:
+python analyse_results/analyse_results.py \
+    --results-dir /path/to/results \
+    --pheno-csv   pheno_prompts.csv \
+    --vllm-url    http://localhost:8001 \
+    --workers     8
+```
+
+The script requires the vLLM server to be running. It:
+
+1. Reads the most recent `report.txt` per patient from `results/`
+2. Calls the SLM to rank included variants by probability of being causative
+3. Anchors the ranked list to genes confirmed by regex (anti-hallucination)
+4. Parses stage-level funnel statistics (first triage, second triage, inclusion)
+5. Cross-references with `pheno_prompts.csv` for expert solution genes and rank tracking
+
+Output: `analyse_results/results_table_{YYYYMMDD}.csv` — one row per case, ready
+for `analysis_notebook.ipynb`.
+
+The script has no external dependencies beyond the Python standard library — it
+uses its own minimal `_VLLMClient` and does not import from `pipeline/`.
+
+---
+
 ## Adding a new tool
 
 See `TOOL_DEVELOPMENT.md` for the full guide. Minimum steps:

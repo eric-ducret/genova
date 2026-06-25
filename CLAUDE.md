@@ -39,6 +39,12 @@ variant-pipeline/
 ├── batch.py                         ← batch runner: process a folder of variant files
 ├── server.py                        ← FastAPI entry point (thin, no business logic)
 │
+├── analyse_results/
+│   ├── analyse_results.py           ← post-processing: per-case CSV from report.txt files
+│   ├── analyse_results.sh           ← SLURM wrapper for analyse_results.py
+│   ├── analysis_notebook.ipynb      ← Jupyter notebook for metric visualisation
+│   └── augment_litvar2.py           ← (auxiliary) LitVar2 enrichment for result tables
+│
 ├── pipeline/
 │   ├── __init__.py
 │   ├── pipeline.py                  ← top-level orchestrator
@@ -635,6 +641,90 @@ The combined conclusions text is truncated to 50 000 characters before the LLM
 call (`_MAX_CONCLUSIONS_CHARS`) to prevent a `400 Bad Request` from vLLM when a
 large number of variants are included and the combined text exceeds
 `--max-model-len 16384` tokens.
+
+---
+
+## Post-processing — `analyse_results/`
+
+### Purpose
+
+`analyse_results.py` reads the `report.txt` files produced by batch pipeline runs and
+computes a per-case analysis CSV (`results_table_{YYYYMMDD}.csv`). It is a standalone
+script — it does **not** import from the `pipeline/` package and has no external
+dependencies beyond the Python standard library.
+
+### What it does (per patient)
+
+1. **Final conclusion extraction** (`_extract_final_conclusion`) — locates the
+   `# Reasoning` / `# Clinical Conclusion` synthesis block in the FINAL REPORT section.
+   Accepts both `#` and `##` header variants (SLM output can vary). Falls back to the
+   last `---`-separated block when neither header pattern is found — covers cases where
+   the SLM outputs plain text or an unexpected header level.
+
+2. **Variant ranking** — calls the vLLM server to ask the SLM to rank the included
+   variants from most to least probable causative (JSON array of `"GENE (HGVS)"` strings).
+   `max_tokens=400` is used to avoid truncation on large lists.
+
+3. **Anti-hallucination anchoring** (`_filter_ranked_variants`) — after the SLM ranks the
+   variants, the ranked list is anchored to the set of genes confirmed by regex
+   (`conclusion_genes` from `_parse_report_funnel`):
+   - Step 1: remove ranked identifiers whose leading gene token is not in `conclusion_genes`
+     (eliminates SLM hallucinations).
+   - Step 2: append any `conclusion_genes` the SLM omitted (ensures completeness, preserving
+     report order).
+   When the synthesis block is missing entirely, `conclusion_genes` is used directly as the
+   ranking fallback (no SLM call needed, no hallucination risk).
+
+4. **Stage funnel parsing** (`_parse_report_funnel`) — pure-regex extraction of stage-level
+   statistics: n_input, first triage results, second triage decisions, included variants,
+   and genes with conclusion blocks. Runs before the SLM ranking so `conclusion_genes` can
+   anchor the ranked list.
+
+5. **Expert gene cross-reference** — looks up the expert solution gene from `pheno_prompts.csv`
+   and determines whether it survived each pipeline stage (`_expert_stage_info`) and its
+   rank in the SLM-ranked list (`_find_expert_rank`).
+
+### Standalone vLLM client
+
+`_VLLMClient` is a minimal vLLM HTTP client using only `urllib.request` (stdlib). It
+replaces the previous import of `pipeline.llm.vllm_client` so the script can run
+on the cluster login node or in any environment without the full pipeline package
+installed. It sends `"chat_template_kwargs": {"enable_thinking": False}` in every
+request, consistent with the pipeline's vLLM client.
+
+### Output
+
+`results_table_{YYYYMMDD}.csv` — one row per case. Key columns:
+
+| Column | Description |
+|---|---|
+| `patient_id` | Patient stem (directory name with timestamp stripped) |
+| `n_variants` | Number of input variants |
+| `triage_ran` | Whether first triage ran (n > threshold) |
+| `n_discarded_triage` | Variants discarded at first triage |
+| `n_excluded_reasoning` | Variants excluded at second triage |
+| `n_included` | Variants included in conclusion |
+| `ranked_variants` | SLM-ranked list, anchored to conclusion genes |
+| `expert_gene` | Solution gene from pheno_prompts.csv |
+| `expert_rank` | 1-indexed rank of expert gene in `ranked_variants` (None if absent) |
+| `expert_survived_*` | Boolean per stage: did the expert gene pass? |
+
+### Running
+
+```bash
+# On the cluster (after sbatch launch.sh has produced results):
+bash analyse_results/analyse_results.sh
+
+# Directly:
+python analyse_results/analyse_results.py \
+    --results-dir /path/to/results \
+    --pheno-csv   /path/to/pheno_prompts.csv \
+    --vllm-url    http://localhost:8001 \
+    --workers     8 \
+    --output-dir  analyse_results/
+```
+
+The script requires the vLLM server to be running (same server used by the pipeline).
 
 ---
 

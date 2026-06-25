@@ -33,12 +33,53 @@ import json
 import logging
 import re
 import sys
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+
+class _VLLMClient(object):
+    """Minimal stdlib-only vLLM HTTP client (no httpx/requests dependency)."""
+
+    def __init__(self, base_url="http://localhost:8001", model_id="Qwen/Qwen3.5-9B", timeout=300):
+        self.base_url = base_url.rstrip("/")
+        self.model_id = model_id
+        self.timeout  = timeout
+
+    def generate(self, system, user, max_tokens=512, temperature=0.0, **kwargs):
+        # type: (str, str, int, float) -> str
+        payload = json.dumps({
+            "model":       self.model_id,
+            "messages":    [{"role": "system", "content": system},
+                            {"role": "user",   "content": user}],
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "{0}/v1/chat/completions".format(self.base_url),
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"].strip()
+
+    def is_available(self):
+        # type: () -> bool
+        try:
+            urllib.request.urlopen(
+                "{0}/health".format(self.base_url), timeout=5
+            )
+            return True
+        except Exception:
+            return False
+
 
 _DEFAULT_RESULTS_DIR = Path(__file__).parent.parent / "results"
 _DEFAULT_OUTPUT_DIR  = Path(__file__).parent
@@ -77,11 +118,15 @@ Example output: ["SIM1 (NM_005068.3:c.744-2A>G p.?)", "CCNP (NM_024877.4:c.305du
 
 # ─── report parsing — final conclusion extraction ─────────────────────────────
 
-def _extract_final_conclusion(report_text: str) -> str | None:
+def _extract_final_conclusion(report_text):
+    # type: (str) -> Optional[str]
     """
     Extract the # Reasoning + # Clinical Conclusion synthesis block from
     the FINAL REPORT section. The synthesis is always the last block before
     the optional appendix (## Variants not included in conclusion).
+
+    Falls back to the last ---‑separated block when the SLM omits the
+    expected markdown headers (e.g. outputs ## instead of #, or plain text).
     """
     final_report_match = re.search(
         r"={60}\nFINAL REPORT\n={60}\n(.*?)(?=\n={60}|\Z)",
@@ -93,24 +138,36 @@ def _extract_final_conclusion(report_text: str) -> str | None:
 
     final_report = final_report_match.group(1)
 
-    pos = final_report.rfind("# Reasoning\n")
-    if pos == -1:
-        pos = final_report.rfind("# Clinical Conclusion\n")
-    if pos == -1:
-        return None
+    # Strip the appendix before any search so rfind targets the synthesis block.
+    appendix_start = re.search(r"\n---\n\n##\s*Variants not included", final_report)
+    if appendix_start:
+        final_report = final_report[: appendix_start.start()]
 
-    synthesis = final_report[pos:]
+    # Primary: look for exact markdown headers produced by the prompt template.
+    # Also accept ## (two hashes) in case the SLM added an extra level.
+    for header in ("# Reasoning\n", "# Clinical Conclusion\n",
+                   "## Reasoning\n", "## Clinical Conclusion\n"):
+        pos = final_report.rfind(header)
+        if pos != -1:
+            return final_report[pos:].strip() or None
 
-    appendix_match = re.search(r"\n---\n\n##\s*Variants not included", synthesis)
-    if appendix_match:
-        synthesis = synthesis[: appendix_match.start()]
+    # Fallback: the final_summary is always the last ---‑separated chunk.
+    chunks = re.split(r"\n\n---\n\n", final_report)
+    if chunks:
+        last = chunks[-1].strip()
+        if last:
+            logger.warning(
+                "[analyse] Final conclusion headers missing — using last --- block as fallback"
+            )
+            return last
 
-    return synthesis.strip() or None
+    return None
 
 
 # ─── ranked variant parsing ───────────────────────────────────────────────────
 
-def _parse_ranked_variants(response: str) -> list[str]:
+def _parse_ranked_variants(response):
+    # type: (str) -> List[str]
     """
     Parse the SLM ranking response into an ordered list of variant identifiers.
 
@@ -137,19 +194,35 @@ def _parse_ranked_variants(response: str) -> list[str]:
     array_match = re.search(r"\[(.+)\]", text, re.DOTALL)
     if array_match:
         try:
-            parsed = json.loads(f"[{array_match.group(1)}]")
+            parsed = json.loads("[{0}]".format(array_match.group(1)))
             if isinstance(parsed, list):
                 return [str(item).strip() for item in parsed if str(item).strip()]
         except (json.JSONDecodeError, ValueError):
             pass
+
+    # Truncated array fallback: extract all double-quoted strings in order.
+    # Handles the case where max_tokens cut the JSON array before the closing ].
+    quoted = re.findall(r'"([^"]+)"', text)
+    if quoted:
+        logger.warning("[analyse] Truncated JSON array — extracting quoted strings directly")
+        seen = set()
+        result = []
+        for item in quoted:
+            item = item.strip()
+            if item and item.upper() not in seen:
+                seen.add(item.upper())
+                result.append(item)
+        if result:
+            return result
 
     # Last resort: split and extract gene-like tokens
     logger.warning("[analyse] JSON parse failed for ranking response; falling back to token split")
     return _fallback_parse_gene_tokens(text)
 
 
-def _fallback_parse_gene_tokens(text: str) -> list[str]:
-    """Fallback: extract gene-like tokens from unstructured ranking response."""
+def _fallback_parse_gene_tokens(text):
+    # type: (str) -> List[str]
+    """Fallback: extract gene-like tokens from unstructured or truncated ranking response."""
     text = re.sub(
         r"^(?:(?:the )?(?:ranked |ordered )?genes?(?:[^:]*):?\s*)",
         "",
@@ -157,12 +230,14 @@ def _fallback_parse_gene_tokens(text: str) -> list[str]:
         flags=re.IGNORECASE,
     )
     parts = re.split(r"[,\n]+", text)
-    seen: set[str] = set()
-    result: list[str] = []
+    seen = set()
+    result = []
     for part in parts:
         token = part.strip()
         token = re.sub(r"^\d+[\.\)\-]\s*", "", token).strip()
-        token = re.sub(r"[*_`#]", "", token).strip()
+        # Strip markdown chars AND JSON quote characters so truncated JSON arrays
+        # like ["RPGRIP1 (NM_...)","SAMD11 don't fail the gene fullmatch below.
+        token = re.sub(r'[*_`#"\']', "", token).strip()
         gene = re.split(r"[\s(]", token)[0].strip()
         if gene and re.fullmatch(r"[A-Za-z][A-Za-z0-9\-]{1,19}", gene):
             key = gene.upper()
@@ -174,7 +249,8 @@ def _fallback_parse_gene_tokens(text: str) -> list[str]:
 
 # ─── report parsing — stage funnel ────────────────────────────────────────────
 
-def _split_gene_field(raw_list: list[str]) -> list[str]:
+def _split_gene_field(raw_list):
+    # type: (List[str]) -> List[str]
     """
     Flatten a list of raw gene captures into individual unique gene names.
 
@@ -187,7 +263,8 @@ def _split_gene_field(raw_list: list[str]) -> list[str]:
     ))
 
 
-def _parse_report_funnel(report_text: str) -> dict:
+def _parse_report_funnel(report_text):
+    # type: (str) -> Dict
     """
     Extract stage-level funnel statistics and per-variant decisions from report.
 
@@ -205,7 +282,7 @@ def _parse_report_funnel(report_text: str) -> dict:
         included_genes       : gene names included at second triage
         conclusion_genes     : gene names with conclusion blocks in FINAL REPORT
     """
-    result: dict = {
+    result = {
         "n_input": None,
         "triage_ran": False,
         "n_discarded_triage": 0,
@@ -315,7 +392,8 @@ def _parse_report_funnel(report_text: str) -> dict:
 
 # ─── expert variant tracking ─────────────────────────────────────────────────
 
-def _parse_expert_genes(expert_gene: str | None) -> list[str]:
+def _parse_expert_genes(expert_gene):
+    # type: (Optional[str]) -> List[str]
     """
     Split a potentially compound solution string into individual gene names.
 
@@ -330,7 +408,8 @@ def _parse_expert_genes(expert_gene: str | None) -> list[str]:
     ))
 
 
-def _expert_stage_info(funnel: dict, expert_gene: str | None) -> dict:
+def _expert_stage_info(funnel, expert_gene):
+    # type: (Dict, Optional[str]) -> Dict
     """
     Determine whether any expert gene survived each pipeline stage.
 
@@ -376,7 +455,41 @@ def _expert_stage_info(funnel: dict, expert_gene: str | None) -> dict:
     }
 
 
-def _find_expert_rank(ranked_variants: list[str], expert_gene: str | None) -> int | None:
+def _gene_from_identifier(identifier):
+    # type: (str) -> str
+    """
+    Extract the leading gene symbol from a ranked-variant identifier.
+
+    Handles "GENE (HGVS)", "GENE", and compound-het "GENE1;GENE2 (HGVS)" forms.
+    Returns the first token before any whitespace, parenthesis, or semicolon,
+    uppercased.
+    """
+    return re.split(r"[\s(;]", identifier)[0].strip().upper()
+
+
+def _filter_ranked_variants(ranked, conclusion_genes):
+    # type: (List[str], List[str]) -> List[str]
+    """
+    Anchor the SLM-ranked list to the genes confirmed by regex in the report.
+
+    Two passes:
+      1. Keep only ranked identifiers whose leading gene token is in
+         conclusion_genes (removes SLM hallucinations).
+      2. Append any conclusion_genes that the SLM omitted, preserving their
+         report order (ensures the list is complete).
+    """
+    conclusion_set = {g.upper() for g in conclusion_genes}
+    filtered = [v for v in ranked if _gene_from_identifier(v) in conclusion_set]
+    seen = {_gene_from_identifier(v) for v in filtered}
+    for gene in conclusion_genes:
+        if gene.upper() not in seen:
+            filtered.append(gene)
+            seen.add(gene.upper())
+    return filtered
+
+
+def _find_expert_rank(ranked_variants, expert_gene):
+    # type: (List[str], Optional[str]) -> Optional[int]
     """
     Find the best (lowest) 1-indexed rank of any expert gene in the ranked list.
 
@@ -388,7 +501,7 @@ def _find_expert_rank(ranked_variants: list[str], expert_gene: str | None) -> in
         return None
 
     expert_genes_set = set(expert_genes)
-    best: int | None = None
+    best = None
     for i, identifier in enumerate(ranked_variants):
         # Extract everything before the first space or parenthesis, then split on ";"
         # to handle SLM outputs like "SAG;SAG (HGVS)" for compound het cases.
@@ -403,7 +516,8 @@ def _find_expert_rank(ranked_variants: list[str], expert_gene: str | None) -> in
 
 # ─── auxiliary data loaders ───────────────────────────────────────────────────
 
-def _load_pheno_data(pheno_csv: Path) -> dict[str, dict]:
+def _load_pheno_data(pheno_csv):
+    # type: (Path) -> Dict[str, Dict]
     """
     Load all metadata from pheno_prompts.csv.
 
@@ -419,7 +533,7 @@ def _load_pheno_data(pheno_csv: Path) -> dict[str, dict]:
           one of the known vague strings (visual impairment, blindness, unknown)
         - "specific" otherwise
     """
-    data: dict[str, dict] = {}
+    data = {}
     if not pheno_csv.exists():
         logger.warning(
             "[analyse] pheno_prompts.csv not found at %s — metadata fields will be empty",
@@ -467,16 +581,18 @@ def _load_pheno_data(pheno_csv: Path) -> dict[str, dict]:
 
 # ─── result discovery ────────────────────────────────────────────────────────
 
-def _extract_stem(folder_name: str) -> str:
+def _extract_stem(folder_name):
+    # type: (str) -> str
     return _TIMESTAMP_RE.sub("", folder_name)
 
 
-def _find_latest_reports(results_dir: Path) -> dict[str, Path]:
+def _find_latest_reports(results_dir):
+    # type: (Path) -> Dict[str, Path]
     """
     For each patient stem, return the report.txt from the most recent run.
     Skips subdirectories with no report.txt or unparseable timestamps.
     """
-    best: dict[str, tuple[str, Path]] = {}
+    best = {}
 
     for subdir in sorted(results_dir.iterdir()):
         if not subdir.is_dir():
@@ -503,12 +619,8 @@ def _find_latest_reports(results_dir: Path) -> dict[str, Path]:
 
 # ─── per-patient processing ──────────────────────────────────────────────────
 
-def _process_patient(
-    stem: str,
-    report_path: Path,
-    llm,
-    pheno_data: dict[str, dict],
-) -> dict:
+def _process_patient(stem, report_path, llm, pheno_data):
+    # type: (str, Path, object, Dict[str, Dict]) -> Dict
     """
     Process one patient report. Returns a per-case dict with all §2 fields.
     """
@@ -518,9 +630,13 @@ def _process_patient(
     pheno       = pheno_data.get(stem, {})
     expert_gene = pheno.get("expert_gene", "")
 
+    # Stage funnel parsing (pure regex, no SLM) — done first so conclusion_genes
+    # is available to anchor and validate the SLM ranking below.
+    funnel = _parse_report_funnel(text)
+
     # SLM-based variant ranking from final conclusion
     conclusion = _extract_final_conclusion(text)
-    ranked_variants: list[str] = []
+    ranked_variants = []
 
     if conclusion:
         logger.info("[analyse] Ranking variants for %s ...", stem)
@@ -528,17 +644,30 @@ def _process_patient(
         response = llm.generate(
             system=_RANKING_SYSTEM,
             user=prompt,
-            max_tokens=200,
+            max_tokens=400,
             temperature=0.0,
         )
         ranked_variants = _parse_ranked_variants(response)
         logger.info("[analyse] %s → %d ranked: %s", stem, len(ranked_variants), ranked_variants)
+
+        # Anti-hallucination + completeness: keep only genes confirmed by regex,
+        # and append any the SLM missed (in report order).
+        if funnel["conclusion_genes"]:
+            ranked_variants = _filter_ranked_variants(
+                ranked_variants, funnel["conclusion_genes"]
+            )
+    elif funnel["conclusion_genes"]:
+        # Synthesis block missing entirely — fall back to the regex-confirmed
+        # gene list in report order. No hallucinations possible.
+        ranked_variants = list(funnel["conclusion_genes"])
+        logger.warning(
+            "[analyse] No synthesis block found for %s — using conclusion gene order as fallback",
+            stem,
+        )
     else:
         logger.warning("[analyse] No final conclusion found in %s", report_path)
 
-    # Stage funnel parsing (pure regex, no SLM)
-    funnel     = _parse_report_funnel(text)
-    stage_info = _expert_stage_info(funnel, expert_gene or None)
+    stage_info  = _expert_stage_info(funnel, expert_gene or None)
     expert_rank = _find_expert_rank(ranked_variants, expert_gene or None)
 
     return {
@@ -591,20 +720,21 @@ _OUTPUT_COLUMNS = [
 ]
 
 
-def main() -> None:
+def main():
+    # type: () -> None
     parser = argparse.ArgumentParser(
         description="Extract per-case analysis data from pipeline reports."
     )
     parser.add_argument(
         "--results-dir", type=Path, default=_DEFAULT_RESULTS_DIR, metavar="DIR",
-        help=f"Folder containing per-patient result subdirectories (default: {_DEFAULT_RESULTS_DIR})",
+        help="Folder containing per-patient result subdirectories (default: {0})".format(_DEFAULT_RESULTS_DIR),
     )
     parser.add_argument(
         "--pheno-csv", type=Path, default=_DEFAULT_PHENO_CSV, metavar="CSV",
         help=(
             "pheno_prompts.csv with columns: patient_id, prompt, n_variants, "
             "resolution_status, phenotype_present, solution, is_solution_here "
-            f"(default: {_DEFAULT_PHENO_CSV})"
+            "(default: {0})".format(_DEFAULT_PHENO_CSV)
         ),
     )
     parser.add_argument(
@@ -617,17 +747,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--output-dir", type=Path, default=_DEFAULT_OUTPUT_DIR, metavar="DIR",
-        help=f"Directory for the output CSV (default: {_DEFAULT_OUTPUT_DIR})",
+        help="Directory for the output CSV (default: {0})".format(_DEFAULT_OUTPUT_DIR),
     )
     args = parser.parse_args()
 
     if not args.results_dir.is_dir():
-        print(f"ERROR: {args.results_dir} is not a directory", file=sys.stderr)
+        print("ERROR: {0} is not a directory".format(args.results_dir), file=sys.stderr)
         sys.exit(1)
 
     reports = _find_latest_reports(args.results_dir)
     if not reports:
-        print(f"ERROR: No valid reports found in {args.results_dir}", file=sys.stderr)
+        print("ERROR: No valid reports found in {0}".format(args.results_dir), file=sys.stderr)
         sys.exit(1)
 
     logger.info("[analyse] %d patient(s) found.", len(reports))
@@ -640,15 +770,14 @@ def main() -> None:
         len(pheno_data), n_with_gt,
     )
 
-    from pipeline.llm.vllm_client import VLLMClient
-    llm = VLLMClient(base_url=args.vllm_url)
+    llm = _VLLMClient(base_url=args.vllm_url)
 
     if not llm.is_available():
-        print(f"ERROR: vLLM server not reachable at {args.vllm_url}", file=sys.stderr)
+        print("ERROR: vLLM server not reachable at {0}".format(args.vllm_url), file=sys.stderr)
         sys.exit(1)
 
     # Parallel SLM calls — one per patient
-    all_results: dict[str, dict] = {}
+    all_results = {}
     workers = min(args.workers, len(reports))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
@@ -670,7 +799,7 @@ def main() -> None:
     today   = datetime.now().strftime("%Y%m%d")
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"results_table_{today}.csv"
+    out_path = out_dir / "results_table_{0}.csv".format(today)
 
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_OUTPUT_COLUMNS, extrasaction="ignore")

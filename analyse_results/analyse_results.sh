@@ -12,11 +12,11 @@
 #   results_dir  — path to results folder       (default below)
 #   workers      — parallel SLM workers          (default: 8)
 #   pheno_csv    — path to pheno_prompts.csv     (default below)
-RESULTS_DIR="${1:-/work/PRTNR/CHUV/MED/fsantoni1/pitnet/AI/JING/GenMasterAI/eric_folder/genova_vllm_556_0610/results}"
+RESULTS_DIR="${1:-/work/PRTNR/CHUV/MED/fsantoni1/pitnet/AI/JING/GenMasterAI/eric_folder/genova_vllm_556_0617/results}"
 WORKERS="${2:-8}"
-PHENO_CSV="${3:-/work/PRTNR/CHUV/MED/fsantoni1/pitnet/AI/JING/GenMasterAI/eric_folder/genova_vllm_556_0610/pheno_prompts.csv}"
+PHENO_CSV="${3:-/work/PRTNR/CHUV/MED/fsantoni1/pitnet/AI/JING/GenMasterAI/eric_folder/genova_vllm_556_0617/pheno_prompts.csv}"
 
-PROJECT_DIR="/work/PRTNR/CHUV/MED/fsantoni1/pitnet/AI/JING/GenMasterAI/eric_folder/genova_vllm_556_0610"
+PROJECT_DIR="/work/PRTNR/CHUV/MED/fsantoni1/pitnet/AI/JING/GenMasterAI/eric_folder/genova_vllm_556_0617"
 CONDA_ENV="/work/PRTNR/CHUV/MED/fsantoni1/pitnet/AI/JING/GenMasterAI/eric_folder/env_vllm_0606"
 VLLM_LOG="$PROJECT_DIR/vllm_startup.log"
 

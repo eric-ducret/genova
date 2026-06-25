@@ -31,6 +31,10 @@ from pipeline.core.context import ToolContext
 from pipeline.core.normalizer import normalize_gene
 from pipeline.tools.websearch import WebSearchTool, WebFetchTool
 from pipeline.tools.ncbi import NCBIFetchTool
+from pipeline.config import DEFAULT_MODEL
+from pipeline.llm.registry import MODELS
+
+_DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL]["model_id"]
 
 
 # ─────────────────────────────────────────────
@@ -39,7 +43,7 @@ from pipeline.tools.ncbi import NCBIFetchTool
 
 @dataclass
 class AgentConfig:
-    model_id:            str   = "Qwen/Qwen3.5-9B"
+    model_id:            str   = field(default_factory=lambda: _DEFAULT_MODEL_ID)
     temperature:         float = 0.7
     top_k:               int   = 5
     top_p:               float = 0.8
@@ -561,7 +565,7 @@ class WebSearchAgentTool(ReActTool):
             .replace("{prior_evidence_block}", ""))
 
         # ── Instantiate and run agent ─────────────────────────────────────────
-        cfg   = AgentConfig(model_id="Qwen/Qwen3.5-9B", max_steps=4)
+        cfg   = AgentConfig(max_steps=4)
         tools = [WebSearchTool(), WebFetchTool(max_chars=2000), NCBIFetchTool()]
         adapted_llm = _LLMAdapter(context.llm)
         agent = ReActAgent(cfg, tools, llm=adapted_llm)

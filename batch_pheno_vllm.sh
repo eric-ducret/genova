@@ -13,6 +13,12 @@ BATCH_NUMBER="${1:?Usage: sbatch batch_pheno_vllm.sh <batch_number> <jobs_folder
 JOBS_FOLDER="${2:?Usage: sbatch batch_pheno_vllm.sh <batch_number> <jobs_folder> [n_batches]}"
 N_BATCHES="${3:-10}"
 
+# Model selection — override at submission time:
+#   VARIANT_MODEL=gemma4-e4b VARIANT_MODEL_HF_ID=google/gemma-4-E4B sbatch batch_pheno_vllm.sh ...
+VARIANT_MODEL="${VARIANT_MODEL:-qwen3.5-9b}"
+VARIANT_MODEL_HF_ID="${VARIANT_MODEL_HF_ID:-Qwen/Qwen3.5-9B}"
+VARIANT_MAX_MODEL_LEN="${VARIANT_MAX_MODEL_LEN:-16384}"
+
 CONDA_ENV="/work/PRTNR/CHUV/MED/fsantoni1/pitnet/AI/JING/GenMasterAI/eric_folder/env_vllm_0606"
 VLLM_LOG="/work/PRTNR/CHUV/MED/fsantoni1/pitnet/AI/JING/GenMasterAI/eric_folder/vllm_startup.log"
 
@@ -34,10 +40,10 @@ echo "================"
 echo "Starting batch $BATCH_NUMBER/$N_BATCHES from folder: $JOBS_FOLDER"
 
 # --- Start vLLM server ---
-echo "Starting vLLM server..."
-vllm serve Qwen/Qwen3.5-9B \
+echo "Starting vLLM server (model: $VARIANT_MODEL_HF_ID, max-model-len: $VARIANT_MAX_MODEL_LEN)..."
+vllm serve "$VARIANT_MODEL_HF_ID" \
     --dtype bfloat16 \
-    --max-model-len 16384 \
+    --max-model-len "$VARIANT_MAX_MODEL_LEN" \
     --gpu-memory-utilization 0.90 \
     --port 8001 \
     --enable-prefix-caching \
@@ -62,4 +68,4 @@ for i in $(seq 1 120); do
 done
 
 # --- Run batch pipeline ---
-python batch_pheno.py "$BATCH_NUMBER" "$JOBS_FOLDER" --backend vllm --n-batches "$N_BATCHES"
+VARIANT_MODEL="$VARIANT_MODEL" python batch_pheno.py "$BATCH_NUMBER" "$JOBS_FOLDER" --backend vllm --n-batches "$N_BATCHES"
