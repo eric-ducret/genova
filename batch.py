@@ -56,7 +56,9 @@ async def _run_all(jobs: list[tuple[Path, Path]], pipeline) -> list[str | None]:
         raw = csv_path.read_bytes()
 
         try:
-            variants, raw_rows = normalize_upload(raw, csv_path.name)
+            variants, raw_rows, parental_ab, header_mapping_summary = normalize_upload(
+                raw, csv_path.name, pipeline._llm
+            )
         except ValueError as e:
             logger.error("[batch] Cannot normalize %s: %s — skipping", csv_path.name, e)
             saved.append(None)
@@ -67,7 +69,10 @@ async def _run_all(jobs: list[tuple[Path, Path]], pipeline) -> list[str | None]:
             saved.append(None)
             continue
 
-        report = await pipeline.run(variants, phenotype, raw_rows=raw_rows)
+        report = await pipeline.run(
+            variants, phenotype, raw_rows=raw_rows,
+            parental_ab=parental_ab, header_mapping_summary=header_mapping_summary,
+        )
 
         stem = csv_path.stem
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

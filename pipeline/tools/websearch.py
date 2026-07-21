@@ -12,6 +12,7 @@ contract). They inherit from NetworkTool for the HTTP helpers and the shared
 name/description fields, but override run(query: str) for ReActAgent compatibility.
 """
 
+import os
 import re
 import time
 import threading
@@ -32,7 +33,19 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 
 NCBI_BASE      = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-NCBI_MIN_DELAY = 0.34          # seconds between calls → stays under 3 req/s limit
+# NCBI_API_KEY / NCBI_PARALLEL_JOBS: this module's NCBI traffic (via
+# NCBIFetchTool and ClinVarGeneStatsTool) is paced independently from
+# litvar2.py's own separate rate limiter — both target NCBI E-utilities from
+# the same process. Using the same NCBI_PARALLEL_JOBS-scaled formula
+# litvar2.py already uses (rather than this module's old fixed 0.34s, which
+# assumed it alone owned the full unauthenticated 3 req/s budget) keeps the
+# two independent streams' COMBINED throughput within shouting distance of
+# NCBI's real limit instead of silently doubling it. Not a perfect unified
+# token bucket, but a large improvement over the previous mismatch — the two
+# streams aren't merged since that's a bigger refactor than this fix needs.
+NCBI_API_KEY       = os.environ.get("NCBI_API_KEY", "")
+NCBI_PARALLEL_JOBS = int(os.environ.get("NCBI_PARALLEL_JOBS", "6"))
+NCBI_MIN_DELAY = NCBI_PARALLEL_JOBS / (10.0 if NCBI_API_KEY else 3.0)
 DEFAULT_TIMEOUT  = 15          # seconds
 DEFAULT_MAX_CHARS = 3000       # safe default — main.py can override per tool instance
 

@@ -431,8 +431,25 @@ def _parse_report_funnel(report_text):
     if final_report_m:
         # Non-greedy [^\n]*? stops at the first dash (the em-dash separator),
         # avoiding false matches on hyphens inside HGVS notation.
+        #
+        # Since the ACMG-MOI-layer merge, a variant's base conclusion block
+        # ("# Variant N — GENE (HGVS)") is only displayed as-is for variants
+        # under "## Unclassified" — a variant covered by a MOI layer (De
+        # Novo/Dominant-Inherited/Recessive/X-Linked) instead surfaces under
+        # that layer's own "# <Layer> Analysis — GENE (...)" header. Matching
+        # both header shapes keeps this count from silently collapsing to
+        # just the Unclassified section. Note: a variant whose gene qualifies
+        # for more than one layer (e.g. AD_AR) is deliberately not
+        # deduplicated by the pipeline, so it can be counted more than once
+        # here — this reflects layer coverage, not distinct variants; treat
+        # n_in_conclusion as a QC signal, not an exact variant count, for
+        # any report containing MOI-layer sections. A compound-het "Recessive
+        # Analysis" pair block also contributes only one gene mention (its
+        # own header), not two, since both variants share the same gene.
         conclusion_genes = re.findall(
-            r"^# Variant[^\n]*?[—\-]\s*([A-Za-z][A-Za-z0-9\-]+)",
+            r"^#\s*(?:Variant[^\n]*?[—\-]|"
+            r"(?:De Novo|Dominant-Inherited|Recessive|X-Linked) Analysis\s*[—\-])"
+            r"\s*([A-Za-z][A-Za-z0-9\-]+)",
             final_report_m.group(1),
             re.MULTILINE,
         )

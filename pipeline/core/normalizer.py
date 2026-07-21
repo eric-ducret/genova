@@ -5,10 +5,22 @@ standard TARGET_COLUMNS schema expected by the pipeline.
 Unknown columns are silently ignored.
 Missing target columns are filled with "NA".
 
+Column-to-field mapping is SLM-driven (_map_columns_llm) when an LLMClient is
+provided — the model inspects the header row (+ one sample data row) and
+classifies each column into a TARGET_COLUMNS field, producing a human-readable
+summary of what it understood. When no LLM is provided (e.g. the CLI
+convenience entry point below), a deterministic alias-dict mapper
+(_map_columns_deterministic) is used instead — same COLUMN_ALIASES table this
+normalizer has always used.
+
 Public function:
-    normalize_upload(raw: bytes, filename: str) -> tuple[list[dict], list[dict]]
-        Accepts raw file bytes + original filename (used to detect .xlsx vs .csv).
-        Returns (normalized_variant_dicts, raw_field_dicts).
+    normalize_upload(raw: bytes, filename: str, llm=None) -> tuple[list[dict], list[dict], list[dict] | None, str]
+        Accepts raw file bytes + original filename (used to detect .xlsx vs .csv) +
+        an optional LLMClient for header interpretation.
+        Returns (normalized_variant_dicts, raw_field_dicts, parental_ab, header_mapping_summary).
+        parental_ab is a list of dicts with keys like "proband", "mother", "father"
+        (depending on how many Allelic balance columns exist), or None if none found.
+        header_mapping_summary is human-readable text showing what was understood.
 """
 
 import io
@@ -36,9 +48,11 @@ def normalize_gene(gene_field: str) -> str:
 
 TARGET_COLUMNS = [
     "Variant", "Chromosome", "Position", "RS_ID", "Ref_seq", "Var_seq",
-    "Type", "HGVS", "Zygosity", "Gene", "OMIM_phenotype",
+    "Type", "Transcript", "HGVS", "Zygosity", "Gene", "OMIM_phenotype",
     "OMIM_inheritance", "Inheritance", "ClinVar_class",
-    "Allelic_balance", "Frequency", "CADD_score", "SpliceAI_score",
+    "Allelic_balance", "Frequency", "CADD_score",
+    "REVEL_score", "SIFT_score", "PolyPhen2_score", "AlphaMissense_score",
+    "SpliceAI_score",
 ]
 
 COLUMN_ALIASES = {
@@ -67,6 +81,9 @@ COLUMN_ALIASES = {
     "class": "Type", "var_type": "Type",
     "exonicfunc": "Type",
     "func": "Type",
+    # Transcript
+    "transcript": "Transcript", "refseq": "Transcript", "refseq_id": "Transcript",
+    "nm_id": "Transcript", "accession": "Transcript", "transcript_id": "Transcript",
     # HGVS
     "hgvs": "HGVS", "cdna": "HGVS", "hgvs_c": "HGVS",
     "hgvs_p": "HGVS", "c_dot": "HGVS", "p_dot": "HGVS",
@@ -107,11 +124,24 @@ COLUMN_ALIASES = {
     "cadd_score": "CADD_score", "cadd": "CADD_score", "phred": "CADD_score",
     "cadd_phred": "CADD_score",
     "cadd_v17_phred": "CADD_score",
-    # SpliceAI_score — pre-computed max delta score from any source
+    # REVEL_score
+    "revel_score": "REVEL_score", "revel": "REVEL_score",
+    # SIFT_score
+    "sift_score": "SIFT_score", "sift": "SIFT_score",
+    "sift4g_score": "SIFT_score", "sift_pred": "SIFT_score",
+    # PolyPhen2_score
+    "polyphen2_score": "PolyPhen2_score", "polyphen2": "PolyPhen2_score",
+    "polyphen": "PolyPhen2_score",
+    "polyphen2_hdiv_score": "PolyPhen2_score",
+    "polyphen2_hvar_score": "PolyPhen2_score",
+    # AlphaMissense_score
+    "alphamissense_score": "AlphaMissense_score", "alphamissense": "AlphaMissense_score",
+    "am_pathogenicity": "AlphaMissense_score", "am_score": "AlphaMissense_score",
+    # SpliceAI_score — pre-computed splice-impact prediction from any source
     "spliceai_score": "SpliceAI_score", "spliceai": "SpliceAI_score",
     "spliceai_v13": "SpliceAI_score", "spliceai_max_score": "SpliceAI_score",
     "spliceai_maxscore": "SpliceAI_score", "spliceai_ds_max": "SpliceAI_score",
-    "spliceai_max": "SpliceAI_score",
+    "spliceai_max": "SpliceAI_score", "ds_max": "SpliceAI_score",
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -157,15 +187,58 @@ def _normalize_type(raw: str) -> str:
     return _TYPE_MAP.get(raw.strip().lower(), raw)
 
 
-def _parse_spliceai_score(raw: str) -> str:
-    """Normalize SpliceAI_score: ANNOVAR writes four pipe-separated delta scores → extract max."""
-    if raw == "NA":
-        return "NA"
-    try:
-        vals = [float(x) for x in raw.split("|") if x.strip() not in ("", ".")]
-        return str(round(max(vals), 4)) if vals else "NA"
-    except ValueError:
-        return raw  # already a plain float string
+def _parse_spliceai_value(raw: str) -> str:
+    """
+    Collapse a compound splice-prediction annotation string down to a single
+    max score. Triggered by value shape, never by the source column's name —
+    works regardless of which annotation tool/plugin produced it or what its
+    header was called.
+
+    Two known fixed schemas are handled by position (same approach as
+    _parse_aachange() for ANNOVAR's AAChange column):
+      - SpliceAI plugin, 10 pipe-delimited fields:
+        ALLELE|SYMBOL|DS_AG|DS_AL|DS_DG|DS_DL|DP_AG|DP_AL|DP_DG|DP_DL
+        Only indices 2-5 are 0-1 delta scores; 6-9 are integer genomic
+        offsets (can coincide with 0/1 and would otherwise look like a
+        plausible delta) — so a blind "any float in 0-1" scan is unsafe here.
+      - dbscSNV ada_score;rf_score pair — both already plain 0-1 scores.
+
+    Any other shape falls back to treating every ';'/'|'/','-delimited token
+    that parses as a 0-1 float as a candidate score. Leaves the value
+    untouched if it already looks like a plain scalar.
+    """
+    if not raw or raw in ("NA", ".", "", "nan"):
+        return raw
+
+    pipe_tokens = raw.split("|")
+    if len(pipe_tokens) == 10:
+        deltas = []
+        for t in pipe_tokens[2:6]:
+            try:
+                deltas.append(float(t.strip()))
+            except ValueError:
+                pass
+        if deltas:
+            return f"{max(deltas):.4f}"
+
+    tokens = re.split(r"[|,;]", raw)
+    if len(tokens) < 2:
+        return raw  # already a scalar
+
+    deltas = []
+    for t in tokens:
+        t = t.strip()
+        try:
+            f = float(t)
+        except ValueError:
+            continue
+        if 0.0 <= f <= 1.0:
+            deltas.append(f)
+
+    if len(deltas) < 2:
+        return raw  # not enough plausible scores — leave as-is
+
+    return f"{max(deltas):.4f}"
 
 
 def _parse_aachange(raw: str) -> str:
@@ -190,12 +263,23 @@ def _extract_raw_fields(df: pd.DataFrame) -> list[dict]:
     ]
 
 
-def _map_columns(df: pd.DataFrame) -> pd.DataFrame:
+# Regex pattern for sample-specific allelic balance columns, shared by both
+# the deterministic and SLM-driven column mappers and by extract_parental_ab().
+_AB_COLUMN_RE = re.compile(r"^allelic\s+balance\s*-", re.IGNORECASE)
+
+
+def _map_columns_deterministic(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Rename columns to TARGET_COLUMNS names using COLUMN_ALIASES.
-    Columns that don't match any alias are kept as-is (they'll be ignored later).
-    When two columns alias to the same target, ExonicFunc takes priority over Func
-    for the Type field; otherwise first-encountered wins.
+    Fallback column mapper used when no LLM is available (e.g. the CLI
+    convenience entry point below). Renames columns to TARGET_COLUMNS names
+    using COLUMN_ALIASES. Columns that don't match any alias are kept as-is
+    (they'll be ignored later). When two columns alias to the same target,
+    ExonicFunc takes priority over Func for the Type field; otherwise
+    first-encountered wins.
+
+    Special handling: columns matching 'Allelic balance - *' (case-insensitive)
+    are mapped to 'Allelic_balance' (first match only) — additional AB columns
+    are left for extract_parental_ab() to handle.
     """
     df.columns = [str(c) for c in df.columns]
     claimed: set[str] = set()
@@ -207,7 +291,15 @@ def _map_columns(df: pd.DataFrame) -> pd.DataFrame:
         key=lambda c: (0 if c.strip().lower() == "exonicfunc" else 1),
     )
 
+    ab_found = False
     for col in cols:
+        if _AB_COLUMN_RE.match(col):
+            if not ab_found and "Allelic_balance" not in claimed:
+                mapping[col] = "Allelic_balance"
+                claimed.add("Allelic_balance")
+                ab_found = True
+            continue
+
         canonical = COLUMN_ALIASES.get(col.strip().lower())
         if canonical and canonical not in claimed:
             mapping[col] = canonical
@@ -218,14 +310,219 @@ def _map_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SLM-DRIVEN HEADER INTERPRETATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_FIELD_DESCRIPTIONS = {
+    "Variant":             "free-text variant identifier/name, e.g. \"chr16:8811144 C>T\"",
+    "Chromosome":          "chromosome number/name, e.g. \"16\", \"chrX\"",
+    "Position":            "genomic position (integer coordinate)",
+    "RS_ID":               "dbSNP rsID, e.g. \"rs80338708\"",
+    "Ref_seq":             "reference allele",
+    "Var_seq":             "alternate/variant allele",
+    "Type":                "variant type/consequence, e.g. missense, nonsense, frameshift, synonymous, splicing",
+    "Transcript":          "RefSeq transcript/accession ID, e.g. \"NM_000303.3\", ONLY when given as its own column separate from the HGVS notation",
+    "HGVS":                "cDNA and/or protein change notation, e.g. \"c.710C>T p.(Thr237Met)\" (may include a transcript prefix)",
+    "Zygosity":            "heterozygous/homozygous/hemizygous genotype call",
+    "Gene":                "gene symbol",
+    "OMIM_phenotype":      "disease/phenotype name associated with the gene/variant",
+    "OMIM_inheritance":    "OMIM-reported inheritance mode text",
+    "Inheritance":         "inheritance mode, e.g. AR/AD/XLR/XLD",
+    "ClinVar_class":       "ClinVar clinical significance/classification",
+    "Allelic_balance":     "the PROBAND's own allelic balance / variant allele fraction (a single float, typically 0-1). Do NOT map any column matching \"Allelic balance - <sample>\" here — those are handled separately.",
+    "Frequency":           "population allele frequency, e.g. gnomAD/ExAC/1000G",
+    "CADD_score":          "CADD Phred-scaled deleteriousness score",
+    "REVEL_score":         "REVEL pathogenicity score",
+    "SIFT_score":          "SIFT score or prediction (damaging/tolerated)",
+    "PolyPhen2_score":     "PolyPhen-2 score or prediction",
+    "AlphaMissense_score": "AlphaMissense pathogenicity score",
+    "SpliceAI_score":      "precomputed splicing-impact prediction for this variant, from SpliceAI, dbscSNV "
+                           "(ada_score/rf_score ensemble prediction), or any similar splice-effect tool. May "
+                           "appear as a single score (e.g. \"0.87\"), a semicolon-pair (e.g. dbscSNV's "
+                           "\"0.999;0.685\"), OR a compound annotation string bundling several pipe/comma-"
+                           "delimited values together (allele, gene symbol, the four acceptor/donor gain/loss "
+                           "delta scores, plus positions, e.g. \"T|GENE|0.01|0.00|0.85|0.02|-2|33|1|-38\") — "
+                           "any of these compound forms is still a match for this field, whatever the column "
+                           "is named.",
+}
+
+_HEADER_INTERPRETATION_SYSTEM = (
+    "You are inspecting the header row (and one sample data row) of an uploaded "
+    "clinical variant table. For each canonical field below, decide which ONE "
+    "original column (if any) corresponds to it. Use the sample row's values to "
+    "disambiguate when the header name alone is ambiguous (e.g. a generically-named "
+    "\"Score\" column can often be identified by its value range). Do not force a "
+    "match — use null for a field if none of the columns genuinely fit it. Each "
+    "original column may be used for AT MOST one field (pick the best match if "
+    "several fields look similar).\n\n"
+    "Canonical fields:\n"
+    + "\n".join(f"  - {name}: {desc}" for name, desc in _FIELD_DESCRIPTIONS.items())
+    + "\n\nOutput ONLY a single JSON object whose KEYS are EXACTLY the canonical "
+    "field names listed above (every one of them, spelled exactly as given) and "
+    "whose VALUES are each either the matching ORIGINAL column name (copied "
+    "exactly as given) or null. No explanation, no markdown, no extra text — "
+    "JSON only."
+)
+
+
+def _map_columns_llm(df: pd.DataFrame, llm) -> tuple[pd.DataFrame, str]:
+    """
+    SLM-driven column mapper: asks the model to classify each header into a
+    TARGET_COLUMNS field, using one sample data row for disambiguation.
+    Columns matching the structural "Allelic balance - <sample>" pattern are
+    handled deterministically beforehand (unambiguous, mechanical — not worth
+    spending model judgment on); only the remaining columns are sent to the
+    model.
+
+    Returns (renamed_df, human_readable_summary) — the summary is meant to be
+    shown to the user (SSE + final report) so they can see what the model
+    understood before the rest of the pipeline runs on it.
+    """
+    import json as _json
+
+    df.columns = [str(c) for c in df.columns]
+    claimed: set[str] = set()
+    mapping: dict[str, str] = {}
+
+    # ── Deterministic pass: sample-specific allelic-balance columns ──────────
+    ab_found = False
+
+    # ── Deterministic pass: raw headers that already literally match a
+    # canonical field name (e.g. a "Frequency" or "Chromosome" column already
+    # named exactly that). Auto-claimed and excluded from the SLM pass —
+    # otherwise the SLM can independently map a *different* raw column onto
+    # the same canonical name (e.g. mapping "Frequency" <- "Alternate Allele
+    # Coverage" while the literal "Frequency" column sits untouched), leaving
+    # two columns both named "Frequency" after rename. pandas then raises
+    # "cannot reindex on an axis with duplicate labels" the first time
+    # anything downstream selects that column by name.
+    _target_by_lower = {f.lower(): f for f in TARGET_COLUMNS}
+
+    llm_cols: list[str] = []
+    for col in df.columns:
+        if _AB_COLUMN_RE.match(col):
+            if not ab_found and "Allelic_balance" not in claimed:
+                mapping[col] = "Allelic_balance"
+                claimed.add("Allelic_balance")
+                ab_found = True
+            continue
+        exact_field = _target_by_lower.get(col.strip().lower())
+        if exact_field and exact_field not in claimed:
+            if col != exact_field:
+                mapping[col] = exact_field
+            claimed.add(exact_field)
+            continue
+        llm_cols.append(col)
+
+    # ── SLM pass: everything else ─────────────────────────────────────────────
+    summary_lines = ["Column header interpretation (SLM-driven):"]
+    if ab_found:
+        ab_source = next(c for c, v in mapping.items() if v == "Allelic_balance")
+        summary_lines.append(f"  {ab_source!r:<30} -> Allelic_balance (proband; structural match)")
+
+    if llm_cols:
+        sample_row = {}
+        if len(df) > 0:
+            first = df.iloc[0]
+            sample_row = {c: _clean(first[c]) for c in llm_cols}
+
+        user_prompt = (
+            "Columns to classify:\n" + "\n".join(f"  - {c!r}" for c in llm_cols)
+            + "\n\nSample row values (for disambiguation):\n"
+            + "\n".join(f"  {c!r}: {sample_row.get(c, 'NA')!r}" for c in llm_cols)
+        )
+
+        raw = llm.generate(
+            system=_HEADER_INTERPRETATION_SYSTEM, user=user_prompt, max_tokens=800
+        ).strip()
+
+        try:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            parsed: dict = _json.loads(match.group()) if match else {}
+        except (_json.JSONDecodeError, AttributeError) as e:
+            print(f"[normalizer] Header interpretation JSON parse failed ({e}) — no columns mapped via SLM")
+            parsed = {}
+
+        # Resolve each returned column value against llm_cols. Exact match first;
+        # falls back to a whitespace/case-normalized match since the model isn't
+        # always byte-exact when echoing back column names (BOM/whitespace
+        # artifacts seen in real uploaded headers) — keeps the lookup robust
+        # without requiring literal reproduction.
+        def _norm(s) -> str:
+            return re.sub(r"\s+", " ", str(s).strip()).lower()
+
+        norm_to_col = {_norm(c): c for c in llm_cols}
+        assigned_cols: set[str] = set()
+
+        # Iterate fields in a stable order (skip Allelic_balance if the deterministic
+        # pass already claimed it) so the summary reads in a sensible sequence.
+        for field in TARGET_COLUMNS:
+            if field in claimed:
+                continue
+            value = parsed.get(field)
+            if not value or not isinstance(value, str):
+                continue
+            resolved = value if value in norm_to_col.values() else norm_to_col.get(_norm(value))
+            if resolved and resolved not in assigned_cols:
+                mapping[resolved] = field
+                claimed.add(field)
+                assigned_cols.add(resolved)
+
+        for col in llm_cols:
+            target = mapping.get(col)
+            if target:
+                note = f"  {col!r:<30} -> {target}"
+            elif "allelic balance" in col.lower():
+                # Not a red flag: this column isn't unused, it's just not the
+                # canonical single-value Allelic_balance field. Parental AB
+                # columns (proband/mother/father, however many/whatever named)
+                # are extracted separately by extract_parental_ab() and appear
+                # in SEGREGATION ANALYSIS, not here — a bare "(unmapped)" for
+                # a second/third allelic-balance column reads as dropped data
+                # when it's actually just handled by a different code path.
+                note = f"  {col!r:<30} -> (handled separately — parental allelic balance, see SEGREGATION ANALYSIS)"
+            else:
+                note = f"  {col!r:<30} -> (unmapped)"
+            summary_lines.append(note)
+
+    summary = "\n".join(summary_lines)
+    print(f"[normalizer] {summary}")
+
+    if mapping:
+        df = df.rename(columns=mapping)
+
+    # Defense-in-depth: if a canonical target name still ended up duplicated
+    # (unforeseen collision beyond the exact-literal-match case handled
+    # above), keep the first occurrence and drop the rest rather than
+    # letting a bare pandas "cannot reindex on an axis with duplicate
+    # labels" surface downstream the first time that column is selected.
+    dupe_targets = {f for f in TARGET_COLUMNS if (df.columns == f).sum() > 1}
+    if dupe_targets:
+        print(f"[normalizer] WARNING: duplicate columns after mapping, keeping first occurrence: {sorted(dupe_targets)}")
+        keep = ~df.columns.duplicated()
+        df = df.loc[:, keep]
+
+    return df, summary
+
+
 def _build_normalized_df(df: pd.DataFrame, df_original: pd.DataFrame) -> pd.DataFrame:
     """Project df onto TARGET_COLUMNS, filling missing ones with 'NA'.
 
     Post-processing:
       - If HGVS is all NA but AAChange exists in the original input, fill from AAChange.
       - Normalise Type values through the ANNOVAR vocabulary map.
+      - Collapse compound SpliceAI annotation strings down to a single max delta score.
     """
-    out = pd.DataFrame()
+    # Anchored to df's row index up front: if TARGET_COLUMNS[0] ("Variant") is
+    # itself absent from the input while later columns are present (common —
+    # many exports have Chromosome/Position/Ref/Alt but no free-text "Variant"
+    # column), assigning a bare "NA" scalar to a still-empty, zero-row
+    # DataFrame silently misaligns the row count for every column that
+    # follows. Pre-seeding the index guarantees N rows before any column is
+    # ever assigned, regardless of which target columns are missing or in
+    # what order they're filled.
+    out = pd.DataFrame(index=df.index)
     for col in TARGET_COLUMNS:
         if col in df.columns:
             out[col] = df[col].apply(_clean)
@@ -248,8 +545,9 @@ def _build_normalized_df(df: pd.DataFrame, df_original: pd.DataFrame) -> pd.Data
         lambda v: _normalize_type(v) if v != "NA" else v
     )
 
-    # Normalise SpliceAI_score: ANNOVAR pipe-separated "DS_AG|DS_AL|DS_DG|DS_DL" → max
-    out["SpliceAI_score"] = out["SpliceAI_score"].apply(_parse_spliceai_score)
+    # Collapse compound SpliceAI annotation strings (whatever the source
+    # column was named) down to a single max delta score
+    out["SpliceAI_score"] = out["SpliceAI_score"].apply(_parse_spliceai_value)
 
     return out
 
@@ -263,19 +561,116 @@ def _df_to_variant_dicts(df: pd.DataFrame) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PARENTAL ALLELIC BALANCE EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Labels when 3 columns are present: proband, mother, father (fixed order)
+_PARENTAL_LABELS_3 = ["proband", "mother", "father"]
+
+_MOTHER_NAME_RE = re.compile(r"\b(mother|mom|maternal)\b", re.IGNORECASE)
+_FATHER_NAME_RE = re.compile(r"\b(father|dad|paternal)\b", re.IGNORECASE)
+
+
+def _parent_label_from_name(col: str) -> str | None:
+    """If a column name explicitly names the parent (e.g. "Allelic balance -
+    mother", "Allelic balance_mother", "Allelic balance (Father)"), return
+    "mother" or "father" — else None to fall back to positional convention.
+    Underscores/hyphens are normalised to spaces first — "_" is a \\w
+    character, so a \\b boundary never forms at "balance_mother"'s "e_m"
+    junction and a bare \\bmother\\b search silently fails to match there."""
+    normalized = re.sub(r"[_\-]+", " ", col)
+    if _MOTHER_NAME_RE.search(normalized):
+        return "mother"
+    if _FATHER_NAME_RE.search(normalized):
+        return "father"
+    return None
+
+
+def extract_parental_ab(df: pd.DataFrame) -> list[dict] | None:
+    """
+    Detect columns containing "Allelic balance" in the header and extract
+    per-variant allelic balance values.
+
+    Column naming convention: "Allelic balance - SAMPLE_ID"
+    Order is always: proband first, then parents (if present).
+
+    Returns:
+        list of dicts (one per row) with keys depending on column count:
+          - 1 column:  {"proband": "0.48"}
+          - 2 columns: {"proband": "0.48", "extra1": "0.51"}
+          - 3 columns: {"proband": "0.48", "mother": "0.51", "father": "0.00"}
+        Or None if no matching columns found.
+    """
+    ab_cols = [
+        str(c) for c in df.columns
+        if "allelic balance" in str(c).lower()
+    ]
+
+    if not ab_cols:
+        return None
+
+    # Preserve original column order (df.columns is already in CSV order)
+    ab_cols_ordered = [c for c in df.columns if c in ab_cols]
+
+    # Assign labels based on count
+    n = len(ab_cols_ordered)
+    if n == 1:
+        labels = ["proband"]
+    elif n >= 3:
+        labels = _PARENTAL_LABELS_3  # proband, mother, father
+    else:
+        # 2 columns: proband + second. If the second column's own name names
+        # its parent explicitly (e.g. "Allelic balance_mother"), use that
+        # label directly instead of the generic "extra1" — otherwise a
+        # correctly-present mother/father AB value is extracted but under a
+        # key (segregation.classify_segregation() etc. look for "mother"/
+        # "father" specifically) nothing downstream ever reads, which reads
+        # identically to that parent's data being absent.
+        second_label = _parent_label_from_name(ab_cols_ordered[1]) or "extra1"
+        labels = ["proband", second_label]
+
+    result = []
+    for _, row in df.iterrows():
+        entry = {}
+        for col, label in zip(ab_cols_ordered, labels):
+            val = _clean(row[col])
+            # Keep as string — downstream (segregation.py) interprets the float value
+            entry[label] = val
+        result.append(entry)
+
+    print(f"[normalizer] Found {n} Allelic balance column(s): {labels}")
+    print(f"[normalizer] AB column names: {ab_cols_ordered}")
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PUBLIC API
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def normalize_upload(
     raw: bytes,
     filename: str = "upload.csv",
-) -> tuple[list[dict], list[dict]]:
+    llm=None,
+) -> tuple[list[dict], list[dict], list[dict] | None, str]:
     """
     Accept raw file bytes from any CSV or Excel upload and return a tuple of
-    (normalized_variant_dicts, raw_field_dicts).
+    (normalized_variant_dicts, raw_field_dicts, parental_ab, header_mapping_summary).
 
     - normalized_variant_dicts: one dict per row, keyed by TARGET_COLUMNS
     - raw_field_dicts:          one dict per row, full original columns before normalization
+    - parental_ab:              list of dicts with allelic balance values per variant,
+                                or None if no "Allelic balance" columns found.
+                                Keys depend on column count: "proband", "mother", "father" (3 cols),
+                                "proband" + "extra1" (2 cols), or just "proband" (1 col).
+    - header_mapping_summary:   human-readable text showing which canonical field each
+                                original header was mapped to — meant to be surfaced to the
+                                user (SSE + final report) so they can sanity-check it.
+
+    Column mapping is SLM-driven (_map_columns_llm) when `llm` is provided (an
+    LLMClient, see pipeline.llm.base.LLMClient) — used once per upload to
+    classify headers using the header row + one sample data row. When `llm`
+    is None, falls back to the deterministic alias-dict mapper
+    (_map_columns_deterministic).
 
     Supports:
       - .csv  (any delimiter — auto-detected)
@@ -310,7 +705,16 @@ def normalize_upload(
 
     # ── Normalize ─────────────────────────────────────────────────────────────
     df_original = df.copy()          # preserve original before column mapping
-    df = _map_columns(df)
+
+    # Extract parental allelic balance BEFORE column mapping (uses raw headers)
+    parental_ab = extract_parental_ab(df_original)
+
+    if llm is not None:
+        df, header_mapping_summary = _map_columns_llm(df, llm)
+    else:
+        df = _map_columns_deterministic(df)
+        header_mapping_summary = "Deterministic alias-based column mapping (no LLM provided)."
+
     df = _build_normalized_df(df, df_original)
 
     if df.empty:
@@ -319,16 +723,16 @@ def normalize_upload(
     variants  = _df_to_variant_dicts(df)
     raw_rows  = _extract_raw_fields(df_original)
 
-    print(f"[csv_normalizer] {len(variants)} variants loaded from '{filename}'")
+    print(f"[normalizer] {len(variants)} variants loaded from '{filename}'")
 
     # Log which target columns were actually populated
     populated = [c for c in TARGET_COLUMNS if any(df[c] != "NA")]
     missing   = [c for c in TARGET_COLUMNS if c not in populated]
-    print(f"[csv_normalizer] Populated columns : {populated}")
+    print(f"[normalizer] Populated columns : {populated}")
     if missing:
-        print(f"[csv_normalizer] Missing (→ NA)   : {missing}")
+        print(f"[normalizer] Missing (→ NA)   : {missing}")
 
-    return variants, raw_rows
+    return variants, raw_rows, parental_ab, header_mapping_summary
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -348,7 +752,15 @@ if __name__ == "__main__":
     with open(input_path, "rb") as f:
         raw = f.read()
 
-    variants, _ = normalize_upload(raw, filename=input_path)
+    variants, _, parental_ab, header_summary = normalize_upload(raw, filename=input_path)
+    print(f"\n{header_summary}\n")
+
+    if parental_ab:
+        print(f"\nParental AB data detected for {len(parental_ab)} variants:")
+        for i, pa in enumerate(parental_ab[:3]):
+            print(f"  Variant {i+1}: {pa}")
+        if len(parental_ab) > 3:
+            print(f"  ... ({len(parental_ab)} total)")
 
     # Write as CSV for inspection
     import csv as _csv

@@ -94,9 +94,13 @@ async def analyze(
     """
     raw = await csv_file.read()
 
+    # Pipeline (and its LLM client) must exist before normalize_upload() so
+    # the SLM-driven column mapper can use it for header interpretation.
+    pipeline = _get_pipeline()
+
     try:
-        variants, raw_rows = normalize_upload(
-            raw, filename=csv_file.filename or "upload.csv"
+        variants, raw_rows, parental_ab, header_mapping_summary = normalize_upload(
+            raw, filename=csv_file.filename or "upload.csv", llm=pipeline._llm
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -104,11 +108,12 @@ async def analyze(
     if not variants:
         raise HTTPException(status_code=400, detail="CSV contained no variant rows.")
 
-    pipeline = _get_pipeline()
     result = await pipeline.run(
         variants,
         patient_report,
         raw_rows=raw_rows,
+        parental_ab=parental_ab,
+        header_mapping_summary=header_mapping_summary,
         # genome_build uses DEFAULT_GENOME_BUILD — auto-detection comes later
     )
 

@@ -4,8 +4,12 @@ pipeline/tools/litvar2.py — LitVar2-powered literature summarisation tool.
 Search strategy (gene-first, three tracks):
 
   1. Gene + patient phenotype (primary — always runs when Gene is present)
-       Uses PubMed esearch with "{gene}[Gene] AND {disease_query}" to retrieve papers
-       co-mentioning the gene and the patient's disease. One API call, no LitVar2 loop.
+       Uses PubMed esearch with a broadened OR query (patient-phenotype disease
+       terms OR a bare "disease" term OR inheritance-mode vocabulary), sorted
+       by publication date so recently-characterized gene-disease links aren't
+       buried by relevance sort, and so the retrieved evidence text also tends
+       to carry inheritance-mode statements (consumed by pipeline/core/moi.py's
+       tier-3 fallback).
        - Zero hits  → explicit "not linked to disease" string (negative signal for triage)
        - Non-zero   → titles → SLM filter → abstracts → SLM summary
 
@@ -19,10 +23,14 @@ Search strategy (gene-first, three tracks):
        - No disease term available → track skipped silently
        - Term found → titles → SLM filter → abstracts → SLM summary (framed on patient phenotype)
 
-  3. Variant-level search (supplemental — runs when RS_ID is valid)
+  3. Variant-level search (supplemental — runs when RS_ID is valid, or resolvable
+     from gene+protein-change via LitVar2's autocomplete endpoint when RS_ID is NA)
        Uses LitVar2 variant publications endpoint (purpose-built for rsID-level tracking).
        - No relevant papers → omitted from output
-       - Papers found       → titles → SLM filter → abstracts → SLM summary
+       - Papers found       → titles → SLM filter → abstracts → SLM summary, with
+         mandatory extraction of functional/experimental evidence and affected-
+         individual case counts (PS3/PS4 grounding) since every hit is already
+         known to be variant-specific.
 
   Tracks 1 and 2 answer different questions: track 1 asks "is this gene linked to this
   patient's phenotype?", track 2 asks "is this gene's known disease related to what we see?".
@@ -52,6 +60,14 @@ logger = logging.getLogger(__name__)
 
 LITVAR2_BASE = "https://www.ncbi.nlm.nih.gov/research/litvar2-api"
 LITVAR2_URL  = f"{LITVAR2_BASE}/variant/get/litvar@{{rsid}}%23%23/publications"
+LITVAR2_AUTOCOMPLETE_URL = f"{LITVAR2_BASE}/variant/autocomplete/"
+
+# Extracts the protein-change token from a combined HGVS field, e.g.
+# "NM_000330.4(RS1):c.214G>A (p.Glu72Lys)" → "p.Glu72Lys", or a bare
+# "p.E72K" short form. LitVar2's autocomplete accepts either 3-letter or
+# 1-letter amino acid codes.
+_PROTEIN_CHANGE_RE = re.compile(r"p\.\(?([A-Za-z*]{1,3}\d+[A-Za-z*]{1,3}(?:fs\*?\d*)?)\)?")
+
 NCBI_BASE    = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 # Without API key: 3 req/s → 0.34 s delay.  With API key: 10 req/s → 0.11 s delay.
 # Set NCBI_API_KEY env var (free key from https://www.ncbi.nlm.nih.gov/account/).
@@ -91,6 +107,11 @@ def _ncbi_rate_limit() -> None:
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+# NOTE: retry/backoff kept at 5 attempts / 10s exponential base (rather than a
+# leaner 4 attempts / 1s base) — under sustained NCBI 429 bursts from 32
+# concurrent workers, the shorter backoff re-triggers rate limiting almost
+# immediately and burns through retry budget without actually waiting out the
+# throttle window.
 _NCBI_MAX_ATTEMPTS = 5
 _NCBI_BACKOFF_BASE = 10.0   # seconds — 10, 20, 40, 80, 160 s
 
@@ -149,6 +170,7 @@ class LitVar2SummaryTool(SLMTool):
 
     # CGD table cache — populated on first use, shared across all instances and variants
     _cgd_table: dict[str, list[str]] | None = None
+    _cgd_inheritance: dict[str, str] | None = None
     _cgd_lock  = threading.Lock()
 
     def __init__(self, **kwargs):
@@ -232,28 +254,29 @@ class LitVar2SummaryTool(SLMTool):
         logger.debug("Disease query resolved: %r → %r", raw, result)
         return result
 
-    # ── CGD table (gene → known conditions) ──────────────────────────────────
+    # ── CGD table (gene → known conditions / inheritance) ────────────────────
 
     @classmethod
-    def _load_cgd_table(cls) -> dict[str, list[str]]:
+    def _load_cgd_table(cls) -> tuple[dict[str, list[str]], dict[str, str]]:
         """
         Download and parse the NHGRI Clinical Genomic Database (CGD).
-        Returns {GENE_UPPER: [condition, ...]}. Called at most once per process.
-        Returns an empty dict on any failure so callers degrade gracefully.
+        Returns ({GENE_UPPER: [condition, ...]}, {GENE_UPPER: inheritance_string}).
+        Called at most once per process. Returns empty dicts on any failure so
+        callers degrade gracefully.
         """
         try:
             resp = requests.get(CGD_URL, timeout=30)
             resp.raise_for_status()
         except Exception as e:
             logger.warning("CGD download failed (%s) — known-disease track disabled", e)
-            return {}
+            return {}, {}
 
         try:
             with gzip.open(io.BytesIO(resp.content)) as f:
                 text = f.read().decode("utf-8")
         except Exception as e:
             logger.warning("CGD decompression failed (%s) — known-disease track disabled", e)
-            return {}
+            return {}, {}
 
         try:
             lines = text.splitlines()
@@ -271,11 +294,16 @@ class LitVar2SummaryTool(SLMTool):
                 (i for i, h in enumerate(headers) if h.upper() in {"CONDITION", "PHENOTYPE"}),
                 None,
             )
+            inh_col = next(
+                (i for i, h in enumerate(headers) if h.upper() == "INHERITANCE"),
+                None,
+            )
             if gene_col is None or cond_col is None:
                 logger.warning("CGD missing GENE/CONDITION column — known-disease track disabled")
-                return {}
+                return {}, {}
 
-            table: dict[str, list[str]] = {}
+            table:       dict[str, list[str]] = {}
+            inheritance: dict[str, str]       = {}
             for line in lines[header_idx + 1:]:
                 if not line.strip() or line.startswith("#"):
                     continue
@@ -286,13 +314,17 @@ class LitVar2SummaryTool(SLMTool):
                 condition = fields[cond_col].strip()
                 if gene and condition:
                     table.setdefault(gene, []).append(condition)
+                if gene and inh_col is not None and len(fields) > inh_col:
+                    inh = fields[inh_col].strip()
+                    if inh and gene not in inheritance:
+                        inheritance[gene] = inh
 
         except Exception as e:
             logger.warning("CGD parsing failed (%s) — known-disease track disabled", e)
-            return {}
+            return {}, {}
 
-        logger.info("CGD table loaded: %d genes indexed", len(table))
-        return table
+        logger.info("CGD table loaded: %d genes indexed (%d with inheritance)", len(table), len(inheritance))
+        return table, inheritance
 
     @classmethod
     def _get_cgd_conditions(cls, gene: str) -> list[str]:
@@ -300,8 +332,57 @@ class LitVar2SummaryTool(SLMTool):
         if cls._cgd_table is None:
             with cls._cgd_lock:
                 if cls._cgd_table is None:   # double-checked locking
-                    cls._cgd_table = cls._load_cgd_table()
+                    cls._cgd_table, cls._cgd_inheritance = cls._load_cgd_table()
         return cls._cgd_table.get(gene.upper(), [])
+
+    @classmethod
+    def get_cgd_inheritance(cls, gene: str) -> str:
+        """Return the CGD-reported inheritance mode for *gene* (e.g. "AR", "AD"),
+        or "" if unknown. Consumed by pipeline/core/moi.py's tier-2 fallback."""
+        if cls._cgd_inheritance is None:
+            with cls._cgd_lock:
+                if cls._cgd_inheritance is None:   # double-checked locking
+                    cls._cgd_table, cls._cgd_inheritance = cls._load_cgd_table()
+        return cls._cgd_inheritance.get(gene.upper(), "")
+
+    # ── step 0: gene + protein-change → rsID (autocomplete path) ────────────
+
+    @staticmethod
+    def extract_protein_change(hgvs: str) -> str | None:
+        """Pulls the 'p.XxxNNNXxx' token out of a combined HGVS string, e.g.
+        'NM_000330.4(RS1):c.214G>A (p.Glu72Lys)' → 'p.Glu72Lys'."""
+        if not hgvs or hgvs == "NA":
+            return None
+        m = _PROTEIN_CHANGE_RE.search(hgvs)
+        return f"p.{m.group(1)}" if m else None
+
+    def _resolve_rsid_by_gene_protein(self, gene: str, protein_change: str) -> str | None:
+        """
+        LitVar2's own index is rsID-keyed, but its autocomplete endpoint resolves
+        a free-text 'GENE proteinchange' query (e.g. "RS1 E72K") to the matching
+        rsID — this lets Track 3 find variant-level literature even when the
+        input CSV's RS_ID column is NA (common in clinical exports) but the gene
+        and protein change are known, instead of skipping variant-level search
+        outright whenever RS_ID is missing.
+        """
+        query = f"{gene} {protein_change}"
+        try:
+            _ncbi_rate_limit()
+            resp = requests.get(
+                LITVAR2_AUTOCOMPLETE_URL, params={"query": query}, timeout=self.timeout
+            )
+            resp.raise_for_status()
+            results = resp.json()
+        except Exception as e:
+            logger.debug("LitVar2 autocomplete failed for %r: %s", query, e)
+            return None
+
+        if not results:
+            return None
+        rsid = results[0].get("rsid")
+        if rsid and re.match(r"^rs\d+$", rsid, re.IGNORECASE):
+            return rsid
+        return None
 
     # ── step 1: LitVar2 → PMIDs (rsID path) ──────────────────────────────────
 
@@ -413,7 +494,7 @@ class LitVar2SummaryTool(SLMTool):
     # ── step 4: PMIDs → abstracts ─────────────────────────────────────────────
 
     def _fetch_abstracts(self, pmids: list[str]) -> dict[str, dict]:
-        """Returns {pmid: {"title": ..., "abstract": ..., "url": ...}}."""
+        """Returns {pmid: {"title": ..., "abstract": ..., "url": ..., "year": ...}}."""
         if not pmids:
             return {}
 
@@ -444,10 +525,19 @@ class LitVar2SummaryTool(SLMTool):
                 ]
                 abstract = " ".join(abstract_parts) if abstract_parts else "No abstract available."
 
+                year_el = article.find(".//PubDate/Year")
+                if year_el is not None and year_el.text:
+                    year = year_el.text.strip()
+                else:
+                    medline_el = article.find(".//PubDate/MedlineDate")
+                    match = re.search(r"\d{4}", medline_el.text) if medline_el is not None and medline_el.text else None
+                    year = match.group(0) if match else "n.d."
+
                 results[pmid] = {
                     "title":    title,
                     "abstract": abstract[: self.max_chars],
                     "url":      f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                    "year":     year,
                 }
 
             return results
@@ -462,23 +552,65 @@ class LitVar2SummaryTool(SLMTool):
         question: str,
         identifier: str,
         context: ToolContext,
+        require_functional: bool = False,
     ) -> str:
-        """Ask the SLM to produce a prose summary with inline PMID citations."""
+        """
+        Ask the SLM to produce a prose summary with inline PMID citations.
+
+        require_functional=True is used for tracks where every abstract is already
+        known to directly mention the specific variant (e.g. LitVar2 rsID hits) — in
+        that case any functional/structural/enzymatic evidence for the variant itself
+        must be reported even if it doesn't bear on the patient's phenotype match,
+        since it's the kind of mechanistic evidence ACMG functional-evidence criteria
+        (e.g. PS3/BS3) are built on and must not be dropped for narrative brevity.
+        Same flag also forces extraction of case-count/proband-enumeration evidence
+        (PS4 grounding) — the summarizer otherwise tends to surface qualitative
+        mechanism statements (e.g. "a known mutational hotspot") over the actual
+        headcount of affected individuals reported with this variant, even when both
+        are present in the same abstract.
+        """
 
         corpus = "\n\n".join(
-            f"[PMID:{pmid}] {p['title']}\n{p['abstract']}"
+            f"[PMID:{pmid}, {p.get('year', 'n.d.')}] {p['title']}\n{p['abstract']}"
             for pmid, p in papers.items()
+        )
+
+        functional_clause = (
+            " Every abstract here was retrieved via a direct search for this specific "
+            f"variant ({identifier}), not just its gene — if ANY abstract reports "
+            "functional, structural, or enzymatic evidence for this exact variant "
+            "(e.g. in vitro/in vivo assays, enzyme activity, protein structure or "
+            "stability effects, splicing effects), you MUST report that finding "
+            "explicitly with its citation, even if it does not relate to the patient's "
+            "phenotype. Do not omit direct variant-level functional evidence for the "
+            "sake of brevity — extend the paragraph if needed. "
+            "Separately, and just as mandatorily: scan every abstract for case-count/"
+            "proband evidence for this exact variant — any explicit number of affected "
+            "individuals, patients, probands, or families reported carrying it (e.g. "
+            "'identified in 12 unrelated probands', 'observed in 3 of 40 patients with "
+            "this phenotype', 'reported in 2 families'). This is the evidence that "
+            "grounds PS4 (prevalence in affected individuals vs. controls) and is easy "
+            "to miss when an abstract also contains a qualitative mechanism statement "
+            "(e.g. a hotspot or domain claim) — report the actual headcount explicitly "
+            "with its citation whenever a number is stated, even in a single clause, "
+            "rather than only reporting the qualitative claim. If no abstract states an "
+            "explicit affected-individual count for this variant, say so explicitly "
+            "rather than leaving it unaddressed."
+            if require_functional else ""
         )
 
         system = (
             "You are a biomedical evidence synthesiser. "
-            "Write a short paragraph (3-5 sentences) summarising findings from the abstracts "
-            "that are relevant to the research question. "
+            "Write a short paragraph (3-5 sentences, longer if needed per instructions below) "
+            "summarising findings from the abstracts that are relevant to the research question. "
+            "When abstracts conflict, prefer the more recent publication year and note the "
+            "disagreement. "
             "Cite sources inline using (PMID:XXXXXXXX) immediately after the relevant claim. "
             "If no abstract contains relevant evidence, write one sentence saying so. "
             "Do NOT use bullet points, headers, or raw URLs. "
             "Do NOT mention abstracts or papers explicitly, just report the findings naturally. "
             "Begin directly with the summary."
+            f"{functional_clause}"
         )
         user = (
             f"Research question: {question}\n"
@@ -486,12 +618,12 @@ class LitVar2SummaryTool(SLMTool):
             f"Abstracts:\n{corpus}"
         )
 
-        return context.llm.generate(system=system, user=user, max_tokens=400).strip()
+        return context.llm.generate(system=system, user=user, max_tokens=500).strip()
 
     # ── primary: gene-level PubMed search ────────────────────────────────────
 
     def _esearch_gene(
-        self, gene: str, disease_query: str | None = None
+        self, gene: str, disease_query: str | None = None, sort: str = "relevance"
     ) -> tuple[list[str], int, str]:
         """
         Query PubMed esearch for the gene, optionally filtered by disease term.
@@ -503,23 +635,24 @@ class LitVar2SummaryTool(SLMTool):
         distinguish "gene has no literature at all" from "gene-disease co-occurrence
         not found."
 
-        Primary call uses relevance sort. If total results exceed max_pmids a second
-        call sorted by publication date adds recent papers not in the relevance window.
+        Primary call uses `sort` (default relevance). If total results exceed max_pmids
+        AND the primary sort wasn't already pub_date, a second call sorted by
+        publication date adds recent papers not in the primary window.
 
         Returns:
-            pmids             — deduplicated list, relevance-ranked first then recency
+            pmids             — deduplicated list, primary-sort-ranked first then recency
             total_count       — total PubMed hits (may exceed len(pmids))
             query_translation — PubMed's MeSH expansion of the submitted term
         """
         gene_clause = f"({gene}[tiab] OR {gene}[Gene])"
         term = f"{gene_clause} AND ({disease_query})" if disease_query else gene_clause
 
-        # ── primary call: relevance sort ──────────────────────────────────────
+        # ── primary call ────────────────────────────────────────────────────────
         try:
             data = _ncbi_get(
                 "esearch.fcgi",
                 {"db": "pubmed", "term": term, "retmax": self.max_pmids,
-                 "retmode": "json", "sort": "relevance"},
+                 "retmode": "json", "sort": sort},
                 self.timeout,
             ).json()
         except Exception as e:
@@ -536,14 +669,15 @@ class LitVar2SummaryTool(SLMTool):
             ) from e
 
         logger.debug(
-            "PubMed esearch (relevance): %d/%d PMIDs for gene=%s",
-            len(pmids), total_count, gene,
+            "PubMed esearch (%s): %d/%d PMIDs for gene=%s",
+            sort, len(pmids), total_count, gene,
         )
 
         # ── conditional second call: recency sort ─────────────────────────────
-        # Only fires when total results exceed what the first call retrieved,
-        # i.e. when there are papers outside the relevance-ranked window.
-        if total_count > self.max_pmids:
+        # Only fires when total results exceed what the first call retrieved
+        # AND the primary call wasn't already sorted by pub_date (no point
+        # repeating the same sort twice).
+        if total_count > self.max_pmids and sort != "pub_date":
             try:
                 data2 = _ncbi_get(
                     "esearch.fcgi",
@@ -575,24 +709,36 @@ class LitVar2SummaryTool(SLMTool):
         Returns a positive evidence block when disease-relevant papers are found,
         or an explicit "not linked" message when none are — providing a clear
         negative signal for downstream reasoning and triage stages.
-
-        Output header shows PubMed's own querytranslation (the MeSH-expanded form of
-        the query) and pool counts so downstream stages can audit what was searched.
         """
-        pmids, total_count, query_translation = self._esearch_gene(gene, self._disease_query)
+        # Broaden the phenotype terms with a bare "disease" OR-term so generic
+        # gene-disease association papers (that don't use the LLM-resolved
+        # phenotype wording) still match, and sort by publication date so the
+        # most recent literature is retrieved first (relevance sort can bury
+        # newly-characterized gene-disease links). Also OR-in inheritance-mode
+        # vocabulary so papers establishing how the gene's disease is inherited
+        # (needed downstream by pipeline/core/moi.py's AR/AD/XLR gate and
+        # phase-check logic) are preferentially retrieved within the
+        # max_pmids-capped pool, not just papers matching the phenotype wording.
+        inheritance_terms = 'recessive OR dominant OR "x-linked" OR "de novo" OR biallelic'
+        disease_query = (
+            f"({self._disease_query}) OR disease OR {inheritance_terms}"
+            if self._disease_query else f"disease OR {inheritance_terms}"
+        )
+        pmids, total_count, query_translation = self._esearch_gene(
+            gene, disease_query, sort="pub_date"
+        )
 
         # Header line shared by all output branches
         def _header(extra: str = "") -> str:
             pool_note = (
-                f"{len(pmids)} retrieved (relevance + recency)"
+                f"{len(pmids)} retrieved (pub_date-sorted)"
                 if total_count > self.max_pmids
                 else f"{total_count} total"
             )
-            base = (
+            return (
                 f"PubMed gene-disease search for {gene}\n"
                 f"[PubMed query: {query_translation} | {pool_note}{extra}]"
             )
-            return base
 
         if not pmids:
             # Retry with gene alone to distinguish "no literature at all" from
@@ -609,7 +755,6 @@ class LitVar2SummaryTool(SLMTool):
             # disease term was dropped so downstream reasoning interprets accordingly.
             pmids = pmids_gene_only
             total_count = total_count_gene_only
-            query_translation = f"{gene} (disease term '{self._disease_query}' yielded no hits — gene-only search)"
 
             def _header(extra: str = "") -> str:  # noqa: F811 — shadow outer _header
                 pool_note = (
@@ -618,8 +763,9 @@ class LitVar2SummaryTool(SLMTool):
                     else f"{total_count} total"
                 )
                 return (
-                    f"PubMed gene-only evidence for {gene}\n"
-                    f"[PubMed query: {query_translation} | {pool_note}{extra}]"
+                    f"PubMed gene-only evidence for {gene} "
+                    f"(disease term '{self._disease_query}' yielded no hits — gene-only search)\n"
+                    f"[{pool_note}{extra}]"
                 )
 
         titles = self._fetch_titles(pmids)
@@ -649,13 +795,12 @@ class LitVar2SummaryTool(SLMTool):
         summary = self._summarise(papers, context.patient_phenotype, gene, context)
 
         source_lines = "\n".join(
-            f"  - [PMID:{pmid}] {p['title']}  {p['url']}"
+            f"  - [PMID:{pmid}, {p.get('year', 'n.d.')}] {p['title']}  {p['url']}"
             for pmid, p in papers.items()
         )
         return (
             f"PubMed gene-disease evidence for {gene}\n"
-            f"[PubMed query: {query_translation} | "
-            f"{len(titles)} screened, {len(papers)} selected]\n\n"
+            f"[{len(titles)} screened, {len(papers)} selected]\n\n"
             f"{summary}\n\n"
             f"Sources:\n{source_lines}"
         )
@@ -724,7 +869,7 @@ class LitVar2SummaryTool(SLMTool):
         summary = self._summarise(papers, context.patient_phenotype, gene, context)
 
         source_lines = "\n".join(
-            f"  - [PMID:{pmid}] {p['title']}  {p['url']}"
+            f"  - [PMID:{pmid}, {p.get('year', 'n.d.')}] {p['title']}  {p['url']}"
             for pmid, p in papers.items()
         )
         return (
@@ -763,10 +908,12 @@ class LitVar2SummaryTool(SLMTool):
         if not papers:
             return None
 
-        summary = self._summarise(papers, context.patient_phenotype, rsid, context)
+        summary = self._summarise(
+            papers, context.patient_phenotype, rsid, context, require_functional=True
+        )
 
         source_lines = "\n".join(
-            f"  - [PMID:{pmid}] {p['title']}  {p['url']}"
+            f"  - [PMID:{pmid}, {p.get('year', 'n.d.')}] {p['title']}  {p['url']}"
             for pmid, p in papers.items()
         )
         return (
@@ -786,13 +933,15 @@ class LitVar2SummaryTool(SLMTool):
         1. Gene + patient phenotype (primary): always runs when Gene is present.
         2. Gene + known disease term (supplemental): runs when OMIM_phenotype is not NA
            or CGD has an entry for the gene. Bridges phenotype terminology gaps.
-        3. Variant-level (supplemental): LitVar2 rsID endpoint when RS_ID is valid.
+        3. Variant-level (supplemental): LitVar2 rsID endpoint when RS_ID is valid,
+           or resolvable from gene+protein-change when RS_ID is NA.
 
         All tracks that yield evidence are combined, separated by dividers. Each block
         header embeds source and query for downstream traceability.
         """
         rsid = context.field("RS_ID")
         gene = _normalize_gene(context.field("Gene"))
+        hgvs = context.field("HGVS")
 
         if self._disease_query is None:
             with self._disease_query_lock:
@@ -801,6 +950,21 @@ class LitVar2SummaryTool(SLMTool):
 
         rsid_ok = rsid != "NA" and re.match(r"^rs\d+$", rsid, re.IGNORECASE) is not None
         gene_ok = gene != "NA" and gene.strip() != ""
+
+        # RS_ID is frequently NA in clinical CSV exports even when the variant
+        # has a real, resolvable rsID — don't skip variant-level search just
+        # because the input column is empty; resolve it from gene+protein
+        # change instead (see _resolve_rsid_by_gene_protein).
+        if not rsid_ok and gene_ok:
+            protein_change = self.extract_protein_change(hgvs)
+            if protein_change:
+                resolved = self._resolve_rsid_by_gene_protein(gene, protein_change)
+                if resolved:
+                    logger.info(
+                        "LitVar2SummaryTool: resolved rsid=%s from gene=%s protein_change=%s "
+                        "(RS_ID column was NA)", resolved, gene, protein_change,
+                    )
+                    rsid, rsid_ok = resolved, True
 
         parts = []
 

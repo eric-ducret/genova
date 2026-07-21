@@ -1,11 +1,16 @@
-﻿"""
-pipeline/stages/conclusion.py â€” SLM structured report stage.
+"""
+pipeline/stages/conclusion.py — SLM structured report stage.
 
 Ported from run_conclusion() in server_main.py.
 
 Single SLM call per variant. Takes one variant's context string, its reasoning
 output, and an optional gene-level cross-analysis text, then produces the
-structured clinical block for that variant.
+structured clinical block for that variant — a base, MOI-agnostic ACMG score
+(Tavtigian et al. 2020 Bayesian point system) covering variant-intrinsic
+evidence only. Mode-of-inheritance-dependent criteria (PS2 de novo, PP1
+cosegregation, PM3 compound-het/homozygous) are scored separately by the
+downstream MOI-layer stages (moi_denovo, moi_dominant, moi_recessive,
+moi_xlinked), which add their own criteria on top of this base score.
 
 The Clinical Conclusion paragraph (overall synthesis across all variants) is
 generated separately by stages/final_conclusion.py.
@@ -19,9 +24,10 @@ Public API:
 from __future__ import annotations
 
 import logging
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from pipeline.core.citations import validate_citations
 
 if TYPE_CHECKING:
     from pipeline.llm.base import LLMClient
@@ -30,38 +36,7 @@ logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "conclusion.txt"
 
-MAX_NEW_TOKENS_REPORT = 700
-
-
-def _validate_citations(result: str, context: str) -> str:
-    """
-    Strip inline citations from the model output that have no grounding in context.
-
-    Two citation forms are checked:
-      (PMID:12345678)  â€” removed if that PMID number does not appear anywhere in context.
-      (https://...)    â€” removed if that URL does not appear as a substring in context.
-
-    After removals, stray spaces before punctuation and double spaces are collapsed.
-    """
-    valid_pmids = set(re.findall(r"PMID:(\d+)", context))
-
-    def _keep_pmid(m: re.Match) -> str:
-        if m.group(1) in valid_pmids:
-            return m.group(0)
-        logger.warning("[Conclusion] Removed hallucinated citation: %s", m.group(0))
-        return ""
-
-    def _keep_url(m: re.Match) -> str:
-        if m.group(1) in context:
-            return m.group(0)
-        logger.warning("[Conclusion] Removed hallucinated citation: %s", m.group(0))
-        return ""
-
-    result = re.sub(r"\(PMID:(\d+)\)", _keep_pmid, result)
-    result = re.sub(r"\((https?://[^)\s]+)\)", _keep_url, result)
-    result = re.sub(r" +([.,;:])", r"\1", result)
-    result = re.sub(r"  +", " ", result)
-    return result
+MAX_NEW_TOKENS_REPORT = 1500
 
 
 def _load_prompt() -> str:
@@ -80,24 +55,30 @@ def run_one(
     llm: "LLMClient",
 ) -> str:
     """
-    Stage 4 â€” Structured clinical report for one variant.
+    Stage 4 — Structured clinical report (base ACMG score) for one variant.
 
     Args:
         variant_context: Per-variant context string from Stage 1 (retrieval).
                          Contains PATIENT DATA header + one VARIANT block with tool outputs.
-        reasoning:       Output from reasoning.run_one() for this variant.
+        reasoning:       Output from reasoning.run_reasoning() (plus any backend-derived
+                         blocks pipeline.py appended) for this variant.
         cross_analysis:  Gene-level cross-analysis text from cross_analysis.run(), or None
                          if this variant's gene has fewer than two variants in this run.
         llm:             Shared LLMClient instance.
 
     Returns:
         Structured report block for this variant:
-            # Variant [N] â€” [GENE] ([HGVS])
+            # Variant [N] — [GENE] ([HGVS])
             **Molecular mechanism:** ...
+            **ClinVar:** ...
+            **Gene constraint (gnomAD):** ...
+            **ClinVar gene-level P/LP counts:** ...
             **Phenotype fit:** ...
             **Inheritance check:** ...
+            **Segregation:** ...
             **Evidence strength:** ...
-            **ACMG criteria**: ...
+            **ACMG criteria:** ...
+            **ACMG points:** [sum] → [classification]
             **Comment:** ...
     """
     logger.info("[Conclusion] Generating structured report for variant...")
@@ -115,10 +96,11 @@ def run_one(
         .replace("{cross_analysis_block}", cross_analysis_block))
 
     result = llm.generate(
-        system="You are an expert clinical geneticist. Base every claim strictly on the evidence below.",
+        system=(
+            "You are an expert clinical geneticist. Base every claim strictly on "
+            "the evidence below. Limit your response to 1000 words maximum."
+        ),
         user=user_prompt,
         max_tokens=MAX_NEW_TOKENS_REPORT,
     )
-    return _validate_citations(result, variant_context)
-
-
+    return validate_citations(result, variant_context)

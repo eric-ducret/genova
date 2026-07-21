@@ -38,6 +38,50 @@ _DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL]["model_id"]
 
 
 # ─────────────────────────────────────────────
+# PROTEIN-CHANGE EXTRACTION (for residue-level PS1/PM5 search)
+# ─────────────────────────────────────────────
+
+_AA_1TO3 = {
+    "A": "Ala", "R": "Arg", "N": "Asn", "D": "Asp", "C": "Cys", "Q": "Gln",
+    "E": "Glu", "G": "Gly", "H": "His", "I": "Ile", "L": "Leu", "K": "Lys",
+    "M": "Met", "F": "Phe", "P": "Pro", "S": "Ser", "T": "Thr", "W": "Trp",
+    "Y": "Tyr", "V": "Val", "X": "Ter", "*": "Ter",
+}
+
+_PROTEIN_CHANGE_RE = re.compile(r"p\.\(?([A-Za-z*]{1,3})(\d+)([A-Za-z*]{1,3})\)?")
+
+
+def _extract_residue_queries(hgvs: str) -> list[dict]:
+    """
+    One search seed per distinct residue position across all transcript
+    segments of a (possibly multi-transcript, pipe-separated) HGVS string —
+    e.g. [{"query": "p.Cys1321", "own_change": "p.Cys1321Ser"}]. Different
+    transcripts of the same physical variant can carry different residue
+    numbers (alternate first exons/UTRs shift the coding start), so every
+    distinct position is searched, not just the first segment.
+
+    The search query deliberately DROPS the destination amino acid
+    ("p.Cys1321", not "p.Cys1321Ser") so one query surfaces every substitution
+    reported at that residue — both an identical change at a different
+    nucleotide (grounds PS1) and a different missense change at the same
+    residue (grounds PM5) — rather than only the exact target change. Original
+    residue in 3-letter form to match ClinVar's own naming convention (e.g.
+    "Cys1321"), which a bare 1-letter query ("C1321") often misses.
+    """
+    seeds: list[dict] = []
+    seen_positions: set[str] = set()
+    for m in _PROTEIN_CHANGE_RE.finditer(hgvs):
+        aa1, pos, aa2 = m.group(1), m.group(2), m.group(3)
+        if pos in seen_positions:
+            continue
+        seen_positions.add(pos)
+        aa1_3 = _AA_1TO3.get(aa1.upper(), aa1.capitalize()) if len(aa1) == 1 else aa1.capitalize()
+        aa2_3 = _AA_1TO3.get(aa2.upper(), aa2.capitalize()) if len(aa2) == 1 else aa2.capitalize()
+        seeds.append({"query": f"p.{aa1_3}{pos}", "own_change": f"p.{aa1_3}{pos}{aa2_3}"})
+    return seeds
+
+
+# ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 
@@ -547,6 +591,46 @@ class WebSearchAgentTool(ReActTool):
             if output:
                 label = tool_name.upper().replace("_", " ")
                 prefetched_parts.append(f"{label} EVIDENCE:\n{output}")
+
+        # ── Hardcoded variant-specific search (residue, not nucleotide) ──────
+        # A nucleotide-level query (e.g. "c.3962G>C") can only ever find THIS
+        # exact allele. Both PS1 and PM5 need the opposite: OTHER established
+        # pathogenic variants at the SAME residue — PS1 via a DIFFERENT
+        # nucleotide producing the SAME amino acid change, PM5 via a DIFFERENT
+        # missense change altogether — neither of which a nucleotide-exact or
+        # full-change-exact query can surface by construction. Search by
+        # residue only (3-letter form, e.g. "p.Cys1321", matching ClinVar's
+        # naming convention, destination amino acid dropped) so one query
+        # returns every substitution reported at that position. Downstream in
+        # the conclusion stage: same amino acid change + different nucleotide
+        # → PS1; different amino acid change (any nucleotide) → PM5; same
+        # nucleotide as this variant → it's this variant's own record, not a
+        # separate precedent (check PS3 instead).
+        gene = normalize_gene(context.field("Gene"))
+        hgvs = context.field("HGVS")
+        if gene != "NA" and hgvs != "NA":
+            _ws = WebSearchTool()
+            residue_queries = _extract_residue_queries(hgvs)
+            if residue_queries:
+                for seed in residue_queries[:4]:   # bounded — multi-transcript HGVS rarely exceeds this
+                    variant_query = f"{gene} {seed['query']} ClinVar"
+                    result = _ws.run(variant_query)
+                    if result and not result.startswith(("Error", "No results")):
+                        prefetched_parts.append(
+                            f"VARIANT WEB SEARCH ({variant_query} — candidate's own change is "
+                            f"{seed['own_change']}; for PS1/PM5, compare each hit's amino acid "
+                            f"and nucleotide change against this):\n{result}"
+                        )
+            else:
+                # No parseable protein change (e.g. intronic/splice variant) —
+                # PS1/PM5 don't apply to these anyway; fall back to a
+                # nucleotide-level query for general ClinVar visibility.
+                hgvs_short = hgvs.split(":")[-1] if ":" in hgvs else hgvs
+                variant_query = f"{gene} {hgvs_short} ClinVar"
+                result = _ws.run(variant_query)
+                if result and not result.startswith(("Error", "No results")):
+                    prefetched_parts.append(f"VARIANT WEB SEARCH ({variant_query}):\n{result}")
+
         prefetched = "\n\n".join(prefetched_parts)
 
         # ── Build retrieval prompt ────────────────────────────────────────────
@@ -570,7 +654,6 @@ class WebSearchAgentTool(ReActTool):
         adapted_llm = _LLMAdapter(context.llm)
         agent = ReActAgent(cfg, tools, llm=adapted_llm)
 
-        gene = normalize_gene(context.field("Gene"))
         forced_first_query = f"{gene} disease" if gene != "NA" else ""
 
         output = agent.run(prompt, conversation=[], prefetched=prefetched,

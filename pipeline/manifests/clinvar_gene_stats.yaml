@@ -1,0 +1,19 @@
+name: clinvar_gene_stats
+description: "Fetches gene-level ClinVar P/LP counts split by missense vs. nonsense/frameshift, plus this variant's own ClinVar submission tally — for PP2/BP1/PS3."
+enabled: true
+
+order: 1
+parallel: true
+
+gate:
+  field: Gene
+  operator: not_na
+
+timeout: 15
+# attempts=4/backoff=5.0: this tool's variant-level submission tally is
+# NOT gene-cached (unlike the gene-level counts) — it fires an NCBI esearch
+# + efetch pair for every kept variant, on top of litvar2's own NCBI traffic.
+# Real retry headroom matters here for a large cohort run.
+retry:
+  attempts: 4
+  backoff: 5.0

@@ -45,50 +45,69 @@ variant-pipeline/
 │   ├── analysis_notebook.ipynb      ← Jupyter notebook for metric visualisation
 │   └── augment_litvar2.py           ← (auxiliary) LitVar2 enrichment for result tables
 │
+├── batch_pheno.py                   ← cohort batch runner: pheno_prompts.csv + jobs_folder → per-patient reports
+├── batch_pheno_vllm.sh              ← SLURM sbatch script for one batch_pheno.py batch (Phase 2, run N times in parallel)
+├── warmup_vllm.sh                   ← SLURM sbatch script: Phase 1.5 sequential NCBI/disease-query pre-fetch
+│
 ├── pipeline/
 │   ├── __init__.py
 │   ├── pipeline.py                  ← top-level orchestrator
-│   ├── config.py                    ← global pipeline configuration (GENOME_BUILD, EXECUTION_MODE)
+│   ├── config.py                    ← global pipeline configuration (GENOME_BUILD, EXECUTION_MODE, DEFAULT_MODEL, FORCE_GENERIC_PHENOTYPE)
 │   │
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── manifest.py              ← manifest loading, validation, gate resolution
 │   │   ├── context.py               ← ToolContext dataclass
-│   │   ├── executor.py              ← tool fan-out, error handling, mini-doc assembly
-│   │   ├── normalizer.py            ← CSV/Excel ingestion and schema normalization
-│   │   └── errors.py                ← typed pipeline exceptions
+│   │   ├── executor.py              ← tool fan-out, error handling, mini-doc assembly, retry
+│   │   ├── normalizer.py            ← CSV/Excel ingestion, SLM-driven column mapping, parental AB extraction
+│   │   ├── errors.py                ← typed pipeline exceptions
+│   │   ├── moi.py                   ← mode-of-inheritance classification (gene mode, chromosome, phenotype pertinence)
+│   │   ├── segregation.py           ← deterministic allelic-balance segregation/phase/zygosity classifiers
+│   │   ├── acmg_sf.py                ← ACMG Secondary Findings v3.2 (81-gene) actionable-variant detection
+│   │   └── citations.py             ← shared anti-hallucination citation validator (used by conclusion + all MOI stages)
 │   │
 │   ├── llm/
 │   │   ├── __init__.py
 │   │   ├── base.py                  ← LLMClient abstract base class
-│   │   ├── vllm_client.py           ← vLLM HTTP client (primary, for A100 node)
+│   │   ├── vllm_client.py           ← vLLM HTTP client (primary, for A100 node) — multi-model, Gemma artifact stripping
 │   │   ├── hf_client.py             ← HuggingFace pipeline client (fallback/dev)
-│   │   └── registry.py              ← model registry, instantiate by name
+│   │   └── registry.py              ← model registry, instantiate by name (MODELS dict, DEFAULT_MODEL env var)
 │   │
 │   ├── stages/
 │   │   ├── __init__.py
-│   │   ├── retrieval.py             ← per-variant tool fan-out stage
+│   │   ├── retrieval.py             ← per-variant tool fan-out stage (+ ALLELIC BALANCE block when parental_ab present)
 │   │   ├── first_triage.py          ← fast SLM keep/discard decision per variant
-│   │   ├── reasoning.py             ← two-call SLM: step-by-step reasoning + second triage (INCLUDE/EXCLUDE)
+│   │   ├── reasoning.py             ← run_reasoning() (Call 1) + run_second_triage() (Call 2, INCLUDE/EXCLUDE)
 │   │   ├── cross_analysis.py        ← gene-level compound-het / interaction analysis
-│   │   ├── conclusion.py            ← per-variant structured report (included variants only)
-│   │   └── final_conclusion.py      ← overall clinical conclusion paragraph
+│   │   ├── conclusion.py            ← Layer 2: per-variant BASE ACMG score (Tavtigian 2020 point system)
+│   │   ├── moi_denovo.py            ← Layer 3: PS2/PM6 de novo delta (AD/AD_AR/XLD/XLR/XLD_XLR/XL genes)
+│   │   ├── moi_dominant.py          ← Layer 4: PP1 cosegregation delta (AD/AD_AR/XLD genes, inherited not de novo)
+│   │   ├── moi_recessive.py         ← Layer 5: PM3 delta — run_pair() compound-het, run_solo() confirmed homozygous
+│   │   ├── moi_xlinked.py           ← Layer 6: PP1 delta via XLR/XLD allelic-balance pattern (chrX genes)
+│   │   ├── actionable.py            ← ACMG-SF actionable-findings report section (independent of phenotype/MOI)
+│   │   └── final_conclusion.py      ← Layer 8: cross-MOI synthesis, two-pass draft (clinical_conclusion.txt) + revise (final_conclusion_revise.txt)
 │   │
 │   ├── tools/
 │   │   ├── __init__.py
 │   │   ├── base.py                  ← Tool, NetworkTool, SLMTool, RAGTool, BotTool
-│   │   ├── litvar2.py               ← literature search: gene-first three-track PubMed + LitVar2 rsID
+│   │   ├── litvar2.py               ← literature search: gene-first three-track PubMed + LitVar2 rsID; CGD inheritance lookup
 │   │   ├── autopvs1.py              ← AutoPVS1 PVS1 criterion evaluation (LoF variants)
 │   │   ├── spliceai.py              ← SpliceAI splice impact delta scores (Broad API)
+│   │   ├── gnomad_constraint.py     ← gnomAD gene constraint (pLI, LOEUF) — gene-cached, for PVS1 mechanism plausibility
+│   │   ├── clinvar_gene_stats.py    ← ClinVar gene-level P/LP consequence counts (PP2/BP1) + per-variant submission tally (PS3)
+│   │   ├── clingen_allele.py        ← ClinGen Allele Registry cross-reference (CAid → ClinVar/dbSNP/gnomAD/ExAC)
 │   │   ├── websearch.py             ← WebSearchTool + WebFetchTool (sub-tools for ReAct agent)
-│   │   ├── websearch_agent.py       ← WebSearchAgentTool: full ReAct web-search loop
+│   │   ├── websearch_agent.py       ← WebSearchAgentTool: full ReAct web-search loop + residue-level PS1/PM5 search
 │   │   └── ncbi.py                  ← NCBIFetchTool (sub-tool for ReAct agent)
 │   │
 │   └── manifests/
-│       ├── litvar2.yaml
-│       ├── autopvs1.yaml
-│       ├── spliceai.yaml
-│       └── websearch_agent.yaml
+│       ├── litvar2.yaml             ← order 1
+│       ├── spliceai.yaml            ← order 1
+│       ├── gnomad_constraint.yaml   ← order 1
+│       ├── clinvar_gene_stats.yaml  ← order 1
+│       ├── clingen_allele.yaml      ← order 1
+│       ├── autopvs1.yaml            ← order 2
+│       └── websearch_agent.yaml     ← order 3 (serial — consumes all order-1/2 outputs via context.all_outputs)
 │
 └── prompts/
     ├── retrieval.txt
@@ -96,10 +115,21 @@ variant-pipeline/
     ├── first_triage.txt
     ├── reasoning.txt
     ├── second_triage.txt
-    ├── conclusion.txt
+    ├── conclusion.txt               ← full Tavtigian 2020 ACMG point-scoring rubric (base, MOI-agnostic)
     ├── cross_analysis.txt
-    └── final_conclusion.txt
+    ├── moi_denovo.txt
+    ├── moi_dominant.txt
+    ├── moi_recessive.txt            ← compound-het pair
+    ├── moi_recessive_homozygous.txt ← confirmed-homozygous solo
+    ├── moi_xlinked.txt
+    ├── actionable_variants.txt
+    ├── clinical_conclusion.txt      ← Layer 8 draft
+    └── final_conclusion_revise.txt  ← Layer 8 fact-check pass
 ```
+
+**Note:** `launch.sh` / `batch.py` / `client.py` (below, under Deployment) are the original single-shot/server-mode
+entry points. For a full cohort run, `batch_pheno.py` + `warmup_vllm.sh` + `batch_pheno_vllm.sh` are the actual
+production workflow — see **Deployment → Cohort batch run** below.
 
 ---
 
@@ -126,9 +156,41 @@ Unknown columns are ignored. Missing columns are filled with `"NA"`.
 | `OMIM_inheritance` | str | `Autosomal recessive` | Full inheritance string |
 | `Inheritance` | str | `AR` | Short code: AR, AD, XL, … |
 | `ClinVar_class` | str | `Pathogenic` | ClinVar clinical significance |
-| `Allelic_balance` | float | `0.5393` | VAF / allele balance |
+| `Allelic_balance` | float | `0.5393` | VAF / allele balance (proband only — see Parental allelic balance below) |
 | `Frequency` | float | `1.19E-05` | Population allele frequency (gnomAD) |
 | `CADD_score` | float | `26` | CADD PHRED score |
+| `Transcript` | str | `NM_000303.3` | RefSeq transcript, only when given as its own column separate from HGVS |
+| `REVEL_score` | float | `0.82` | REVEL pathogenicity score |
+| `SIFT_score` | str/float | `0.01` | SIFT score or prediction |
+| `PolyPhen2_score` | str/float | `0.97` | PolyPhen-2 score or prediction |
+| `AlphaMissense_score` | float | `0.71` | AlphaMissense pathogenicity score |
+| `SpliceAI_score` | float | `0.85` | Pre-computed splice-impact score, if already present in the input |
+
+### Column mapping
+
+Column-to-field mapping is **SLM-driven** (`normalizer.py::_map_columns_llm`) when an
+`LLMClient` is passed to `normalize_upload()` — the model inspects the header row plus
+one sample data row and classifies each column into a canonical field, producing a
+human-readable `header_mapping_summary` surfaced at the top of the report. When no
+`llm` is passed (e.g. the CLI convenience entry point), falls back to the deterministic
+`COLUMN_ALIASES` dict mapper. Both paths share the same "Allelic balance - `<sample>`"
+structural detection (below) — that part is never sent to the SLM, it's mechanical.
+
+### Parental allelic balance
+
+Columns matching `"Allelic balance - <sample>"` (case-insensitive) are detected
+separately from the main column-mapping pass, via `extract_parental_ab()`. The first
+such column becomes the canonical `Allelic_balance` field (proband); additional
+columns are returned as a `parental_ab: list[dict]` alongside the normalized variants
+— one dict per variant, keys `"proband"`/`"mother"`/`"father"` (3 columns),
+`"proband"`/`"extra1"` or the named parent (2 columns), or just `"proband"` (1 column).
+This is the data source for the entire segregation/MOI machinery — see
+Mode-of-Inheritance & ACMG Scoring below.
+
+`normalize_upload(raw, filename, llm=None)` returns
+`(variants, raw_rows, parental_ab, header_mapping_summary)` — a 4-tuple; all three
+call sites (`server.py`, `batch.py`, `batch_pheno.py`) unpack all four and thread
+`parental_ab`/`header_mapping_summary` into `Pipeline.run()`.
 
 ### Real example rows (from test dataset)
 
@@ -208,24 +270,44 @@ prevents thinking preambles in HF mode and was the reference for the vLLM fix.
 # pipeline/llm/registry.py
 MODELS = {
     "qwen3.5-9b": {
-        "client": "hf",            # currently "hf" (dev default); change to "vllm" for production
-        "model_id": "Qwen/Qwen3.5-9B",
-        "enable_thinking": False,  # MUST be False for Qwen3.5 in this pipeline
+        "client":             "vllm",
+        "model_id":           "Qwen/Qwen3.5-9B",
+        "enable_thinking":    False,   # MUST remain False — thinking tokens break downstream parsing
         "max_tokens_default": 1024,
+        "vllm_extra_payload": {"chat_template_kwargs": {"enable_thinking": False}},
     },
-    # add new models here
+    "gemma4-e4b": {
+        "client":             "vllm",
+        "model_id":           "google/gemma-4-E4B-it",
+        "enable_thinking":    False,
+        "max_tokens_default": 1024,
+        "vllm_extra_payload": {},   # -it model has its own chat template + correct EOS handling
+    },
+    # add new models here following the same pattern
 }
 
 def get_client(model_name: str, **kwargs) -> LLMClient:
     ...
 ```
 
+`vllm_extra_payload` is merged verbatim into every vLLM chat-completions request for that model —
+this is how model-specific quirks (Qwen's `enable_thinking` flag, a future model's own extra params)
+are handled without branching in `vllm_client.py` itself.
+
+**Model selection:** `pipeline/config.py`'s `DEFAULT_MODEL = os.environ.get("VARIANT_MODEL", "qwen3.5-9b")`.
+Override per-submission with `VARIANT_MODEL=gemma4-e4b sbatch batch_pheno_vllm.sh ...` (see
+`batch_pheno_vllm.sh`, which resolves the HF model ID from this same registry so the `vllm serve`
+command line and the pipeline's client always agree on which model is running).
+
 **Qwen3.5 note:** `enable_thinking` must always be `False` in this pipeline.
 The thinking mode produces chain-of-thought tokens that bloat the context and
 break downstream parsing. For the HF client this is enforced via
 `tokenizer.apply_chat_template(..., enable_thinking=False)`. For the vLLM client
-it is enforced via `"chat_template_kwargs": {"enable_thinking": False}` in the
-request payload — the two are equivalent but use different APIs.
+it is enforced via `vllm_extra_payload`'s `chat_template_kwargs` — the two are
+equivalent but use different APIs. `vllm_client.py` also applies
+`_strip_thinking_header()` (Qwen preamble) and `_strip_gemma_artifacts()`
+(Gemma `<start_of_turn>`/`<end_of_turn>` leakage) as defensive post-processing
+on every response, regardless of model.
 
 ---
 
@@ -402,6 +484,9 @@ note the missing evidence in the report rather than reasoning from a gap.
 |---|---|---|---|
 | `litvar2_summary` | `SLMTool` | 1 (parallel) | RS_ID valid **or** Gene present (Python gate) |
 | `spliceai` | `NetworkTool` | 1 (parallel) | Python gate — skips synonymous, intergenic, UTR, unresolvable coords |
+| `gnomad_constraint` | `NetworkTool` | 1 (parallel) | Manifest gate — Gene present |
+| `clinvar_gene_stats` | `NetworkTool` | 1 (parallel) | Manifest gate — Gene present |
+| `clingen_allele` | `NetworkTool` | 1 (parallel) | Python gate — a usable HGVS/genomic query can be built |
 | `autopvs1` | `NetworkTool` | 2 (parallel) | Python gate — LoF/frameshift/splice variants only |
 | `websearch_agent` | `ReActTool` | 3 (serial) | Python gate — hard-skips ClinVar benign/likely-benign and common variants (AF > 1%); pre-loop checkpoint handles remaining cases |
 
@@ -434,7 +519,99 @@ whether any primary gaps remain (OMIM/GeneReviews, ClinVar details, functional d
 recent case reports). The loop runs up to `max_steps=4` iterations; after each
 observation a mid-loop checkpoint decides whether to continue or stop. The Python
 gate hard-skips ClinVar benign/likely-benign and common variants (AF > 1%) before
-reaching the pre-loop checkpoint.
+reaching the pre-loop checkpoint. Before the ReAct loop starts, `run()` also fires a
+deterministic (non-LLM) residue-level web search: `_extract_residue_queries()` pulls
+every distinct protein-residue position out of the variant's HGVS and searches
+`"{gene} p.Cys1321 ClinVar"` (destination amino acid deliberately dropped) so PS1/PM5
+in `conclusion.txt` can see every other pathogenic substitution reported at that
+position, not just this variant's own record.
+
+**`gnomad_constraint`** fetches pLI and LOEUF (`oe_lof_upper`) per gene from gnomAD's
+public GraphQL API (`https://gnomad.broadinstitute.org/api`, no API key). Gene-scoped
+and cached at the class level (`_constraint_cache`), so a cohort with many variants
+per gene issues one request per unique gene, not per variant. Feeds PVS1's "is LoF a
+plausible mechanism for this gene" gate in `conclusion.txt` (pLI≥0.9 or LOEUF<0.35 =
+LoF-intolerant) and the report's Gene-Level Evidence Summary table.
+
+**`clinvar_gene_stats`** fetches two independent pieces of ClinVar evidence via NCBI
+E-utilities: (1) gene-level counts of Pathogenic/Likely-pathogenic ClinVar variants
+split missense vs. nonsense/frameshift (class-cached per gene, `_stats_cache`) —
+grounds PP2/BP1; (2) this specific variant's own ClinVar submission-classification
+tally (P/LP/VUS/LB/B per individual submitter), **not** gene-cached — resolved and
+fetched fresh per variant, tagging each Pathogenic/Likely-pathogenic submission's
+rationale with `[mentions functional/experimental evidence]` when it cites an in
+vitro/in vivo/assay finding. This tag is what PS3 in `conclusion.txt` requires before
+crediting functional evidence — an aggregate P/LP ClinVar label alone is not
+sufficient grounding for PS3. This is the single tool whose NCBI call volume scales
+with variant count rather than gene count — the one to watch first under rate-limit
+pressure on a large cohort run.
+
+**`clingen_allele`** resolves a variant against the ClinGen Allele Registry
+(`reg.clinicalgenome.org/allele`, no API key), cross-referencing ClinVar/dbSNP/gnomAD/
+ExAC by canonical allele ID (CAid). Tries transcript+cDNA HGVS, then a clean HGVS
+string, then genomic-coordinate SNV fallback (trying both hg19/hg38 accessions since
+the declared build is frequently wrong for a given upload). Not gene-cached — one
+lookup per variant. An empty cross-reference set is itself reported as a meaningful
+"novel/unreported" signal. A 429/5xx from the registry raises `ToolFetchError` (so the
+manifest's retry engages); a 400 (genuinely unparseable HGVS/coordinates) is reported
+as "not resolvable" without retrying, since retrying a malformed request doesn't help.
+
+---
+
+## Mode-of-Inheritance (MOI) & ACMG Scoring
+
+Layered on top of the tool/manifest system above. Two new deterministic (no-LLM)
+core modules precompute facts *before* any relevant SLM call, so the model states
+them as given rather than re-deriving them under uncertainty:
+
+- **`pipeline/core/segregation.py`** — pure functions over allelic-balance floats:
+  `classify_ab_ratio` (0.3–0.7→het, >0.8→hom, <0.1→absent), `classify_segregation`
+  (proband+mother+father → de_novo/maternal/paternal/both_carriers/homozygous_parent/
+  uncertain/insufficient_data, duo-tolerant), `classify_phase` (two variants' own
+  segregation results → cis/trans/unknown — a CIS compound-het pair is filtered out
+  here, in plain Python, before it can ever reach an LLM call), `classify_xlinked_ab`.
+- **`pipeline/core/moi.py`** — `build_gene_mode_cache()` resolves each gene's
+  inheritance mode via a 3-tier fallback (CSV `Inheritance`/`OMIM_inheritance` text →
+  NHGRI CGD lookup via `LitVar2SummaryTool.get_cgd_inheritance()` → retrieved
+  literature text), gated by `gene_chromosome()` (a gene confirmed off chrX can never
+  classify as X-linked, regardless of what any text tier claims). `derive_pertinence()`
+  reads LitVar2's own emitted markers (`"NO DISEASE LINK"` / `"PubMed gene-disease
+  evidence for"`) to produce a phenotype-pertinence signal without a new tool call.
+- **`pipeline/core/acmg_sf.py`** — `ACMG_SF_GENES` (81 genes, ACMG SF v3.2) +
+  `build_actionable_set()`: a variant in one of these genes classified P/LP (ClinVar
+  field, or an SLM fallback check against already-fetched LitVar2 text when
+  ClinVar_class is NA) is force-included through triage/second-triage regardless of
+  phenotype relevance, and gets its own report section (`stages/actionable.py`) —
+  independent of everything else in the pipeline.
+
+**Scoring itself is entirely prompt-driven — there is no Python-side point accumulator.**
+`stages/conclusion.py` (Layer 2) scores each variant's MOI-agnostic ACMG criteria
+(mechanism, frequency, in-silico, functional, phenotype fit — never PS2/PP1/PM3) via
+`prompts/conclusion.txt`'s full Tavtigian et al. 2020 Bayesian point-system rubric.
+Four MOI-layer stages then each take that base block as **read-only input**
+("BASE CONCLUSION — already scored, do not recompute") and add exactly one
+inheritance-specific delta on top, gated as follows:
+
+| Layer | Stage | Gate | Adds |
+|---|---|---|---|
+| De Novo | `moi_denovo.py` | mode ∈ {AD, AD_AR, XLD, XLR, XLD_XLR, XL} | PS2 (trio-confirmed) / PM6 (one parent) |
+| Dominant-Inherited | `moi_dominant.py` | mode ∈ {AD, AD_AR, XLD} | PP1 (cosegregation, both proband+parent AB confirm het) |
+| Recessive (pair) | `moi_recessive.py::run_pair` | ≥2 variants in a recessive-relevant gene, `classify_phase` ≠ cis | PM3, per-variant, based on partner's own classification |
+| Recessive (solo) | `moi_recessive.py::run_solo` | confirmed-homozygous, no trans partner | PM3 at reduced weight (+0/+0.5/+1, ClinGen SVI guidance) |
+| X-Linked | `moi_xlinked.py` | `gene_chrom_cache[gene] == "X"` (chromosome, not mode) | PP1 via XLR/XLD allelic-balance pattern |
+
+A variant can land in 0, 1, or 2+ layers (e.g. an AD_AR gene's variant appears in both
+Dominant and Recessive) — deliberately not deduplicated. Python only reads the
+SLM-written `"ACMG points: N → Classification"` line back out via regex
+(`pipeline.py::_extract_acmg_points_value`) for sorting/ranking; it never recomputes it.
+
+`stages/final_conclusion.py` (Layer 8) closes the report with a two-pass synthesis:
+a draft (`prompts/clinical_conclusion.txt`) across all MOI layers, then a **second,
+independent** call (`prompts/final_conclusion_revise.txt`) that fact-checks the draft
+against the same source layer blocks for wrong point totals, hallucinated criteria,
+CIS pairs mislabeled compound-het, single-heterozygous-in-AR-gene over-claiming, and
+disease names bled across genes. Falls back to the unrevised draft on any failure or
+malformed output.
 
 ---
 
@@ -505,13 +682,43 @@ GPU KV cache math for the A100 40 GB (Qwen3.5-9B bfloat16):
 - ~112 KB per token; 32 workers × ~3000 tokens each ≈ 10.7 GB — well within budget.
 - Beyond ~48 workers vLLM starts queuing rather than crashing; latency increases.
 
-To change worker count, edit `MAX_WORKERS` in both files (one line each).
+**This estimate predates the ACMG-scoring/MOI-layer merge and is now optimistic for
+the heaviest stage.** `prompts/conclusion.txt` (Layer 2, base ACMG score) alone is
+~5,350 fixed instruction tokens before any variant evidence is substituted in —
+roughly 5–10x the size of the MOI-layer prompts and a meaningful jump from the old
+per-call estimate. Per-call token count is unevenly distributed across stages:
+Layer 2 conclusion calls run heavier than the 3,000-token estimate above; the four
+MOI-layer calls (Layer 3–6, each their own `MAX_WORKERS_LLM=16` pool) are lighter,
+since their fixed template is small and they only re-embed one already-generated
+base conclusion block (capped at `MAX_NEW_TOKENS_REPORT=1500`), not raw evidence.
+**Recompute this before a large cohort run** rather than trusting the number above —
+watch `nvidia-smi` / vLLM's own logs during an initial small-batch test
+(see Deployment → Cohort batch run) before pointing `MAX_WORKERS_LLM=16` at the
+full cohort. If OOM or heavy queuing shows up, reduce `MAX_WORKERS_LLM` in
+`pipeline/pipeline.py` first (the LLM-bound pools) — `MAX_WORKERS=32` (retrieval,
+network-bound) is unaffected by this and does not need to change.
+
+To change worker count, edit `MAX_WORKERS`/`MAX_WORKERS_LLM` in `pipeline/pipeline.py`
+(and `MAX_WORKERS` in `pipeline/stages/retrieval.py` to match, for retrieval specifically).
 
 ---
 
 ## Pipeline Stages
 
-The full flow is: retrieval → first triage → reasoning + second triage → cross-analysis → conclusion → final conclusion.
+The full flow, in the order `pipeline.py::Pipeline.run()` actually executes it:
+
+```
+retrieval → ACMG-SF detection → first triage → MOI precompute
+  → reasoning (Call 1) → second triage (Call 2) → ACMG-SF override
+  → cross-analysis → conclusion (Layer 2, base ACMG)
+  → segregation/chromosome cache → MOI layers 3–6 (De Novo, Dominant, Recessive, X-Linked)
+  → final conclusion (Layer 8, two-pass) → actionable section → report assembly
+```
+
+Threading: `MAX_WORKERS=32` for retrieval/first-triage (network/IO-bound);
+`MAX_WORKERS_LLM=16` for every LLM-calling stage from reasoning onward, always
+`min(MAX_WORKERS_LLM, len(targets))`. Cross-analysis and final conclusion run
+sequentially (once per gene / once per run), not threaded.
 
 ### Stage 1 — Retrieval (`stages/retrieval.py`)
 
@@ -526,10 +733,18 @@ retrieval.py (per variant)
           → tool.run(variant, context)
           → compression (if configured and threshold met)
           → append to mini-doc
-    ← context slice string
+    ← context slice string: PATIENT DATA [+ ALLELIC BALANCE if parental_ab given] + VARIANT DATA
 ```
 
 All context slices are kept independently (one per variant) for downstream stages.
+
+### ACMG-SF actionable detection (`pipeline.py`, calls `core/acmg_sf.py`)
+
+Runs once, on **all** variants, immediately after retrieval — before triage, and
+independent of it. `acmg_sf.build_actionable_set()` flags any variant in one of the
+81 ACMG SF v3.2 genes classified P/LP. Flagged variants are force-exempted from
+DISCARD at first triage and force-set to INCLUDE at second triage, regardless of
+phenotype relevance — see the MOI & ACMG Scoring section above.
 
 ### First Triage (`stages/first_triage.py`)
 
@@ -540,9 +755,9 @@ Prompt loaded from `prompts/first_triage.txt`.
 Only runs when `n > TRIAGE_ENABLED_THRESHOLD` (configured in `pipeline/config.py`;
 current value: 12). When skipped, all variants are implicitly KEEP.
 
-Compound heterozygous candidates (two or more variants in the same gene) are
-automatically exempted from DISCARD — a DISCARD decision on any such variant is
-overridden to KEEP.
+Two automatic exemptions from DISCARD, both overriding to KEEP: compound heterozygous
+candidates (two or more kept-eligible variants in the same gene) and ACMG-SF
+actionable findings (checked first).
 
 SLM output format:
 ```
@@ -552,25 +767,38 @@ Decision: KEEP or DISCARD
 ```
 
 Results:
-- **KEEP** variants proceed to reasoning.
+- **KEEP** variants proceed to MOI precompute and reasoning.
 - **DISCARD** variants are excluded from all subsequent stages and appear in the
   appendix of the final report with their justification.
 
+### MOI precompute (`pipeline.py`, calls `core/moi.py`)
+
+Runs once, on all kept variants, before reasoning. Builds `gene_mode_cache`
+(inheritance mode per gene), `recessive_gene_groups` (compound-het candidate
+groupings), and `pertinence_cache` (per-variant gene-phenotype literature signal,
+read from LitVar2's already-emitted evidence). No LLM calls — see the MOI & ACMG
+Scoring section above for the exact 3-tier resolution logic.
+
 ### Stage 2 — Reasoning + Second Triage (`stages/reasoning.py`)
 
-Two SLM calls per kept variant, executed sequentially:
+Two SLM calls per kept variant:
 
-**Call 1 — reasoning** (`prompts/reasoning.txt`): produces step-by-step clinical
-reasoning grounded in cited evidence only. The model is explicitly instructed not
+**Call 1 — `run_reasoning()`** (`prompts/reasoning.txt`): produces step-by-step clinical
+reasoning grounded in cited evidence only, plus a backend-fed `{inheritance_mode_block}`
+(gene mode + phenotype pertinence, stated as fact) and, for compound-het candidates,
+a `{sibling_context_block}` built from the sibling variant's raw evidence (Call 1 runs
+for every kept variant in a gene group before any of them proceeds to Call 2, so the
+sibling's own reasoning doesn't exist yet at this point). Ends with a mandatory
+"Segregation & Inheritance Summary" table. The model is explicitly instructed not
 to produce a score or classification and not to introduce external knowledge without
-a reference in the provided context. Steps: phenotype fit → variant description →
-molecular mechanism → inheritance coherence → flags and uncertainties.
+a reference in the provided context.
 
-**Call 2 — second triage** (`prompts/second_triage.txt`): takes the variant context
-and the reasoning from call 1 and emits a structured inclusion decision. Decoupling
-the decision from the narrative prevents the model from forcing a favourable outcome
-to justify speculative reasoning. `MAX_NEW_TOKENS_SCORING = 400` — budget is large
-enough to accommodate any residual thinking preamble before the three decision lines.
+**Call 2 — `run_second_triage()`** (`prompts/second_triage.txt`): takes the variant
+context and Call 1's reasoning and emits a structured inclusion decision — now with
+the sibling's *reasoning* (not just raw evidence) injected, plus AD_AR/XLD_XLR
+inheritance-mode carve-outs and a low-allelic-balance-confidence exclusion rule.
+Decoupling the decision from the narrative prevents the model from forcing a
+favourable outcome to justify speculative reasoning.
 
 SLM output format for second triage:
 ```
@@ -582,65 +810,109 @@ Decision: INCLUDE or EXCLUDE
 The two outputs are concatenated (separated by `SECOND TRIAGE:`) before being stored,
 so the REASONING display section in the final output is self-contained.
 
+Any variant in `actionable_indices` (ACMG-SF) that didn't come back INCLUDE is then
+force-set to INCLUDE.
+
 Results:
-- **INCLUDE** variants proceed to cross-analysis and conclusion.
+- **INCLUDE** variants proceed to cross-analysis, conclusion, and the MOI layers.
 - **EXCLUDE** variants are listed in the report appendix with their reasoning available
-  in the REASONING section.
+  in the REASONING section — they still get a Layer 2 base conclusion (next stage),
+  just no MOI-layer analysis.
 
 ### Stage 3 — Cross-analysis (`stages/cross_analysis.py`)
 
-Runs after reasoning, for each gene that has two or more included variants. Presents the
-per-variant contexts and reasonings to the SLM and asks it to evaluate potential
-compound heterozygous or other gene-level interactions.
+Runs after second triage, for each gene that has two or more **included** variants.
+Presents the per-variant contexts and reasonings to the SLM and asks it to evaluate
+potential compound heterozygous or other gene-level interactions.
 Prompt loaded from `prompts/cross_analysis.txt`.
 
-The cross-analysis output is passed into `conclusion.run_one()` for the relevant variants.
+The cross-analysis output is passed into `conclusion.run_one()` and, where
+applicable, `moi_recessive.run_pair()`/`run_solo()` for the relevant variants.
 
-### Stage 4 — Conclusion (`stages/conclusion.py`)
+### Stage 4 — Conclusion / base ACMG score, Layer 2 (`stages/conclusion.py`)
 
-One SLM call per included variant. Takes the variant context slice, its reasoning block,
-and (if available) the cross-analysis for its gene. Produces the structured variant
-report block. Prompt loaded from `prompts/conclusion.txt`.
+One SLM call per **kept, non-reasoning-failed** variant — a broader set than just
+INCLUDE, so excluded variants still carry a documented base score for the report
+appendix. Takes the variant context slice, its reasoning block (+ backend-fed
+pertinence/zygosity blocks), and (if available) the cross-analysis for its gene.
+Produces the structured base-ACMG report block. Prompt loaded from
+`prompts/conclusion.txt` — see the MOI & ACMG Scoring section above for the full
+Tavtigian point-system rubric this now implements.
 
-After the SLM call, a `_validate_citations` post-processing step strips any inline
+After the SLM call, `core/citations.py::validate_citations()` strips any inline
 citations that are not grounded in the variant context: `(PMID:XXXXXXXX)` references
 are kept only if that PMID appears in the context; `(https://...)` references are kept
 only if the URL appears verbatim in the context. This prevents hallucinated citations
-from propagating into the final report.
+from propagating into the final report. The same function is reused by all four
+MOI-layer stages.
 
-Output format per variant:
+Output format per variant (abridged — see `prompts/conclusion.txt` for the full
+criterion-by-criterion rubric):
 ```
 # Variant [N] — [GENE] ([HGVS])
 **Molecular mechanism:** ...
+**ClinVar:** ...
+**Gene constraint (gnomAD):** ...
+**ClinVar gene-level P/LP counts:** ...
 **Phenotype fit:** match | mismatch | uncertain — ...
 **Inheritance check:** consistent | inconsistent | insufficient data
+**Segregation:** de novo | inherited from mother | inherited from father | both parents carriers | uncertain | no parental data
 **Evidence strength:** strong | moderate | weak | absent
-**ACMG criteria**: ...
+**ACMG criteria:** [criterion list, each with strength/points/justification]
+**ACMG points:** [sum] → [classification]
 **Comment:** ...
 ```
 
-### Stage 5 — Final Conclusion (`stages/final_conclusion.py`)
+### MOI layers 3–6 (`stages/moi_denovo.py`, `moi_dominant.py`, `moi_recessive.py`, `moi_xlinked.py`)
 
-Single SLM call. Takes all included variants' conclusion blocks and the patient phenotype.
-Prompt loaded from `prompts/final_conclusion.txt`.
+Run after Layer 2, over **included** variants only, each independently gated (see
+the table in the MOI & ACMG Scoring section above). Each is one SLM call (recessive
+pair: one call per gene-pair combination) that takes the Layer 2 block as read-only
+input and adds exactly one inheritance-specific ACMG delta on top. A variant can hit
+0, 1, or 2+ layers — not deduplicated.
+
+### Stage 5 — Final Conclusion, Layer 8 (`stages/final_conclusion.py`)
+
+Two sequential SLM calls, once per run (not per variant):
+
+**Draft** (`prompts/clinical_conclusion.txt`) — takes all non-empty MOI-layer output
+lists plus any Unclassified (included-but-no-layer-fired) base conclusions, each under
+its own `=== LAYER ===` header, and the patient phenotype.
+
+**Revise** (`prompts/final_conclusion_revise.txt`) — a second, independent call that
+fact-checks the draft against the same source layer blocks (wrong point totals,
+hallucinated criteria, CIS pairs mislabeled compound-het, single-heterozygous-in-AR-
+gene over-claiming, disease names bled across genes). Replaces the draft only if it
+succeeds and the output contains `"# Clinical Conclusion"`; falls back to the
+unrevised draft otherwise.
 
 Output format (two sections):
 ```
 # Reasoning
-[3–6 sentences comparing variants, drawing on what each conclusion states]
+[layer-by-layer summary, phase-check lines for recessive genes, then comparison across layers]
 
 # Clinical Conclusion
-[2–3 sentences naming the primary causative variant and why it fits]
+[per-causative-variant paragraphs with ACMG classification + criteria list, then a closing summary sentence]
 ```
 
-This stage is separate from Stage 4 so that each variant's block can be generated
-individually (reducing SLM memory pressure) while the overall summary still has
-visibility across all variants.
-
-The combined conclusions text is truncated to 50 000 characters before the LLM
+The combined layer-blocks text is truncated to 50 000 characters before either LLM
 call (`_MAX_CONCLUSIONS_CHARS`) to prevent a `400 Bad Request` from vLLM when a
 large number of variants are included and the combined text exceeds
 `--max-model-len 16384` tokens.
+
+### Actionable Variants section (`stages/actionable.py`)
+
+One SLM call, once per run, batched over all ACMG-SF-flagged variants that reached
+a Layer 2 conclusion (skipped entirely if none). Independent of phenotype fit and
+MOI layers by design.
+
+### Report assembly (`pipeline.py`, no LLM calls)
+
+Gene-Level Evidence Summary table (gnomAD pLI/LOEUF + ClinVar consequence verdict per
+gene, read from the tools' own class-level caches, not re-fetched) → each non-empty
+MOI-layer section (blocks sorted Pathogenic → Likely Pathogenic → VUS → Likely Benign
+→ Benign) → Unclassified appendix (same sort) → the Layer 8 Clinical Conclusion →
+Actionable Variants (if any) → exclude/discard appendix.
 
 ---
 
@@ -652,6 +924,14 @@ large number of variants are included and the combined text exceeds
 computes a per-case analysis CSV (`results_table_{YYYYMMDD}.csv`). It is a standalone
 script — it does **not** import from the `pipeline/` package and has no external
 dependencies beyond the Python standard library.
+
+**Known gap since the ACMG-scoring/MOI-layer merge:** only received a light
+compatibility pass — `_parse_report_funnel`'s `conclusion_genes` regex was updated to
+also match MOI-layer headers (`# De Novo Analysis — GENE`, etc.), not just the old
+flat `# Variant N — GENE` header, so `n_in_conclusion` doesn't silently collapse to
+just the Unclassified section. It does **not** yet parse ACMG points/classification,
+per-layer breakdowns, or the Actionable Variants section — that's a separate,
+not-yet-done task once the new report format has been seen with real output.
 
 ### What it does (per patient)
 
@@ -769,6 +1049,44 @@ python batch.py "$JOBS_FOLDER" --backend vllm
 `--enable-prefix-caching` — reuses KV cache for shared prompt prefixes across requests.
 Startup polling uses 60 attempts × 5 s = 5 minutes; Qwen3.5's hybrid Mamba
 architecture needs this much time on first load.
+
+### Cohort batch run (production, current)
+
+For a full patient cohort (e.g. `pheno_prompts.csv`), the actual workflow is
+`warmup_vllm.sh` → N × `batch_pheno_vllm.sh`, not `launch.sh`/`batch.py` above:
+
+```bash
+# Phase 1.5 — one sequential job, resolves disease queries + NCBI Track 1 for
+# every patient into external_prefetch's cache, so Phase 2 jobs below make as
+# few live NCBI calls as possible.
+sbatch warmup_vllm.sh <jobs_folder>
+
+# Phase 2 — N parallel jobs, one per batch (n-batches must match across all of them)
+for i in $(seq 1 6); do
+    sbatch batch_pheno_vllm.sh "$i" <jobs_folder> 6
+done
+```
+
+`batch_pheno_vllm.sh` resolves the HF model ID from `pipeline.llm.registry.MODELS`
+so the `vllm serve` command and the pipeline's client always agree on which model
+is running; override with `VARIANT_MODEL=gemma4-e4b sbatch batch_pheno_vllm.sh ...`.
+
+**`external_prefetch` is not part of this repo.** `batch_pheno.py` imports it inside
+a `try/except ImportError: pass` — if present on the cluster filesystem, it caches
+LitVar2's disease-query resolution and NCBI Track-1 results so the parallel Phase 2
+jobs mostly avoid live NCBI calls. **It predates the ACMG-scoring merge and does not
+cover `clinvar_gene_stats`'s NCBI traffic** (gene-level ClinVar counts + this specific
+variant's own submission tally) or the two other new tools (`gnomad_constraint` hits
+gnomAD, not NCBI; `clingen_allele` hits the ClinGen Allele Registry, not NCBI) — none
+of these are pre-fetched/cached by the existing warmup design. Extending the warmup
+to cover `clinvar_gene_stats` the same way it covers LitVar2 Track 1 would meaningfully
+reduce live-NCBI pressure during Phase 2, but that's cluster-side code this repo
+doesn't have visibility into.
+
+**Recommended before pointing this at the full cohort:** run `warmup_vllm.sh` +
+a single `batch_pheno_vllm.sh` batch against a small `--n-batches` slice first (a
+handful of patients), and watch for `429`/rate-limit warnings in the job log and
+GPU memory headroom in `nvidia-smi`, before fanning out to the full parallel run.
 
 ### Local / dev
 
@@ -957,6 +1275,18 @@ These rules must be respected in all new code:
 
 10. **The server knows nothing about variants.** `server.py` parses the request,
     calls `pipeline.run()`, and returns the result. All logic is in `pipeline/`.
+
+11. **Deterministic facts are computed in Python, never re-derived by the SLM.**
+    Anything expressible as a pure function over already-known data (segregation
+    pattern, CIS/TRANS phase, gene inheritance mode, X-linked AB pattern — see
+    `core/segregation.py`/`core/moi.py`) is computed once in plain Python and handed
+    to the prompt as a stated, backend-determined fact ("do not re-derive"). This is
+    not an optimization — a CIS compound-het pair, for example, is filtered out in a
+    Python loop before it can ever reach an LLM call, rather than relying on the model
+    to catch it. Reserve the LLM for judgment calls that genuinely require reading
+    unstructured evidence (is this literature relevant, does this comment describe
+    functional data, is the phenotype specific enough for PP4) — never for arithmetic
+    or classification a `re.match`/threshold check could do reliably.
 
 ---
 

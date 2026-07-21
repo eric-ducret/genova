@@ -1,0 +1,18 @@
+name: gnomad_constraint
+description: "Fetches gnomAD gene constraint metrics (pLI, LOEUF) for PVS1 mechanism plausibility."
+enabled: true
+
+order: 1
+parallel: true
+
+gate:
+  field: Gene
+  operator: not_na
+
+timeout: 15
+# attempts=4/backoff=5.0: gene-cached (one call per unique gene, not per
+# variant) so total volume is low, but with no tool-level backoff of its
+# own a single retry at 2s often isn't enough to clear a real throttle.
+retry:
+  attempts: 4
+  backoff: 5.0

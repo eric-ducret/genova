@@ -138,6 +138,31 @@ class NCBIFetchTool(NetworkTool):
 
     # ── ClinVar variation ──────────────────────────────────────────────────────
 
+    # Matches the cDNA-change token out of a combined/compound HGVS string,
+    # e.g. "NM_000330:exon4:c.214G>A:p.E72K" -> "c.214G>A". ClinVar's own
+    # esearch [variant name] index only matches this clean token — the full
+    # colon-glued compound string comes back as one unsplittable phrase with
+    # zero hits, even when the variant is in ClinVar.
+    _CDNA_CHANGE_RE = re.compile(r"c\.[^\s:;]+")
+
+    def resolve_clinvar_id(self, gene: str, hgvs: str) -> str | None:
+        """Look up a ClinVar variation ID for gene+HGVS via esearch, for use
+        when the ReAct agent doesn't already have a numeric ID from a URL."""
+        cdna_match = self._CDNA_CHANGE_RE.search(hgvs) if hgvs and hgvs != "NA" else None
+        variant_term = cdna_match.group(0) if cdna_match else hgvs
+        term = f"{gene}[gene] AND {variant_term}[variant name]" if variant_term and variant_term != "NA" else f"{gene}[gene]"
+        try:
+            data = _ncbi_get(
+                "esearch.fcgi",
+                {"db": "clinvar", "term": term, "retmode": "json", "retmax": 1},
+                self.timeout,
+            ).json()
+            ids = data.get("esearchresult", {}).get("idlist", [])
+        except Exception as e:
+            logger.debug("ClinVar esearch failed for %s: %s", term, e)
+            return None
+        return ids[0] if ids else None
+
     def _fetch_clinvar(self, variation_id: str) -> str:
         logger.debug("Fetching ClinVar variation_id=%s", variation_id)
         try:
@@ -159,6 +184,12 @@ class NCBIFetchTool(NetworkTool):
         last_eval  = result.get("germline_classification", {}).get("last_evaluated", "")
         gene       = ", ".join(g["symbol"] for g in result.get("genes", []) if "symbol" in g)
         conditions = ", ".join(t["name"]   for t in result.get("trait_set", []) if "name" in t)
+        # An empty ClinVar trait_set is a load-bearing fact, not a formatting
+        # gap — a Pathogenic/Likely pathogenic call with no associated
+        # condition at all cannot be checked against the patient's phenotype
+        # and must not read as an unremarkable blank line the model can skim
+        # past (this exact case let an unrelated-disease P call reach INCLUDE).
+        conditions = conditions if conditions else "(none listed — no disease/condition associated with this ClinVar record)"
 
         return (
             f"Variant:    {name}\n"

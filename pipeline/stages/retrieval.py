@@ -1,9 +1,10 @@
-﻿"""
-pipeline/stages/retrieval.py â€” Per-variant tool fan-out stage.
+"""
+pipeline/stages/retrieval.py — Per-variant tool fan-out stage.
 
 For each variant, calls Executor.run_variant() to run all tools in manifest order,
 then returns a list of per-variant context strings. Each string is self-contained:
-it includes the PATIENT DATA header and one VARIANT block with tool outputs.
+it includes the PATIENT DATA header, optional ALLELIC BALANCE block, and one
+VARIANT block with tool outputs.
 
 Variants are processed concurrently up to MAX_WORKERS using a ThreadPoolExecutor.
 Tools within each variant still run in manifest order (sequential within the thread).
@@ -11,11 +12,14 @@ vLLM handles concurrent HTTP requests natively via continuous batching, so paral
 variants translate directly into higher GPU throughput.
 
 Public API:
-    run(variants, patient_phenotype, executor) -> list[str]
+    run(variants, patient_phenotype, executor, genome_build, raw_rows, parental_ab) -> list[str]
 
 Each element of the returned list follows this format:
     PATIENT DATA:
     {patient_phenotype}
+
+    ALLELIC BALANCE:          (only if parental_ab is provided)
+    Proband: 0.48 | Mother: 0.51 | Father: 0.00
 
     VARIANT DATA:
 
@@ -47,15 +51,21 @@ def _variant_dict_to_str(variant: dict) -> str:
     return ", ".join(f"{k}={variant.get(k, 'NA')}" for k in TARGET_COLUMNS)
 
 
+def _format_allelic_balance(ab_entry: dict) -> str:
+    """Format a single variant's allelic balance dict into a readable string."""
+    return " | ".join(f"{label.capitalize()}: {value}" for label, value in ab_entry.items())
+
+
 def run(
     variants: list[dict],
     patient_phenotype: str,
     executor: "Executor",
     genome_build: str = DEFAULT_GENOME_BUILD,
     raw_rows: list[dict] | None = None,
+    parental_ab: list[dict] | None = None,
 ) -> list[str]:
     """
-    Stage 1 â€” Per-variant tool fan-out, parallelised across variants.
+    Stage 1 — Per-variant tool fan-out, parallelised across variants.
 
     Args:
         variants:          List of normalized variant dicts.
@@ -63,6 +73,8 @@ def run(
         executor:          Configured Executor instance (tools + manifests + LLM).
         genome_build:      Reference genome build for this run.
         raw_rows:          Full original CSV rows, one dict per variant.
+        parental_ab:       Per-variant allelic balance dicts from normalizer,
+                           or None if no parental data available.
 
     Returns:
         List of per-variant context strings in the same order as the input.
@@ -91,11 +103,17 @@ def run(
             raw_fields=raw_fields,
         )
 
-        slice_ = (
-            f"PATIENT DATA:\n{patient_phenotype}\n\n"
-            f"VARIANT DATA:\n\n"
-            f"VARIANT {i + 1}:\n{variant_str}\n\n{mini_doc}"
-        )
+        # Build context: patient data header
+        parts = [f"PATIENT DATA:\n{patient_phenotype}"]
+
+        # Add allelic balance block if available
+        if parental_ab and i < len(parental_ab) and parental_ab[i]:
+            parts.append(f"\nALLELIC BALANCE:\n{_format_allelic_balance(parental_ab[i])}")
+
+        # Add variant data and tool outputs
+        parts.append(f"\nVARIANT DATA:\n\nVARIANT {i + 1}:\n{variant_str}\n\n{mini_doc}")
+
+        slice_ = "\n".join(parts)
         logger.info("[Retrieval] Variant %d/%d done.", i + 1, total)
         return i, slice_, log_entries
 
@@ -121,5 +139,3 @@ def run(
     executor.process_log = sorted(all_log_entries, key=lambda e: e["variant_index"])
 
     return context_slices  # type: ignore[return-value]  # all slots filled above
-
-
