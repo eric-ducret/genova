@@ -39,6 +39,8 @@ MAX_WORKERS_LLM      = 16   # reasoning/conclusion (vLLM calls, GPU-bound)
 from pipeline.config          import (
     DEFAULT_GENOME_BUILD,
     TRIAGE_ENABLED_THRESHOLD,
+    FORCE_GENERIC_PHENOTYPE,
+    GENERIC_PHENOTYPE_TEXT,
 )
 from pipeline.core.manifest  import ManifestLoader
 from pipeline.core.executor  import Executor
@@ -296,6 +298,13 @@ class Pipeline:
         """
         if not variants:
             raise ValueError("variants list is empty — nothing to analyze.")
+
+        if FORCE_GENERIC_PHENOTYPE:
+            logger.info(
+                "[Pipeline] FORCE_GENERIC_PHENOTYPE active — overriding phenotype "
+                "with generic placeholder for this run."
+            )
+            patient_phenotype = GENERIC_PHENOTYPE_TEXT
 
         # Reset per-run state: _disease_query is derived from patient_phenotype and
         # must not bleed across run() calls when the same Pipeline instance is reused.

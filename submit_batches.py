@@ -150,6 +150,8 @@ def main() -> None:
     for i in range(1, n_batches + 1):
         cmd = [
             "sbatch",
+            "--export=NONE",   # ignore the submitting shell's env (e.g. an active conda env)
+                               # so batch_pheno_vllm.sh always builds its own clean environment
             str(_SBATCH_SCRIPT),
             str(i),
             str(args.jobs_folder),

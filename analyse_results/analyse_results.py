@@ -31,6 +31,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 import re
 import sys
 import urllib.request
@@ -42,25 +43,52 @@ from typing import Dict, List, Optional, Tuple
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# Per-model payload extras — mirrors pipeline/llm/registry.py MODELS entries.
+_MODEL_CONFIGS = {
+    "qwen3.5-9b": {
+        "model_id":      "Qwen/Qwen3.5-9B",
+        "extra_payload": {"chat_template_kwargs": {"enable_thinking": False}},
+    },
+    "gemma4-e4b": {
+        "model_id":      "google/gemma-4-E4B-it",
+        "extra_payload": {},
+    },
+}
+
+# Gemma turn tokens that leak into responses when stop is not applied correctly.
+_GEMMA_TURN_START_RE = re.compile(r"^(?:<start_of_turn>\w+\n)+")
+
+
+def _strip_gemma_artifacts(text):
+    # type: (str) -> str
+    text = _GEMMA_TURN_START_RE.sub("", text, count=1)
+    end = text.find("<end_of_turn>")
+    if end != -1:
+        text = text[:end]
+    return text.strip() or text
+
 
 class _VLLMClient(object):
     """Minimal stdlib-only vLLM HTTP client (no httpx/requests dependency)."""
 
-    def __init__(self, base_url="http://localhost:8001", model_id="Qwen/Qwen3.5-9B", timeout=300):
-        self.base_url = base_url.rstrip("/")
-        self.model_id = model_id
-        self.timeout  = timeout
+    def __init__(self, base_url="http://localhost:8001", model_id="Qwen/Qwen3.5-9B",
+                 timeout=300, extra_payload=None):
+        self.base_url        = base_url.rstrip("/")
+        self.model_id        = model_id
+        self.timeout         = timeout
+        self._extra_payload  = extra_payload or {}
 
     def generate(self, system, user, max_tokens=512, temperature=0.0, **kwargs):
         # type: (str, str, int, float) -> str
-        payload = json.dumps({
+        body = {
             "model":       self.model_id,
             "messages":    [{"role": "system", "content": system},
                             {"role": "user",   "content": user}],
             "max_tokens":  max_tokens,
             "temperature": temperature,
-            "chat_template_kwargs": {"enable_thinking": False},
-        }).encode("utf-8")
+        }
+        body.update(self._extra_payload)
+        payload = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
             "{0}/v1/chat/completions".format(self.base_url),
             data=payload,
@@ -68,7 +96,8 @@ class _VLLMClient(object):
         )
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"].strip()
+        raw = data["choices"][0]["message"]["content"].strip()
+        return _strip_gemma_artifacts(raw)
 
     def is_available(self):
         # type: () -> bool
@@ -166,6 +195,29 @@ def _extract_final_conclusion(report_text):
 
 # ─── ranked variant parsing ───────────────────────────────────────────────────
 
+def _dedupe_identifiers(parsed):
+    # type: (List) -> List[str]
+    """
+    Dedupe a parsed ranking array by leading gene token (case-insensitive),
+    preserving first-occurrence order. Guards against models that repeat the
+    whole array (or individual entries) instead of emitting a stop token.
+    """
+    items = [str(item).strip() for item in parsed if str(item).strip()]
+    seen = set()
+    result = []
+    for item in items:
+        gene = re.split(r"[\s(]", item, 1)[0].strip().upper()
+        if gene and gene not in seen:
+            seen.add(gene)
+            result.append(item)
+    if len(result) < len(items):
+        logger.warning(
+            "[analyse] Ranking response had %d repeated/duplicate entries — deduped %d → %d",
+            len(items) - len(result), len(items), len(result),
+        )
+    return result
+
+
 def _parse_ranked_variants(response):
     # type: (str) -> List[str]
     """
@@ -186,7 +238,7 @@ def _parse_ranked_variants(response):
     try:
         parsed = json.loads(text)
         if isinstance(parsed, list):
-            return [str(item).strip() for item in parsed if str(item).strip()]
+            return _dedupe_identifiers(parsed)
     except (json.JSONDecodeError, ValueError):
         pass
 
@@ -196,7 +248,7 @@ def _parse_ranked_variants(response):
         try:
             parsed = json.loads("[{0}]".format(array_match.group(1)))
             if isinstance(parsed, list):
-                return [str(item).strip() for item in parsed if str(item).strip()]
+                return _dedupe_identifiers(parsed)
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -742,6 +794,11 @@ def main():
         help="vLLM HTTP server base URL (default: http://localhost:8001)",
     )
     parser.add_argument(
+        "--model", default=os.environ.get("VARIANT_MODEL", "qwen3.5-9b"),
+        choices=list(_MODEL_CONFIGS),
+        help="Model name — qwen3.5-9b or gemma4-e4b (default: VARIANT_MODEL env var or qwen3.5-9b)",
+    )
+    parser.add_argument(
         "--workers", type=int, default=8, metavar="N",
         help="Number of parallel SLM workers (default: 8)",
     )
@@ -770,7 +827,13 @@ def main():
         len(pheno_data), n_with_gt,
     )
 
-    llm = _VLLMClient(base_url=args.vllm_url)
+    model_cfg = _MODEL_CONFIGS.get(args.model, _MODEL_CONFIGS["qwen3.5-9b"])
+    logger.info("[analyse] Using model: %s (%s)", args.model, model_cfg["model_id"])
+    llm = _VLLMClient(
+        base_url=args.vllm_url,
+        model_id=model_cfg["model_id"],
+        extra_payload=model_cfg["extra_payload"],
+    )
 
     if not llm.is_available():
         print("ERROR: vLLM server not reachable at {0}".format(args.vllm_url), file=sys.stderr)
@@ -796,16 +859,31 @@ def main():
                     "total_ranked": 0,
                 }
 
-    today   = datetime.now().strftime("%Y%m%d")
-    out_dir = args.output_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "results_table_{0}.csv".format(today)
+    today    = datetime.now().strftime("%Y%m%d")
+    filename = "results_table_{0}.csv".format(today)
 
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=_OUTPUT_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for stem in sorted(all_results):
-            writer.writerow(all_results[stem])
+    def _write_csv(path):
+        # type: (Path) -> None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_OUTPUT_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for stem in sorted(all_results):
+                writer.writerow(all_results[stem])
+
+    try:
+        out_path = args.output_dir / filename
+        _write_csv(out_path)
+    except OSError as exc:
+        # All patients were already processed by the SLM — an unwritable
+        # output-dir must not throw that work away. Fall back to cwd.
+        fallback_path = Path.cwd() / filename
+        logger.error(
+            "[analyse] Could not write to %s (%s) — falling back to %s",
+            out_path, exc, fallback_path,
+        )
+        _write_csv(fallback_path)
+        out_path = fallback_path
 
     logger.info("[analyse] Saved → %s", out_path)
     print(out_path)

@@ -25,10 +25,20 @@ _THINKING_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def _strip_thinking_header(text: str) -> str:
     cleaned = _THINKING_HEADER_RE.sub("", text, count=1).strip()
     return cleaned if cleaned else text
+
+
+# Defensive fallback for Gemma turn-token leakage (primary fix is stop=["<end_of_turn>"]).
+_GEMMA_TURN_START_RE = re.compile(r"^(?:<start_of_turn>\w+\n)+", re.MULTILINE)
+
+def _strip_gemma_artifacts(text: str) -> str:
+    text = _GEMMA_TURN_START_RE.sub("", text, count=1)
+    end = text.find("<end_of_turn>")
+    if end != -1:
+        text = text[:end]
+    return text.strip() or text
 
 
 class VLLMClient(LLMClient):
@@ -80,6 +90,11 @@ class VLLMClient(LLMClient):
                         f"{self.base_url}/v1/chat/completions",
                         json=payload,
                     )
+                    if resp.status_code >= 400:
+                        raise httpx.HTTPStatusError(
+                            f"{resp.status_code} {resp.reason_phrase}: {resp.text[:500]}",
+                            request=resp.request, response=resp,
+                        )
                     resp.raise_for_status()
                     data = resp.json()
                 break
@@ -89,7 +104,7 @@ class VLLMClient(LLMClient):
                 time.sleep(_backoff * (attempt + 1))
 
         raw = data["choices"][0]["message"]["content"].strip()
-        return _strip_thinking_header(raw)
+        return _strip_gemma_artifacts(_strip_thinking_header(raw))
 
     async def generate_async(
         self,
@@ -116,11 +131,16 @@ class VLLMClient(LLMClient):
                 f"{self.base_url}/v1/chat/completions",
                 json=payload,
             )
+            if resp.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    f"{resp.status_code} {resp.reason_phrase}: {resp.text[:500]}",
+                    request=resp.request, response=resp,
+                )
             resp.raise_for_status()
             data = resp.json()
 
         raw = data["choices"][0]["message"]["content"].strip()
-        return _strip_thinking_header(raw)
+        return _strip_gemma_artifacts(_strip_thinking_header(raw))
 
     def is_available(self) -> bool:
         """Ping the vLLM health endpoint."""

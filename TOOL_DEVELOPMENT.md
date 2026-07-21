@@ -211,6 +211,7 @@ Add the instance to the `self._tools` list in `pipeline/pipeline.py`:
 ```python
 self._tools = [
     LitVar2SummaryTool(),
+    SpliceAITool(),
     AutoPVS1Tool(),
     WebSearchAgentTool(),
     MyTool(),            # ← add here, in execution order

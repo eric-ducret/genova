@@ -24,10 +24,11 @@ MODELS: dict[str, dict] = {
     },
     "gemma4-e4b": {
         "client":             "vllm",
-        "model_id":           "google/gemma-4-E4B",
+        "model_id":           "google/gemma-4-E4B-it",
         "enable_thinking":    False,
         "max_tokens_default": 1024,
-        # No vllm_extra_payload needed — Gemma uses a standard chat template.
+        # -it model has a built-in chat template and correct EOS handling; no extra payload needed.
+        "vllm_extra_payload": {},
     },
     # Add new models here following the same pattern.
     # "my-new-model": {
