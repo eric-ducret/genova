@@ -64,7 +64,16 @@ variant-pipeline/
 │   │   ├── moi.py                   ← mode-of-inheritance classification (gene mode, chromosome, phenotype pertinence)
 │   │   ├── segregation.py           ← deterministic allelic-balance segregation/phase/zygosity classifiers
 │   │   ├── acmg_sf.py                ← ACMG Secondary Findings v3.2 (81-gene) actionable-variant detection
-│   │   └── citations.py             ← shared anti-hallucination citation validator (used by conclusion + all MOI stages)
+│   │   ├── citations.py             ← shared anti-hallucination citation validator (used by conclusion + all MOI stages)
+│   │   ├── acmg_points.py           ← shared point-arithmetic regex utility (classify(), adjust_points_line()) for the validators below
+│   │   ├── acmg_pp2_bp1.py          ← post-hoc validator: strips PP2/BP1 if the SLM's claim doesn't match gene-level ClinVar consequence counts
+│   │   ├── acmg_pp3.py              ← post-hoc validator: strips PP3 if fewer than 2 in-silico tools actually cross their documented threshold
+│   │   ├── acmg_pp4.py              ← post-hoc validator: strips PP4 if its own justification names a hardcoded heterogeneous condition
+│   │   ├── acmg_ps1_pm5.py          ← post-hoc validator: inserts a missed PS1/PM5 line when residue-level evidence supports it but the SLM omitted it
+│   │   ├── acmg_bp6.py              ← post-hoc validator: strips BP6 if its own justification text self-contradicts (names VUS/pathogenic instead of benign)
+│   │   ├── build_detection.py       ← genome-build (hg19/hg38) auto-detection via ClinGen majority vote over a variant sample — utility, not yet called from pipeline.py
+│   │   ├── clinvar_reference.py     ← deterministically appends a ClinVar Variation-ID/URL line to conclusion/MOI blocks
+│   │   └── protein_change.py        ← shared HGVS protein-change parsing (extract_residue_queries), used by websearch_agent.py and clinvar_residue_search.py
 │   │
 │   ├── llm/
 │   │   ├── __init__.py
@@ -94,17 +103,21 @@ variant-pipeline/
 │   │   ├── autopvs1.py              ← AutoPVS1 PVS1 criterion evaluation (LoF variants)
 │   │   ├── spliceai.py              ← SpliceAI splice impact delta scores (Broad API)
 │   │   ├── gnomad_constraint.py     ← gnomAD gene constraint (pLI, LOEUF) — gene-cached, for PVS1 mechanism plausibility
+│   │   ├── gnomad_frequency.py      ← live variant-level gnomAD AF + het/hom carrier counts (PM2/BS1 fallback when CSV Frequency is blank)
 │   │   ├── clinvar_gene_stats.py    ← ClinVar gene-level P/LP consequence counts (PP2/BP1) + per-variant submission tally (PS3)
+│   │   ├── clinvar_residue_search.py ← deterministic residue-level ClinVar query — primary PS1/PM5 evidence source
 │   │   ├── clingen_allele.py        ← ClinGen Allele Registry cross-reference (CAid → ClinVar/dbSNP/gnomAD/ExAC)
 │   │   ├── websearch.py             ← WebSearchTool + WebFetchTool (sub-tools for ReAct agent)
-│   │   ├── websearch_agent.py       ← WebSearchAgentTool: full ReAct web-search loop + residue-level PS1/PM5 search
+│   │   ├── websearch_agent.py       ← WebSearchAgentTool: full ReAct web-search loop + residue-level PS1/PM5 search fallback
 │   │   └── ncbi.py                  ← NCBIFetchTool (sub-tool for ReAct agent)
 │   │
 │   └── manifests/
 │       ├── litvar2.yaml             ← order 1
 │       ├── spliceai.yaml            ← order 1
 │       ├── gnomad_constraint.yaml   ← order 1
+│       ├── gnomad_frequency.yaml    ← order 1
 │       ├── clinvar_gene_stats.yaml  ← order 1
+│       ├── clinvar_residue_search.yaml ← order 1
 │       ├── clingen_allele.yaml      ← order 1
 │       ├── autopvs1.yaml            ← order 2
 │       └── websearch_agent.yaml     ← order 3 (serial — consumes all order-1/2 outputs via context.all_outputs)
@@ -122,6 +135,7 @@ variant-pipeline/
     ├── moi_recessive.txt            ← compound-het pair
     ├── moi_recessive_homozygous.txt ← confirmed-homozygous solo
     ├── moi_xlinked.txt
+    ├── moi_mode_classification.txt  ← LLM tier-3 gene-inheritance-mode fallback prompt (core/moi.py)
     ├── actionable_variants.txt
     ├── clinical_conclusion.txt      ← Layer 8 draft
     └── final_conclusion_revise.txt  ← Layer 8 fact-check pass
@@ -170,22 +184,34 @@ Unknown columns are ignored. Missing columns are filled with `"NA"`.
 
 Column-to-field mapping is **SLM-driven** (`normalizer.py::_map_columns_llm`) when an
 `LLMClient` is passed to `normalize_upload()` — the model inspects the header row plus
-one sample data row and classifies each column into a canonical field, producing a
+one sample data row and classifies **every** header column into a canonical field,
+including the allelic-balance columns (proband/mother/father), producing a
 human-readable `header_mapping_summary` surfaced at the top of the report. When no
 `llm` is passed (e.g. the CLI convenience entry point), falls back to the deterministic
-`COLUMN_ALIASES` dict mapper. Both paths share the same "Allelic balance - `<sample>`"
-structural detection (below) — that part is never sent to the SLM, it's mechanical.
+`COLUMN_ALIASES` dict mapper.
+
+Allelic-balance columns used to be claimed by a hardcoded regex
+(`^allelic\s+balance\s*-`) *before* the SLM mapper ever saw them. That regex was
+space-strict and, on a real upload that used `Allelic_balance_1`/`Allelic_balance_2`
+naming, matched nothing — silently discarding trio parental AB data for every variant
+in the file. The SLM mapper now classifies these columns itself (see the
+`Allelic_balance`/`Allelic_balance_mother`/`Allelic_balance_father` entries in
+`_FIELD_DESCRIPTIONS`, which describe the matching rules: explicit naming, sample-ID
+suffix, or positional fallback when naming gives no parent identity).
 
 ### Parental allelic balance
 
-Columns matching `"Allelic balance - <sample>"` (case-insensitive) are detected
-separately from the main column-mapping pass, via `extract_parental_ab()`. The first
-such column becomes the canonical `Allelic_balance` field (proband); additional
-columns are returned as a `parental_ab: list[dict]` alongside the normalized variants
-— one dict per variant, keys `"proband"`/`"mother"`/`"father"` (3 columns),
-`"proband"`/`"extra1"` or the named parent (2 columns), or just `"proband"` (1 column).
-This is the data source for the entire segregation/MOI machinery — see
-Mode-of-Inheritance & ACMG Scoring below.
+Primary path: `_build_parental_ab_from_mapped()` reads parental AB straight from the
+SLM's own column mapping (`Allelic_balance`/`Allelic_balance_mother`/
+`Allelic_balance_father`), so it works under whatever naming convention the input file
+happens to use. Fallback path (only when the SLM path finds no proband AB column at
+all, or when `llm=None`): `extract_parental_ab()` — a regex over raw headers matching
+`"allelic balance"` (case/separator-insensitive substring, so `Allelic_balance_1` and
+`Allelic balance - proband` both match). Either path returns a `parental_ab: list[dict]`
+alongside the normalized variants — one dict per variant, keys
+`"proband"`/`"mother"`/`"father"` (3 columns), `"proband"`/`"extra1"` or the named
+parent (2 columns), or just `"proband"` (1 column). This is the data source for the
+entire segregation/MOI machinery — see Mode-of-Inheritance & ACMG Scoring below.
 
 `normalize_upload(raw, filename, llm=None)` returns
 `(variants, raw_rows, parental_ab, header_mapping_summary)` — a 4-tuple; all three
@@ -485,7 +511,9 @@ note the missing evidence in the report rather than reasoning from a gap.
 | `litvar2_summary` | `SLMTool` | 1 (parallel) | RS_ID valid **or** Gene present (Python gate) |
 | `spliceai` | `NetworkTool` | 1 (parallel) | Python gate — skips synonymous, intergenic, UTR, unresolvable coords |
 | `gnomad_constraint` | `NetworkTool` | 1 (parallel) | Manifest gate — Gene present |
+| `gnomad_frequency` | `NetworkTool` | 1 (parallel) | Manifest gate — resolvable coordinates |
 | `clinvar_gene_stats` | `NetworkTool` | 1 (parallel) | Manifest gate — Gene present |
+| `clinvar_residue_search` | `NetworkTool` | 1 (parallel) | Manifest gate — a protein-residue position can be parsed from HGVS |
 | `clingen_allele` | `NetworkTool` | 1 (parallel) | Python gate — a usable HGVS/genomic query can be built |
 | `autopvs1` | `NetworkTool` | 2 (parallel) | Python gate — LoF/frameshift/splice variants only |
 | `websearch_agent` | `ReActTool` | 3 (serial) | Python gate — hard-skips ClinVar benign/likely-benign and common variants (AF > 1%); pre-loop checkpoint handles remaining cases |
@@ -556,6 +584,31 @@ lookup per variant. An empty cross-reference set is itself reported as a meaning
 manifest's retry engages); a 400 (genuinely unparseable HGVS/coordinates) is reported
 as "not resolvable" without retrying, since retrying a malformed request doesn't help.
 
+**`clinvar_residue_search`** queries ClinVar (NCBI esearch + esummary) for every
+classified variant reported at this variant's own protein residue(s), then classifies
+each hit against this variant's own change: identical destination amino acid + different
+nucleotide → PS1 candidate; different destination amino acid → PM5 candidate; identical
+nucleotide → this variant's own record (skipped). One esearch + one batched esummary
+call per distinct residue (`{gene}[gene] AND {aa3}{pos}[variant name]`), capped at
+`_MAX_HITS_PER_RESIDUE=15`. Replaces reliance on the general-purpose web-search agent
+for PS1/PM5 grounding — a live comparison found the web search missed a directly-relevant
+ClinVar record that this structured esearch found immediately and deterministically.
+`prompts/conclusion.txt`'s PS1/PM5 criteria now treat this tool's output as the
+*primary* evidence source, falling back to the web-search agent's residue-level query
+only when this block is absent for a variant.
+
+**`gnomad_frequency`** fetches live variant-level gnomAD allele frequency (genome + exome
+AF, plus homozygote/heterozygote carrier counts) via the same public GraphQL API as
+`gnomad_constraint`. Two call sites: (1) as a retrieval-stage tool, gated to run only
+when the input CSV's own `Frequency` field is blank — exists because PM2/BS1 were being
+applied from "Frequency is blank, therefore presumed rare" reasoning, when a live
+lookup can directly contradict that (a real case: CSV `Frequency=NA`, but gnomAD exome
+AF=0.0013 — not rare enough for a presumed-recessive disease); (2) called ungated from
+`pipeline.py::_build_gene_evidence_table` for the final report's Gene-Level Evidence
+Summary, since homozygote/heterozygote carrier counts are never present in the input
+CSV at all, regardless of whether a plain AF was supplied. Not gene-cached — variant-scoped,
+fetched fresh per variant/table row.
+
 ---
 
 ## Mode-of-Inheritance (MOI) & ACMG Scoring
@@ -570,13 +623,23 @@ them as given rather than re-deriving them under uncertainty:
   uncertain/insufficient_data, duo-tolerant), `classify_phase` (two variants' own
   segregation results → cis/trans/unknown — a CIS compound-het pair is filtered out
   here, in plain Python, before it can ever reach an LLM call), `classify_xlinked_ab`.
-- **`pipeline/core/moi.py`** — `build_gene_mode_cache()` resolves each gene's
-  inheritance mode via a 3-tier fallback (CSV `Inheritance`/`OMIM_inheritance` text →
-  NHGRI CGD lookup via `LitVar2SummaryTool.get_cgd_inheritance()` → retrieved
-  literature text), gated by `gene_chromosome()` (a gene confirmed off chrX can never
-  classify as X-linked, regardless of what any text tier claims). `derive_pertinence()`
-  reads LitVar2's own emitted markers (`"NO DISEASE LINK"` / `"PubMed gene-disease
-  evidence for"`) to produce a phenotype-pertinence signal without a new tool call.
+- **`pipeline/core/moi.py`** — `build_gene_mode_cache(variants, kept_indices,
+  context_slices, group_by_gene, llm)` resolves each gene's inheritance mode via a
+  3-tier fallback: (1) CSV `Inheritance`/`OMIM_inheritance` text; (2) NHGRI CGD lookup
+  via `LitVar2SummaryTool.get_cgd_inheritance()`; (3) an LLM call (`_llm_classify_mode`,
+  `prompts/moi_mode_classification.txt`) reasoning over the retrieved literature/
+  gnomAD-constraint text for genes tiers 1–2 left unresolved — replacing an older
+  plain-text substring match. Genes needing tier 3 are resolved concurrently across a
+  dedicated pool (`MAX_WORKERS_MODE_CLASSIFICATION`) after tiers 1–2 run serially over
+  all genes. Gated throughout by `gene_chromosome()` (a gene confirmed off chrX can
+  never classify as X-linked, regardless of what any tier claims). Returns
+  `(gene_mode_cache, gene_mode_reasoning_cache)` — the second dict holds the tier-3
+  LLM's justification text (empty for tiers 1–2, which are unambiguous structured
+  facts and carry no reasoning), surfaced in the report's Gene-Level Evidence Summary
+  so a literature-reasoned mode call is auditable, not a silent label.
+  `derive_pertinence()` reads LitVar2's own emitted markers (`"NO DISEASE LINK"` /
+  `"PubMed gene-disease evidence for"`) to produce a phenotype-pertinence signal
+  without a new tool call.
 - **`pipeline/core/acmg_sf.py`** — `ACMG_SF_GENES` (81 genes, ACMG SF v3.2) +
   `build_actionable_set()`: a variant in one of these genes classified P/LP (ClinVar
   field, or an SLM fallback check against already-fetched LitVar2 text when
@@ -584,11 +647,27 @@ them as given rather than re-deriving them under uncertainty:
   phenotype relevance, and gets its own report section (`stages/actionable.py`) —
   independent of everything else in the pipeline.
 
-**Scoring itself is entirely prompt-driven — there is no Python-side point accumulator.**
+**The SLM produces every criterion's initial score — Python only applies narrow,
+documented post-hoc corrections, never an independent scorer.**
 `stages/conclusion.py` (Layer 2) scores each variant's MOI-agnostic ACMG criteria
 (mechanism, frequency, in-silico, functional, phenotype fit — never PS2/PP1/PM3) via
 `prompts/conclusion.txt`'s full Tavtigian et al. 2020 Bayesian point-system rubric.
-Four MOI-layer stages then each take that base block as **read-only input**
+After the SLM call, `conclusion.py::run_one()` chains five deterministic validators —
+`validate_citations → validate_pp3 → validate_pp2_bp1 → validate_ps1_pm5 →
+validate_bp6 → validate_pp4` (in `pipeline/core/acmg_{pp3,pp2_bp1,ps1_pm5,bp6,pp4}.py`)
+— each a pure string transform over the SLM's *own already-generated* conclusion
+text: it regex-matches the criterion line the SLM already wrote, checks it against
+separately-fetched deterministic evidence (gene-level ClinVar consequence counts,
+in-silico threshold crossings, residue-level ClinVar hits, the justification text
+itself), and only on a mismatch strips or inserts that one line, shifting the running
+point total by the criterion's fixed value via `acmg_points.py::adjust_points_line()`.
+None of these independently evaluate a variant from scratch or compute a criterion the
+SLM didn't already attempt — they correct five specific, previously-observed SLM
+failure modes (PP2/BP1, PP3, PS1/PM5, BP6, PP4), the same "precomputed fact, never
+re-derived" spirit as `core/segregation.py`/`core/moi.py` but applied as a correction
+pass over generated text rather than a fact injected into the prompt beforehand.
+
+Four MOI-layer stages then each take that (validator-corrected) base block as **read-only input**
 ("BASE CONCLUSION — already scored, do not recompute") and add exactly one
 inheritance-specific delta on top, gated as follows:
 
@@ -606,11 +685,14 @@ SLM-written `"ACMG points: N → Classification"` line back out via regex
 (`pipeline.py::_extract_acmg_points_value`) for sorting/ranking; it never recomputes it.
 
 `stages/final_conclusion.py` (Layer 8) closes the report with a two-pass synthesis:
-a draft (`prompts/clinical_conclusion.txt`) across all MOI layers, then a **second,
-independent** call (`prompts/final_conclusion_revise.txt`) that fact-checks the draft
-against the same source layer blocks for wrong point totals, hallucinated criteria,
-CIS pairs mislabeled compound-het, single-heterozygous-in-AR-gene over-claiming, and
-disease names bled across genes. Falls back to the unrevised draft on any failure or
+a draft (`prompts/clinical_conclusion.txt`) across all MOI layers plus an optional
+`actionable_variants` list (ACMG-SF findings, built in `pipeline.py` before this call
+so the draft's own prose can name them in a dedicated "Actionable findings" section,
+not just the separate ACTIONABLE VARIANTS appendix), then a **second, independent**
+call (`prompts/final_conclusion_revise.txt`) that fact-checks the draft against the
+same source layer blocks for wrong point totals, hallucinated criteria, CIS pairs
+mislabeled compound-het, single-heterozygous-in-AR-gene over-claiming, and disease
+names bled across genes. Falls back to the unrevised draft on any failure or
 malformed output.
 
 ---
@@ -773,11 +855,15 @@ Results:
 
 ### MOI precompute (`pipeline.py`, calls `core/moi.py`)
 
-Runs once, on all kept variants, before reasoning. Builds `gene_mode_cache`
-(inheritance mode per gene), `recessive_gene_groups` (compound-het candidate
-groupings), and `pertinence_cache` (per-variant gene-phenotype literature signal,
-read from LitVar2's already-emitted evidence). No LLM calls — see the MOI & ACMG
-Scoring section above for the exact 3-tier resolution logic.
+Runs once, on all kept variants, before reasoning. Builds `gene_mode_cache` +
+`gene_mode_reasoning_cache` (inheritance mode per gene, tiers 1–2 no-LLM /
+tier 3 one LLM call per unresolved gene, run concurrently), `recessive_gene_groups`
+(compound-het candidate groupings), and `pertinence_cache` (per-variant
+gene-phenotype literature signal, read from LitVar2's already-emitted evidence) — see
+the MOI & ACMG Scoring section above for the exact 3-tier resolution logic. Also
+computes `segregation_cache` (over `kept_indices`) so the deterministic CIS/TRANS
+phase fact (`_phase_fact()`) can be injected into sibling-context blocks before
+reasoning/second-triage, not just for MOI Layers 3–5 later.
 
 ### Stage 2 — Reasoning + Second Triage (`stages/reasoning.py`)
 
@@ -844,7 +930,9 @@ citations that are not grounded in the variant context: `(PMID:XXXXXXXX)` refere
 are kept only if that PMID appears in the context; `(https://...)` references are kept
 only if the URL appears verbatim in the context. This prevents hallucinated citations
 from propagating into the final report. The same function is reused by all four
-MOI-layer stages.
+MOI-layer stages. Citation validation is followed by the five post-hoc criterion
+validators (PP3, PP2/BP1, PS1/PM5, BP6, PP4) described in the MOI & ACMG Scoring
+section above.
 
 Output format per variant (abridged — see `prompts/conclusion.txt` for the full
 criterion-by-criterion rubric):
@@ -908,11 +996,17 @@ MOI layers by design.
 
 ### Report assembly (`pipeline.py`, no LLM calls)
 
-Gene-Level Evidence Summary table (gnomAD pLI/LOEUF + ClinVar consequence verdict per
-gene, read from the tools' own class-level caches, not re-fetched) → each non-empty
+`_build_gene_evidence_table(variants, genome_build, gene_mode_cache,
+gene_mode_reasoning_cache)` builds the Gene-Level Evidence Summary, one block per
+gene: ClinVar P/LP missense:nonsense/FS ratio + gnomAD pLI/LOEUF (read from the
+tools' own class-level caches, not re-fetched) + inheritance mode (with reasoning
+text when tier-3-LLM-resolved) + a **live** gnomAD variant-level AF/carrier-count
+lookup for the gene's representative variant (`gnomad_frequency.py` — never present
+in the input CSV regardless of whether a plain AF column existed) → each non-empty
 MOI-layer section (blocks sorted Pathogenic → Likely Pathogenic → VUS → Likely Benign
-→ Benign) → Unclassified appendix (same sort) → the Layer 8 Clinical Conclusion →
-Actionable Variants (if any) → exclude/discard appendix.
+→ Benign) → Unclassified appendix (same sort, each block additionally carrying a
+`clinvar_reference.py`-appended ClinVar Variation-ID/URL line) → the Layer 8 Clinical
+Conclusion → Actionable Variants (if any) → exclude/discard appendix.
 
 ---
 
@@ -1286,7 +1380,13 @@ These rules must be respected in all new code:
     to catch it. Reserve the LLM for judgment calls that genuinely require reading
     unstructured evidence (is this literature relevant, does this comment describe
     functional data, is the phenotype specific enough for PP4) — never for arithmetic
-    or classification a `re.match`/threshold check could do reliably.
+    or classification a `re.match`/threshold check could do reliably. A related but
+    distinct pattern: the `core/acmg_{pp3,pp2_bp1,ps1_pm5,bp6,pp4}.py` validators
+    (see MOI & ACMG Scoring above) apply this same "Python owns the deterministic
+    check" principle *after* the SLM has already generated a criterion line, as a
+    narrow correction pass for five specific, previously-observed failure modes —
+    never as an original scorer, and never expanded to cover a criterion without a
+    documented, recurring SLM mistake behind it.
 
 ---
 

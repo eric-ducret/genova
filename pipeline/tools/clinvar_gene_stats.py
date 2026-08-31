@@ -10,13 +10,32 @@ Two independent pieces of evidence, both from ClinVar:
      LitVar2SummaryTool._cgd_table.
   2. Variant-level: for THIS specific variant, how many individual ClinVar
      submitters classified it Pathogenic / Likely pathogenic / VUS / Likely
-     benign / Benign (the submission-level classification tally), plus — for
-     each Pathogenic/Likely pathogenic submission — its evidentiary rationale
-     and source, tagged when it cites functional/experimental data. This is
-     the single source of ClinVar submission-level evidence in the pipeline
-     (PS3 in prompts/conclusion.txt reads the functional-evidence tag from
-     here) — deliberately not duplicated inside WebSearchAgentTool, which
-     only consumes pre-fetched evidence rather than re-fetching ClinVar itself.
+     benign / Benign — the submission-level classification tally. Previously
+     this tally was only ever fetched inside WebSearchAgentTool's forced check,
+     and only when the CSV's own ClinVar_class field already read Pathogenic/
+     Likely pathogenic — so a stale or wrong CSV label meant the real ClinVar
+     submitter breakdown was never seen at all. Fetched unconditionally here
+     instead, for every variant with a resolvable ClinVar record.
+
+     For each individual Pathogenic/Likely pathogenic submission, its
+     evidentiary rationale (Comment text + cited PMIDs, from the
+     Classification-level Citation elements only — see the note above
+     AssertionMethod-boilerplate PMIDs below) is extracted and tagged
+     "[mentions functional/experimental evidence]" when its comment text
+     contains a functional-study marker (patient-derived cells, in vitro/in
+     vivo assay, minigene, enzymatic activity, etc.) — this is the
+     PS3-relevant signal a bare P/LP classification label cannot provide on
+     its own (P/LP-by-label is not PS3; PS3 requires the underlying functional
+     data). This is the single source of ClinVar submission-level evidence in
+     the pipeline (PS3 in prompts/conclusion.txt reads the functional-evidence
+     tag from here) — deliberately not duplicated inside WebSearchAgentTool,
+     which only consumes pre-fetched evidence rather than re-fetching ClinVar
+     itself. Shown unconditionally whenever any P/LP submission exists, with
+     an additional escalated "CONFLICTING" review section when the tally
+     shows genuine submitter disagreement (more than one distinct
+     classification bucket represented — ClinVar's own definition of
+     "conflicting"), so a disagreeing record's per-submission evidence is
+     called out rather than left to blend into the aggregate count.
 """
 
 import logging
@@ -32,7 +51,9 @@ from pipeline.core.errors import ToolFetchError, ToolParseError
 logger = logging.getLogger(__name__)
 
 # Normalizes whatever GermlineClassification text ClinVar submitters used into
-# one of the 5 standard tally buckets.
+# one of the 5 standard tally buckets. Same mapping as NCBIFetchTool's in
+# ncbi.py (kept as an independent copy — same duplication pattern as
+# _FUNCTIONAL_MARKERS below).
 _CLASS_BUCKETS = {
     "pathogenic": "Pathogenic",
     "likely pathogenic": "Likely pathogenic",
@@ -43,12 +64,16 @@ _CLASS_BUCKETS = {
 _TALLY_ORDER = ["Pathogenic", "Likely pathogenic", "VUS", "Likely benign", "Benign"]
 
 # Words that mark a submitter <Comment> as carrying functional/experimental
-# evidence (PS3-relevant) rather than a generic classification remark.
+# evidence (PS3-relevant) rather than a generic classification remark. Same
+# list as NCBIFetchTool._FUNCTIONAL_MARKERS in ncbi.py (kept as an
+# independent copy — this tool runs unconditionally per variant; that one
+# only runs on-demand inside the ReAct agent).
 _FUNCTIONAL_MARKERS = (
     "functional stud", "in vitro", "in vivo", "assay", "minigene",
     "splicing assay", "reporter assay", "enzymatic activity",
     "protein function", "functional assay", "functional analysis",
-    "functional characterization", "experimentally",
+    "functional characterization", "experimentally", "patient-derived",
+    "patient derived", "fibroblast",
 )
 
 # A consequence class is "predominant" only when the OTHER class makes up
@@ -167,8 +192,14 @@ class ClinVarGeneStatsTool(NetworkTool):
     # e.g. "RS1:NM_000330:exon4:c.214G>A:p.E72K" -> "c.214G>A". ClinVar's own
     # esearch [variant name] index only matches this clean token, not a
     # colon-glued compound annotation (same fix already applied in ncbi.py's
-    # resolve_clinvar_id for the same reason).
-    _CDNA_CHANGE_RE = re.compile(r"c\.[^\s:;]+")
+    # resolve_clinvar_id for the same reason). "(" excluded too — an HGVS
+    # string of the form "c.1292T>A(p.Val431Asp)" otherwise swallows the
+    # trailing protein annotation into the token, producing an unmatchable
+    # esearch term and a false "not resolvable" even when ClinVar has the
+    # variant (verified live: LARS1 c.1292T>A, ClinVar Variation ID 431849 —
+    # found instantly by ClinGenAlleleTool's genomic-HGVS route, but this
+    # tool's own cDNA-token esearch silently failed on the untruncated token).
+    _CDNA_CHANGE_RE = re.compile(r"c\.[^\s:;()]+")
 
     def _resolve_variation_id(self, gene: str, hgvs: str) -> str | None:
         cdna_match = self._CDNA_CHANGE_RE.search(hgvs) if hgvs and hgvs != "NA" else None
@@ -188,16 +219,17 @@ class ClinVarGeneStatsTool(NetworkTool):
             return None
         return ids[0] if ids else None
 
-    def _fetch_classification_tally(self, variation_id: str) -> tuple[dict[str, int], list[str]] | None:
-        """Returns (bucket_counts, pl_evidence_lines) or None if unresolvable.
+    def _fetch_classification_tally(self, variation_id: str) -> dict | None:
+        """
+        Returns {"counts": {bucket: n, ...}, "pl_evidence": [line, ...]} or None.
 
-        pl_evidence_lines holds, for each Pathogenic/Likely pathogenic
-        submission: its source (submitter + SCV), cited PMIDs, and its
-        rationale — tagged "[mentions functional/experimental evidence]"
-        when the rationale text matches _FUNCTIONAL_MARKERS. This tag is
-        what prompts/conclusion.txt's PS3 criterion reads to decide whether
-        an aggregate P/LP classification is backed by actual functional
-        data, rather than accepting the label at face value.
+        pl_evidence has one entry per individual Pathogenic/Likely-pathogenic
+        submission — submitter, SCV accession, cited PMIDs (Classification-
+        level Citation elements only — see the AssertionMethod-boilerplate
+        note below), and the "[mentions functional/experimental evidence]"
+        tag when the Comment text matches a _FUNCTIONAL_MARKERS keyword.
+        Always populated regardless of whether the tally turns out
+        conflicting — run() decides what to surface and when.
         """
         try:
             xml = _ncbi_get(
@@ -229,25 +261,37 @@ class ClinVarGeneStatsTool(NetworkTool):
             bucket = _CLASS_BUCKETS.get(desc.lower(), desc)
             counts[bucket] = counts.get(bucket, 0) + 1
 
-            if desc.lower() in ("pathogenic", "likely pathogenic"):
-                acc = ca.find("ClinVarAccession")
-                submitter = acc.get("SubmitterName", "Unknown submitter") if acc is not None else "Unknown submitter"
-                scv = acc.get("Accession", "") if acc is not None else ""
-                comment_el = cl.find("Comment")
-                comment = _clean_xml_text(comment_el.text) if comment_el is not None and comment_el.text else ""
-                pmids = [c.find("ID").text for c in cl.findall("Citation")
-                         if c.find("ID") is not None and c.find("ID").get("Source") == "PubMed"]
+            if desc.lower() not in ("pathogenic", "likely pathogenic"):
+                continue
 
-                line = f"- [{desc}] source: {submitter} ({scv})"
-                if pmids:
-                    line += f" — cites PMID: {', '.join(pmids[:8])}"
-                if comment:
-                    tag = " [mentions functional/experimental evidence]" if \
-                        any(m in comment.lower() for m in _FUNCTIONAL_MARKERS) else ""
-                    line += f"{tag}\n  Rationale: {comment[:600]}"
-                pl_evidence.append(line)
+            acc = ca.find("ClinVarAccession")
+            submitter = acc.get("SubmitterName", "Unknown submitter") if acc is not None else "Unknown submitter"
+            scv = acc.get("Accession", "") if acc is not None else ""
 
-        return counts, pl_evidence
+            comment_el = cl.find("Comment")
+            comment = _clean_xml_text(comment_el.text) if comment_el is not None and comment_el.text else ""
+
+            # Classification-level Citation only. A ClinicalAssertion's own
+            # top-level AttributeSet/Citation is paired with an
+            # Attribute Type="AssertionMethod" (e.g. "ACMG Guidelines, 2015")
+            # — it cites the classification METHODOLOGY paper (Richards et al.
+            # 2015, PMID 25741868), not variant-specific evidence. Verified
+            # live: that PMID appeared on every submission in a real record
+            # regardless of actual content, confirming it is method boilerplate,
+            # not evidence — do not pull citations from that level.
+            pmids = [c.find("ID").text for c in cl.findall("Citation")
+                     if c.find("ID") is not None and c.find("ID").get("Source") == "PubMed"]
+
+            line = f"- [{desc}] source: {submitter} ({scv})"
+            if pmids:
+                line += f" — cites PMID: {', '.join(pmids[:8])}"
+            if comment:
+                tag = " [mentions functional/experimental evidence]" if \
+                    any(m in comment.lower() for m in _FUNCTIONAL_MARKERS) else ""
+                line += f"{tag}\n  Rationale: {comment[:600]}"
+            pl_evidence.append(line)
+
+        return {"counts": counts, "pl_evidence": pl_evidence}
 
     def run(self, variant: dict, context: ToolContext) -> str | None:
         gene = context.field("Gene")
@@ -275,7 +319,8 @@ class ClinVarGeneStatsTool(NetworkTool):
                 "(or no individual submissions listed)."
             )
         else:
-            tally, pl_evidence = result
+            tally = result["counts"]
+            pl_evidence = result["pl_evidence"]
             total = sum(tally.values())
             known_lines = "\n".join(
                 f"{label:<18}: {tally.get(label, 0)}" for label in _TALLY_ORDER
@@ -303,6 +348,28 @@ class ClinVarGeneStatsTool(NetworkTool):
                     "review or consensus across the counts above, not a single traceable "
                     "submission) — do not apply PS3 on functional-evidence grounds from this "
                     "block alone."
+                )
+
+            # "Conflicting" per ClinVar's own definition: more than one distinct
+            # classification bucket represented among individual submitters.
+            # Only when genuinely conflicting do we pay for the deeper per-P/LP
+            # evidence dig — a clean unanimous call doesn't need it.
+            distinct_buckets = sum(1 for n in tally.values() if n > 0)
+            if distinct_buckets > 1 and result["pl_evidence"]:
+                variant_block += (
+                    f"\n\nCLINVAR CONFLICTING — PATHOGENIC/LIKELY PATHOGENIC SUBMISSION "
+                    f"EVIDENCE REVIEW (variation ID {variation_id}, {total} total "
+                    f"submissions, {distinct_buckets} distinct classifications — "
+                    f"submitters disagree, so each P/LP call's own evidentiary basis "
+                    f"is broken out below rather than trusting the aggregate label):\n"
+                    + "\n".join(result["pl_evidence"][:10])
+                )
+            elif distinct_buckets > 1 and not result["pl_evidence"]:
+                variant_block += (
+                    "\n\nCLINVAR CONFLICTING: submitters disagree on classification, "
+                    "but no individual submission was itself Pathogenic/Likely "
+                    "pathogenic (the P/LP portion of the aggregate, if any, traces to "
+                    "expert panel review rather than a single traceable submission)."
                 )
 
         return f"{gene_block}\n\n{variant_block}"

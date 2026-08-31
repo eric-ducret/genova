@@ -33,52 +33,9 @@ from pipeline.tools.websearch import WebSearchTool, WebFetchTool
 from pipeline.tools.ncbi import NCBIFetchTool
 from pipeline.config import DEFAULT_MODEL
 from pipeline.llm.registry import MODELS
+from pipeline.core.protein_change import extract_residue_queries as _extract_residue_queries
 
 _DEFAULT_MODEL_ID = MODELS[DEFAULT_MODEL]["model_id"]
-
-
-# ─────────────────────────────────────────────
-# PROTEIN-CHANGE EXTRACTION (for residue-level PS1/PM5 search)
-# ─────────────────────────────────────────────
-
-_AA_1TO3 = {
-    "A": "Ala", "R": "Arg", "N": "Asn", "D": "Asp", "C": "Cys", "Q": "Gln",
-    "E": "Glu", "G": "Gly", "H": "His", "I": "Ile", "L": "Leu", "K": "Lys",
-    "M": "Met", "F": "Phe", "P": "Pro", "S": "Ser", "T": "Thr", "W": "Trp",
-    "Y": "Tyr", "V": "Val", "X": "Ter", "*": "Ter",
-}
-
-_PROTEIN_CHANGE_RE = re.compile(r"p\.\(?([A-Za-z*]{1,3})(\d+)([A-Za-z*]{1,3})\)?")
-
-
-def _extract_residue_queries(hgvs: str) -> list[dict]:
-    """
-    One search seed per distinct residue position across all transcript
-    segments of a (possibly multi-transcript, pipe-separated) HGVS string —
-    e.g. [{"query": "p.Cys1321", "own_change": "p.Cys1321Ser"}]. Different
-    transcripts of the same physical variant can carry different residue
-    numbers (alternate first exons/UTRs shift the coding start), so every
-    distinct position is searched, not just the first segment.
-
-    The search query deliberately DROPS the destination amino acid
-    ("p.Cys1321", not "p.Cys1321Ser") so one query surfaces every substitution
-    reported at that residue — both an identical change at a different
-    nucleotide (grounds PS1) and a different missense change at the same
-    residue (grounds PM5) — rather than only the exact target change. Original
-    residue in 3-letter form to match ClinVar's own naming convention (e.g.
-    "Cys1321"), which a bare 1-letter query ("C1321") often misses.
-    """
-    seeds: list[dict] = []
-    seen_positions: set[str] = set()
-    for m in _PROTEIN_CHANGE_RE.finditer(hgvs):
-        aa1, pos, aa2 = m.group(1), m.group(2), m.group(3)
-        if pos in seen_positions:
-            continue
-        seen_positions.add(pos)
-        aa1_3 = _AA_1TO3.get(aa1.upper(), aa1.capitalize()) if len(aa1) == 1 else aa1.capitalize()
-        aa2_3 = _AA_1TO3.get(aa2.upper(), aa2.capitalize()) if len(aa2) == 1 else aa2.capitalize()
-        seeds.append({"query": f"p.{aa1_3}{pos}", "own_change": f"p.{aa1_3}{pos}{aa2_3}"})
-    return seeds
 
 
 # ─────────────────────────────────────────────
@@ -237,6 +194,10 @@ def checkpoint_messages(user_input: str, scratchpad: list[str],
             "You are a search decision checker for a clinical genomics pipeline. "
             "Given the available evidence, decide whether further web search is needed.\n\n"
             "Primary gaps to check first (prefer these over PubMed):\n"
+            "- OMIM or GeneReviews entry for this gene\n"
+            "- Mode of inheritance for this gene (autosomal dominant/recessive, "
+            "X-linked, or a dominant-negative mechanism) — check OMIM's "
+            "'Inheritance' field or GeneReviews\n"
             "- ClinVar submitter details or review status\n"
             "- Functional or experimental data for this specific variant\n"
             "- Recent preprints or clinical case reports\n\n"
@@ -285,7 +246,19 @@ def final_answer_messages(user_input: str, conversation: list[dict],
             "3. If a gap could not be filled due to access errors, say so rather than filling it.\n"
             "4. Include the full URL for each cited source.\n"
             "5. Do NOT mention tools, search steps, or internal reasoning.\n\n"
-            "Begin directly with the evidence."
+            "Begin directly with the evidence.\n\n"
+            "Whenever the sources support it, explicitly answer these two questions "
+            "before finishing your answer: (1) Phenotype relevance — is this gene "
+            "affirmatively linked to the patient's phenotype, and how specifically; "
+            "(2) Mode of inheritance — is this gene's disease mechanism autosomal "
+            "dominant, autosomal recessive, X-linked, or dominant-negative "
+            "(name the mechanism explicitly, e.g. 'dominant-negative — mutant "
+            "subunit interferes with the wild-type protein', if the sources "
+            "describe one), citing the source for each. If a source does not "
+            "address one of these questions, say so plainly rather than omitting "
+            "the question entirely — do not guess or infer either answer beyond "
+            "what the sources state. Rule 1 still applies to these two answers: "
+            "if the sources do not support an answer, say so rather than inferring one."
         )},
         *conversation,
         {"role": "user", "content": (

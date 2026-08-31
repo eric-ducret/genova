@@ -299,14 +299,15 @@ class SpliceAITool(NetworkTool):
             return True
 
         # Require resolvable coordinates (needed for the API call)
-        coords = parse_variant_coords(
-            variant_str=variant.get("Variant", ""),
-            chrom_field=variant.get("Chromosome", ""),
-            pos_field=variant.get("Position", ""),
-            ref_field=variant.get("Ref_seq", ""),
-            alt_field=variant.get("Var_seq", ""),
-        )
-        if not coords:
+        try:
+            parse_variant_coords(
+                variant_str=variant.get("Variant", ""),
+                chrom_field=variant.get("Chromosome", ""),
+                pos_field=variant.get("Position", ""),
+                ref_field=variant.get("Ref_seq", ""),
+                alt_field=variant.get("Var_seq", ""),
+            )
+        except ValueError:
             print(f"[SpliceAI gate] SKIP — cannot resolve coordinates")
             return False
 
@@ -317,14 +318,15 @@ class SpliceAITool(NetworkTool):
         if pre_score != "NA":
             return _format_precomputed(pre_score)
 
-        coords = parse_variant_coords(
-            variant_str=variant.get("Variant", ""),
-            chrom_field=variant.get("Chromosome", ""),
-            pos_field=variant.get("Position", ""),
-            ref_field=variant.get("Ref_seq", ""),
-            alt_field=variant.get("Var_seq", ""),
-        )
-        if not coords:
+        try:
+            coords = parse_variant_coords(
+                variant_str=variant.get("Variant", ""),
+                chrom_field=variant.get("Chromosome", ""),
+                pos_field=variant.get("Position", ""),
+                ref_field=variant.get("Ref_seq", ""),
+                alt_field=variant.get("Var_seq", ""),
+            )
+        except ValueError:
             return None
 
         chrom, pos, ref, alt = coords

@@ -58,11 +58,20 @@ from pipeline.core import moi, segregation, acmg_sf
 from pipeline.llm.registry    import get_client
 from pipeline.tools           import (
     AutoPVS1Tool, LitVar2SummaryTool, SpliceAITool, WebSearchAgentTool,
-    GnomadConstraintTool, ClinVarGeneStatsTool, ClinGenAlleleTool,
+    GnomadConstraintTool, GnomadFrequencyTool, ClinVarGeneStatsTool,
+    ClinVarResidueSearchTool, ClinGenAlleleTool,
 )
-from pipeline.tools.gnomad_constraint    import classify_pli, classify_loeuf
-from pipeline.tools.clinvar_gene_stats   import classify_consequence_counts
-from pipeline.stages import (
+from pipeline.tools.clinvar_gene_stats import classify_consequence_counts
+from pipeline.tools.gnomad_constraint  import (
+    classify_pli, classify_loeuf, _BUILD_TO_REFERENCE_GENOME,
+)
+from pipeline.tools.gnomad_frequency   import fetch_variant_frequency
+from pipeline.tools.autopvs1           import (
+    parse_variant_coords, _CLEAR_LOF_TYPES,
+)
+from pipeline.core.errors              import ToolFetchError, ToolParseError
+from pipeline.core.clinvar_reference   import append_clinvar_reference
+from pipeline.stages         import (
     retrieval, reasoning, conclusion, cross_analysis, final_conclusion, first_triage,
     moi_denovo, moi_dominant, moi_recessive, moi_xlinked, actionable,
 )
@@ -107,6 +116,34 @@ def _parse_variant_str(variant_str: str) -> dict:
 _SLICE_HEADER_RE = re.compile(r"^(PATIENT DATA:.*?VARIANT DATA:\n\n)", re.DOTALL)
 
 
+_LOF_HGVS_CLUES = ("fs", "ter", "del", "dup", "ins", "ext*")
+
+
+def _is_lof_variant(variant: dict) -> bool:
+    """
+    Fast, deterministic LoF check — reuses the exact same rule AutoPVS1's own
+    gate uses (autopvs1.py's _CLEAR_LOF_TYPES) so "LoF" means the same thing
+    here as it does for PVS1 eligibility elsewhere in the pipeline.
+    """
+    type_val = (variant.get("Type") or "").lower()
+    if any(t in type_val for t in _CLEAR_LOF_TYPES):
+        return True
+    hgvs_val = (variant.get("HGVS") or "").lower()
+    if any(c in hgvs_val for c in _LOF_HGVS_CLUES) and "=" not in hgvs_val:
+        return True
+    return False
+
+
+def _gene_phenotype_relevant(context_slice: str) -> bool:
+    """
+    True unless the retrieval evidence explicitly recorded no gene-phenotype
+    literature link (litvar2.py emits the literal string "NO DISEASE LINK"
+    in both of its no-link cases) — i.e. relevance is assumed by default,
+    only overridden by an explicit negative signal.
+    """
+    return "NO DISEASE LINK" not in context_slice
+
+
 def _group_by_gene(variants: list[dict]) -> dict[str, list[int]]:
     """
     Return a mapping of gene symbol → list of 0-based variant indices.
@@ -146,6 +183,120 @@ def _reconstruct_full_context(context_slices: list[str]) -> str:
 
     variant_sections = [s[header_len:].rstrip() for s in context_slices]
     return header + "\n\n".join(variant_sections) + "\n"
+
+
+def _build_gene_evidence_table(
+    variants: list[dict],
+    genome_build: str,
+    gene_mode_cache: dict[str, str] | None = None,
+    gene_mode_reasoning_cache: dict[str, str] | None = None,
+) -> str:
+    """
+    One block per gene in the variant set: ClinVar P/LP missense:nonsense/FS
+    ratio (the same counts that gate BP1/PP2), gnomAD pLI/LOEUF, this gene's
+    inheritance-mode determination (with reasoning, if the mode was resolved
+    by the LLM tier — see moi.build_gene_mode_cache), and this gene's
+    representative variant's own gnomAD allele frequency + homozygote/
+    heterozygote carrier counts (never present in the input CSV, regardless
+    of whether a plain AF was already supplied there).
+
+    pLI/LOEUF and the ClinVar counts are read from the tools' own class-level
+    caches (populated during retrieval, one fetch per gene for the whole run)
+    rather than re-fetched — cheap and guaranteed consistent with whatever
+    the reasoning/conclusion stages actually saw. The variant-level gnomAD
+    frequency is NOT cached anywhere else (it's variant-scoped, not
+    gene-scoped) so it's fetched fresh here, once per gene's first variant.
+    """
+    gene_mode_cache = gene_mode_cache or {}
+    gene_mode_reasoning_cache = gene_mode_reasoning_cache or {}
+    reference_genome = _BUILD_TO_REFERENCE_GENOME.get(genome_build, "GRCh37")
+
+    # First variant seen per gene — used both to key the gene and as the
+    # representative variant for the live gnomAD frequency lookup below.
+    gene_variants: dict[str, dict] = {}
+    gene_order: list[str] = []
+    for variant in variants:
+        gene = variant.get("Gene", "NA")
+        if gene and gene != "NA" and gene not in gene_variants:
+            gene_variants[gene] = variant
+            gene_order.append(gene)
+    if not gene_order:
+        return ""
+
+    lines = []
+    for gene in gene_order:
+        variant    = gene_variants[gene]
+        stats      = ClinVarGeneStatsTool._stats_cache.get(gene.upper())
+        constraint = GnomadConstraintTool._constraint_cache.get(f"{gene.upper()}:{reference_genome}")
+
+        lines.append(f"{gene}:")
+
+        if stats:
+            missense, nonsense = stats["missense"], stats["nonsense"]
+            total = missense + nonsense
+            fraction = f"{missense / total:.1%} missense" if total else "n/a"
+            verdict = classify_consequence_counts(missense, nonsense)
+            lines.append(
+                f"  ClinVar P/LP missense:nonsense/FS = {missense}:{nonsense} ({fraction}) -> {verdict}"
+            )
+        else:
+            lines.append("  ClinVar gene-level counts: not fetched")
+
+        if constraint and (constraint["pli"] is not None or constraint["loeuf"] is not None):
+            pli, loeuf = constraint["pli"], constraint["loeuf"]
+            pli_str   = f"{pli:.3f} ({classify_pli(pli)})" if pli is not None else "not available"
+            loeuf_str = f"{loeuf:.3f} ({classify_loeuf(loeuf)})" if loeuf is not None else "not available"
+            lines.append(f"  gnomAD pLI = {pli_str}  |  LOEUF = {loeuf_str}")
+        else:
+            lines.append("  gnomAD constraint: not available")
+
+        mode      = gene_mode_cache.get(gene, "")
+        reasoning = gene_mode_reasoning_cache.get(gene, "")
+        mode_label = moi.MODE_LABELS.get(mode, moi.MODE_LABELS[""])
+        if reasoning:
+            # Only resolved via the LLM tier (tiers 1/2 are unambiguous
+            # structured facts and carry no reasoning text) — surface the
+            # justification so the mode call is auditable, not a silent label.
+            lines.append(f"  Inheritance mode (literature-reasoned): {mode_label} — {reasoning}")
+        elif mode:
+            lines.append(f"  Inheritance mode (CSV/CGD): {mode_label}")
+
+        try:
+            coords = parse_variant_coords(
+                variant_str=variant.get("Variant", ""),
+                chrom_field=variant.get("Chromosome", ""),
+                pos_field=variant.get("Position", ""),
+                ref_field=variant.get("Ref_seq", ""),
+                alt_field=variant.get("Var_seq", ""),
+            )
+        except ValueError:
+            coords = None
+        if coords:
+            try:
+                freq = fetch_variant_frequency(*coords, genome_build)
+            except (ToolFetchError, ToolParseError) as e:
+                lines.append(f"  gnomAD variant AF ({variant.get('HGVS', '?')}): fetch failed — {e}")
+                freq = None
+            if freq:
+                if freq["error"]:
+                    lines.append(f"  gnomAD variant AF ({variant.get('HGVS', '?')}): not found — {freq['error']}")
+                else:
+                    for key, label in (("genome", "Genome"), ("exome", "Exome")):
+                        sub = freq.get(key)
+                        if sub:
+                            hom = sub["homozygote_count"]
+                            het = sub["heterozygote_count"]
+                            lines.append(
+                                f"  gnomAD {label} AF = {sub['af']:.6g} "
+                                f"(homozygotes={hom if hom is not None else 'n/a'}, "
+                                f"heterozygotes={het if het is not None else 'n/a'})"
+                            )
+        else:
+            lines.append("  gnomAD variant AF: coordinates not resolvable for this variant")
+
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
 
 
 def _build_process_details(
@@ -321,7 +472,9 @@ class Pipeline:
             SpliceAITool(),
             AutoPVS1Tool(),
             GnomadConstraintTool(),
+            GnomadFrequencyTool(),
             ClinVarGeneStatsTool(),
+            ClinVarResidueSearchTool(),
             ClinGenAlleleTool(),
             WebSearchAgentTool(),
         ]
@@ -461,6 +614,19 @@ class Pipeline:
                             f"[compound-het exempt — original triage: DISCARD: {justification}]"
                         )
                         decision = "KEEP"
+                    elif (
+                        decision == "DISCARD"
+                        and _is_lof_variant(variants[i])
+                        and _gene_phenotype_relevant(context_slices[i])
+                    ):
+                        logger.info(
+                            "[Pipeline] Triage override: variant %d (%s) is a LoF variant "
+                            "in a phenotype-relevant gene — forced KEEP", i + 1, gene,
+                        )
+                        justification = (
+                            f"[LoF-in-phenotype-gene exempt — original triage: DISCARD: {justification}]"
+                        )
+                        decision = "KEEP"
                     triage_results[i] = (decision, justification)
         else:
             # No triage — all variants kept
@@ -474,9 +640,19 @@ class Pipeline:
             len(kept_indices), len(discarded_indices),
         )
 
-        # ── MOI precompute (once globally, before reasoning) ──────────────────
-        gene_mode_cache = moi.build_gene_mode_cache(
-            variants, kept_indices, context_slices, _group_by_gene
+        # ── Compound-het gene grouping (AR / AD-AR genes with ≥2 kept variants) ─
+        # Computed before reasoning (Stage 2a) so that sibling variant evidence
+        # can be injected into each variant's FIRST reasoning call, not just
+        # second_triage — Call 1 should already weigh the variant jointly with
+        # its gene-mate instead of reasoning about it in isolation.
+        # Scoped to recessive-relevant inheritance only — a second variant in a
+        # purely dominant gene doesn't change the first variant's standing.
+        # Inheritance-mode classification and compound-het gene grouping live in
+        # pipeline/core/moi.py (relocated so the MOI-layer stage modules can
+        # import this logic directly) — same behavior, just no longer inline here.
+        kept_set = set(kept_indices)
+        gene_mode_cache, gene_mode_reasoning_cache = moi.build_gene_mode_cache(
+            variants, kept_indices, context_slices, _group_by_gene, self._llm,
         )
         recessive_gene_groups = moi.build_recessive_gene_groups(
             variants, gene_mode_cache, kept_indices, _group_by_gene
@@ -484,6 +660,51 @@ class Pipeline:
         pertinence_cache = moi.build_pertinence_cache(variants, kept_indices, context_slices)
 
         # ── Context-block builders (sibling / inheritance-mode / zygosity) ────
+
+        # Segregation classification, computed once per KEPT variant (not just
+        # included) — needed up front so the deterministic CIS/TRANS phase
+        # check below can run BEFORE reasoning/second-triage, not just for the
+        # later MOI Layers 3/4/5 (which only ever saw included pairs). Scoped
+        # to kept_indices ⊇ include_indices, so this single cache serves both;
+        # classify_segregation() only depends on parental_ab[i], not on
+        # inclusion status, so computing it early for the wider set is safe.
+        segregation_cache: dict[int, str] = {}
+        for i in kept_indices:
+            ab_entry = parental_ab[i] if parental_ab else {}
+            segregation_cache[i] = segregation.classify_segregation(
+                ab_entry.get("proband"), ab_entry.get("mother"), ab_entry.get("father"),
+            )
+
+        _PHASE_FACT_LABELS = {
+            "cis": (
+                "CIS (same parent as this variant) — the two variants sit on the "
+                "SAME parental allele; the other parental allele is wild-type at "
+                "both positions. This is NOT compound heterozygous, no matter how "
+                "strong either variant's individual evidence looks. Do not describe "
+                "this pair as compound heterozygous or apply a biallelic/recessive "
+                "model to it."
+            ),
+            "trans": (
+                "TRANS (different parents) — consistent with compound heterozygous "
+                "biallelic inheritance."
+            ),
+            "unknown": (
+                "UNKNOWN — phase not determinable from available parental "
+                "allelic-balance data. A compound-heterozygous model may still apply "
+                "per biallelic evidence, but phase uncertainty must be noted "
+                "explicitly, not asserted as confirmed trans."
+            ),
+        }
+
+        def _phase_fact(i: int, j: int) -> str:
+            """Backend-determined CIS/TRANS/UNKNOWN phase between variants i and j,
+            from classify_phase() over the already-computed segregation_cache —
+            handed to the model as a stated fact (same pattern as
+            _inheritance_mode_block) instead of letting it re-derive phase itself
+            from raw allelic-balance numbers, which can disagree between two
+            separate LLM calls reasoning about the same pair from either side."""
+            phase = segregation.classify_phase(segregation_cache.get(i, ""), segregation_cache.get(j, ""))
+            return f"Phase vs this variant (backend-determined): {_PHASE_FACT_LABELS[phase]}"
 
         def _inheritance_mode_block(i: int) -> str:
             gene = normalize_gene(variants[i].get("Gene", "NA"))
@@ -530,10 +751,17 @@ class Pipeline:
                 return ""
             parts = ["\nSIBLING VARIANT(S) IN SAME GENE (for compound-het/homozygous recessive evaluation):"]
             for j in siblings:
-                hgvs = variants[j].get("HGVS", variants[j].get("Variant", "?"))
-                zyg  = variants[j].get("Zygosity", "NA")
-                parts.append(f"\n--- Sibling: Variant {j + 1} — {gene} ({hgvs}), Zygosity={zyg} ---\n{context_slices[j]}")
-            return "\n".join(parts)
+                sib = variants[j]
+                m = _SLICE_HEADER_RE.match(context_slices[j])
+                sib_evidence = context_slices[j][m.end():].rstrip() if m else context_slices[j].rstrip()
+                parts.append(
+                    f"\nSibling Variant {j + 1} — {sib.get('Gene', '?')} "
+                    f"{sib.get('HGVS', sib.get('Variant', '?'))} "
+                    f"(zygosity: {sib.get('Zygosity', 'NA')})\n"
+                    f"{_phase_fact(i, j)}\n"
+                    f"Sibling evidence:\n{sib_evidence}"
+                )
+            return "\n".join(parts) + "\n"
 
         def _sibling_reasoning_block(i: int, reasoning_only: dict[int, str]) -> str:
             """Sibling context built from sibling reasoning (Call 1 output),
@@ -550,9 +778,14 @@ class Pipeline:
                 return ""
             parts = ["\nSIBLING VARIANT(S) IN SAME GENE — reasoning already produced:"]
             for j in siblings:
-                hgvs = variants[j].get("HGVS", variants[j].get("Variant", "?"))
-                parts.append(f"\n--- Sibling: Variant {j + 1} — {gene} ({hgvs}) reasoning ---\n{reasoning_only[j]}")
-            return "\n".join(parts)
+                sib = variants[j]
+                parts.append(
+                    f"\nSibling Variant {j + 1} — {sib.get('Gene', '?')} "
+                    f"{sib.get('HGVS', sib.get('Variant', '?'))}\n"
+                    f"{_phase_fact(i, j)}\n"
+                    f"Sibling reasoning:\n{reasoning_only[j]}"
+                )
+            return "\n".join(parts) + "\n"
 
         # ── Stage 2a: Reasoning Call 1 (all kept variants) ────────────────────
         reasoning_only: dict[int, str] = {}
@@ -585,7 +818,7 @@ class Pipeline:
                     continue
                 reasoning_only[i] = r
 
-        # ── Stage 2b: Second triage Call 2 (kept, non-failed variants) ────────
+        # ── Stage 2b: Second triage (INCLUDE/EXCLUDE, with sibling context) ────
         reasonings: dict[int, str] = {}
         inclusion_decisions: dict[int, str] = {}
         second_triage_justifications: dict[int, str] = {}
@@ -641,6 +874,44 @@ class Pipeline:
                 prior = second_triage_justifications.get(i, "")
                 second_triage_justifications[i] = (
                     f"[ACMG-SF actionable — forced INCLUDE: {actionable_reasons.get(i, '')}] {prior}".strip()
+                )
+                inclusion_decisions[i] = "INCLUDE"
+
+        # ── Compound-het second-triage override: a variant EXCLUDEd by second_triage
+        #     that sits in a recessive-relevant gene (AR/XLR/AD_AR/XLD_XLR) with >=2
+        #     kept variants must not be dropped on the SLM's own free-text cis/trans
+        #     call — that determination belongs to the deterministic backend
+        #     classify_phase() (segregation_cache, computed earlier from real
+        #     parental allelic-balance data and handed to the model as a stated fact
+        #     via _phase_fact). The SLM can still assert "cis" in its Exclude-case
+        #     prose even when the backend fact it was given says phase is UNKNOWN
+        #     (no parental AB data at all) — that is a hallucinated phase call, not
+        #     a grounded one, and must not be trusted to drop a real compound-het
+        #     candidate. Mirrors the first_triage compound-het override above, one
+        #     stage later. Only let an EXCLUDE stand when the backend phase against
+        #     EVERY kept sibling in the group is deterministically "cis"; any
+        #     "trans" or "unknown" sibling relationship forces INCLUDE so the
+        #     AR module (moi_recessive.py) — which requires phase == "trans" or
+        #     "unknown" and hard-blocks "cis" — is the one to make the final call.
+        for gene, idxs in recessive_gene_groups.items():
+            for i in idxs:
+                if i in reasoning_failed or inclusion_decisions.get(i) != "EXCLUDE":
+                    continue
+                siblings = [j for j in idxs if j != i]
+                phases = {
+                    segregation.classify_phase(segregation_cache.get(i, ""), segregation_cache.get(j, ""))
+                    for j in siblings
+                }
+                if phases == {"cis"}:
+                    continue  # backend-confirmed cis against every sibling — EXCLUDE stands
+                logger.info(
+                    "[Pipeline] Second-triage override: variant %d (%s) is a compound-het "
+                    "candidate and backend phase vs sibling(s) is not confirmed cis — "
+                    "forced INCLUDE", i + 1, gene,
+                )
+                second_triage_justifications[i] = (
+                    f"[compound-het exempt — backend phase not confirmed cis — original: "
+                    f"EXCLUDE: {second_triage_justifications.get(i, '')}]"
                 )
                 inclusion_decisions[i] = "INCLUDE"
 
@@ -713,15 +984,21 @@ class Pipeline:
                     i + 1, variants[i].get("Gene", "?"),
                 )
 
-        # ── MOI-layer precompute (segregation + chromosome caches) ────────────
-        segregation_cache: dict[int, str] = {}
-        for i in include_indices:
-            ab_entry   = parental_ab[i] if (parental_ab and i < len(parental_ab)) else None
-            proband_ab = ab_entry.get("proband") if ab_entry else None
-            mother_ab  = ab_entry.get("mother") if ab_entry else None
-            father_ab  = ab_entry.get("father") if ab_entry else None
-            segregation_cache[i] = segregation.classify_segregation(proband_ab, mother_ab, father_ab)
+        # ── Stage 4.5: MOI-specific layers (3: de novo, 4: dominant-inherited,
+        #     5: recessive/compound-het, 6: X-linked) — each ADDS criteria on
+        #     top of the Layer 2 base score above; scoped to include_indices
+        #     (Tier 1), the same population the flat report used to cover. A
+        #     variant can appear in more than one layer if its gene's MOI
+        #     qualifies for more than one (e.g. AD_AR genes appear in both the
+        #     dominant and recessive layers) — deliberately not deduplicated. ──
+        include_set = set(include_indices)
 
+        # segregation_cache was already computed above (over kept_indices, a
+        # superset of include_indices) so the CIS/TRANS phase fact could be
+        # injected into the reasoning/second-triage sibling blocks before this
+        # point — reused here by Layers 3/4/5 unchanged. Layer 6 uses a
+        # separate X-linked-specific classifier since XLR/XLD read differently
+        # off the same AB values.
         gene_chrom_cache = moi.build_gene_chrom_cache(variants, kept_indices, _group_by_gene)
 
         layer_outputs: dict[str, list[str]] = {
@@ -916,7 +1193,29 @@ class Pipeline:
 
         # ── Unclassified (included, but no MOI layer fired) ──────────────────
         unclassified_indices = [i for i in include_indices if i not in moi_covered_indices]
-        unclassified_conclusions = [conclusions[i] for i in unclassified_indices if i in conclusions]
+        unclassified_conclusions = [
+            append_clinvar_reference(conclusions[i], context_slices[i])
+            for i in unclassified_indices
+        ]
+
+        # ── ACMG SF actionable variants (built here, before final_conclusion, so
+        #     the Clinical Conclusion prose can name them in its own dedicated
+        #     "Actionable findings" section, not just the separate ACTIONABLE
+        #     VARIANTS appendix below) — independent of include/exclude since
+        #     flagged variants were already force-included above ─────────────────
+        actionable_flagged = [
+            {
+                "index":          i,
+                "gene":           variants[i].get("Gene", "?"),
+                "hgvs":           variants[i].get("HGVS", variants[i].get("Variant", "?")),
+                "condition":      acmg_sf.ACMG_SF_CONDITIONS.get(variants[i].get("Gene", ""), "n/a"),
+                "reason":         actionable_reasons.get(i, ""),
+                "zygosity":       variants[i].get("Zygosity", "NA"),
+                "classification": _extract_classification_label(conclusions.get(i, "")),
+            }
+            for i in sorted(actionable_indices)
+            if i in conclusions
+        ]
 
         # ── Stage 5: Final clinical conclusion (cross-MOI synthesis) ─────────
         if not include_indices:
@@ -928,27 +1227,14 @@ class Pipeline:
                 layer_outputs=layer_outputs_for_summary,
                 unclassified_conclusions=unclassified_conclusions,
                 patient_phenotype=patient_phenotype,
+                actionable_variants=actionable_flagged,
                 llm=self._llm,
             )
 
-        # ── ACMG-SF actionable variants section ───────────────────────────────
-        actionable_flagged = []
-        for i in sorted(actionable_indices):
-            if i not in conclusions:
-                continue
-            gene = variants[i].get("Gene", "NA")
-            actionable_flagged.append({
-                "index": i,
-                "gene": gene,
-                "hgvs": variants[i].get("HGVS", variants[i].get("Variant", "?")),
-                "condition": acmg_sf.ACMG_SF_CONDITIONS.get(gene, "unknown condition"),
-                "reason": actionable_reasons.get(i, ""),
-                "zygosity": variants[i].get("Zygosity", "NA"),
-                "classification": _extract_classification_label(conclusions[i]),
-            })
-        actionable_section = (
-            actionable.run(actionable_flagged, patient_phenotype, self._llm)
-            if actionable_flagged else ""
+        actionable_section = actionable.run(
+            flagged=actionable_flagged,
+            patient_phenotype=patient_phenotype,
+            llm=self._llm,
         )
 
         # ── Assemble final output ─────────────────────────────────────────────
@@ -998,7 +1284,9 @@ class Pipeline:
 
         # FINAL REPORT — gene-evidence table + MOI-layer sections + unclassified
         # appendix + clinical conclusion + actionable section + exclude/discard appendix
-        gene_evidence_table = _build_gene_evidence_table(variants, kept_indices, genome_build)
+        gene_evidence_table = _build_gene_evidence_table(
+            variants, genome_build, gene_mode_cache, gene_mode_reasoning_cache,
+        )
 
         final_report_parts: list[str] = []
         if gene_evidence_table:
@@ -1157,54 +1445,6 @@ def _build_segregation_analysis(
         gene = variants[i].get("Gene", "?")
         hgvs = variants[i].get("HGVS", variants[i].get("Variant", "?"))
         lines.append(f"  Variant {i + 1} — {gene} ({hgvs}): {segregation_cache[i]}")
-    return "\n".join(lines)
-
-
-def _build_gene_evidence_table(
-    variants: list[dict],
-    kept_indices: list[int],
-    genome_build: str,
-) -> str:
-    """
-    Per-gene evidence summary (gnomAD constraint + ClinVar consequence verdict)
-    for every gene with a kept variant. Reads from the tools' own class-level
-    caches (populated during retrieval) rather than re-fetching — a pure
-    presentation step over data already gathered.
-    """
-    reference_genome = "GRCh38" if genome_build == "hg38" else "GRCh37"
-    genes = sorted({
-        normalize_gene(variants[i].get("Gene", "NA"))
-        for i in kept_indices
-        if normalize_gene(variants[i].get("Gene", "NA")) != "NA"
-    })
-    if not genes:
-        return ""
-
-    gnomad_tool  = GnomadConstraintTool()
-    clinvar_tool = ClinVarGeneStatsTool()
-
-    lines = [
-        "| Gene | pLI | LOEUF | ClinVar P/LP missense | ClinVar P/LP nonsense/frameshift | Verdict |",
-        "|---|---|---|---|---|---|",
-    ]
-    for gene in genes:
-        try:
-            constraint = gnomad_tool._get_constraint(gene, reference_genome) or {}
-        except Exception:
-            constraint = {}
-        pli, loeuf = constraint.get("pli"), constraint.get("loeuf")
-        pli_s   = f"{pli:.3f} ({classify_pli(pli)})" if pli is not None else "n/a"
-        loeuf_s = f"{loeuf:.3f} ({classify_loeuf(loeuf)})" if loeuf is not None else "n/a"
-
-        try:
-            stats = clinvar_tool._get_stats(gene)
-            missense, nonsense = stats["missense"], stats["nonsense"]
-            verdict = classify_consequence_counts(missense, nonsense)
-        except Exception:
-            missense, nonsense, verdict = "n/a", "n/a", "not available"
-
-        lines.append(f"| {gene} | {pli_s} | {loeuf_s} | {missense} | {nonsense} | {verdict} |")
-
     return "\n".join(lines)
 
 

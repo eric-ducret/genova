@@ -16,6 +16,19 @@ INCLUDE only variants with real clinical significance: a clear gene-phenotype li
 AND probable pathogenicity. Both criteria must be supported by evidence.
 Variants included here appear in the final clinical report — be selective.
 
+PHENOTYPE-MATCHING INTERPRETATION (applies to both criteria below): match at
+whatever level of specificity the patient's phenotype text actually provides.
+If it is a broad category (e.g. "hearing loss", "developmental delay")
+rather than a named syndrome, treat any disease that is a recognized cause of
+that broad category as satisfying the phenotype-fit requirement — do NOT
+require the evidence's disease name, or ClinVar's Conditions field, to
+textually restate the patient's own wording. Reserve "keyword overlap" /
+"unrelated disease" rejections for cases where the shared term is incidental
+to a genuinely different disease mechanism (e.g. a paper on an acquired
+vascular condition that happens to list a symptom in common) — not for cases
+where a specific syndrome is a true member of the broader symptom category
+named in the phenotype.
+
 INCLUDE requires evidence for BOTH:
 
 1. GENE-PHENOTYPE LINK — the gene is known or strongly suspected to cause the
@@ -27,10 +40,10 @@ INCLUDE requires evidence for BOTH:
    (this gene causes/is associated with this disease or a genuine differential of it)
    — NOT a paper that merely contains a shared descriptive word while describing an
    unrelated disease process. E.g. a paper about hypermethylation of gene X in
-   "vascular cognitive impairment" that happens to mention "visual and cognitive
-   deficits" as a symptom of that acquired/vascular condition is NOT a gene-phenotype
-   link for a patient being worked up for a primary genetic visual impairment — that
-   is keyword overlap, not a disease relationship, and does not satisfy criterion 1.
+   "chronic kidney disease" that happens to mention "growth restriction" as a
+   symptom of that acquired/renal condition is NOT a gene-phenotype link for a
+   patient being worked up for a primary genetic growth disorder — that is
+   keyword overlap, not a disease relationship, and does not satisfy criterion 1.
    If the literature evidence itself states there is no direct link to the patient's
    specific phenotype (even while discussing the gene in some other disease context),
    treat criterion 1 as NOT met.

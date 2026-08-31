@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=eric.ducret@unil.ch
-#SBATCH --output=/work/PRTNR/CHUV/MED/fsantoni1/pitnet/AI/JING/GenMasterAI/eric_folder/genova_vllm_556_qwen_same_pheno_0711/slurm-%j.out
+#SBATCH --output=/work/PRTNR/CHUV/MED/fsantoni1/pitnet/AI/JING/GenMasterAI/eric_folder/genova_vllm_556_qwen_same_pheno_0811/slurm-%j.out
 
 # Usage: sbatch batch_pheno_vllm.sh <batch_number> <jobs_folder> [n_batches]
 BATCH_NUMBER="${1:?Usage: sbatch batch_pheno_vllm.sh <batch_number> <jobs_folder> [n_batches]}"
